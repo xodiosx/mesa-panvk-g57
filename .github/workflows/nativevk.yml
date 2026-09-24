@@ -243,17 +243,32 @@ jobs:
               python3 /ci-scripts/patch_panvkdbg.py
 
               echo "=============================================="
-              echo "Sanity check: patch actually applied ..."
+              echo "Sanity check: no unwrapped PANVKDBG call remains ..."
               echo "=============================================="
-              SILENCED=$(grep -r "if (0) fprintf(stderr, \"PANVKDBG" src/panfrost/ | wc -l || true)
-              DUMP_GUARDS=$(grep -r "DEBUG DISABLED: dump path stripped" src/panfrost/ | wc -l || true)
-              echo "if (0) fprintf sites:    $SILENCED"
-              echo "dump-path early returns: $DUMP_GUARDS"
-              if [[ "$SILENCED" -lt 60 || "$DUMP_GUARDS" -lt 2 ]]; then
-                echo "ERROR: PANVKDBG source patch incomplete." >&2
-                echo "Expected >=60 sites and >=2 dump guards." >&2
+              UNWRAPPED=$(grep -r -c 'fprintf(stderr, "PANVKDBG' src/panfrost/ \
+                            | awk -F: "{s+=\$2} END {print s+0}")
+              WRAPPED=$(grep -r -c "if (0) fprintf(stderr, \"PANVKDBG" src/panfrost/ \
+                          | awk -F: "{s+=\$2} END {print s+0}")
+              DUMP_GUARDS=$(grep -r "DEBUG DISABLED: dump path stripped" src/panfrost/ \
+                              | wc -l || true)
+              echo "Unwrapped sites remaining: $UNWRAPPED"
+              echo "if (0) wrapped sites:      $WRAPPED"
+              echo "dump-path early returns:   $DUMP_GUARDS"
+
+              if [[ "$UNWRAPPED" -ne 0 ]]; then
+                echo "ERROR: $UNWRAPPED PANVKDBG calls were not wrapped." >&2
+                grep -r 'fprintf(stderr, "PANVKDBG' src/panfrost/ | head -10
                 exit 1
               fi
+              if [[ "$WRAPPED" -lt 60 ]]; then
+                echo "ERROR: only $WRAPPED wrapped sites; expected at least 60." >&2
+                exit 1
+              fi
+              if [[ "$DUMP_GUARDS" -lt 2 ]]; then
+                echo "ERROR: dump-path early returns missing." >&2
+                exit 1
+              fi
+              echo ">>> PASS: all PANVKDBG calls wrapped, dump helpers guarded"
 
               meson setup build-bionic \
                 -Dbuildtype="$BUILD_TYPE" \
