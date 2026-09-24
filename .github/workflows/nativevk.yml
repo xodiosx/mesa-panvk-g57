@@ -150,6 +150,7 @@ jobs:
                 fi
               done
 
+              pkg install -y x11-repo tur-repo
               pkg install -y \
                 git clang lld ninja python python-pip pkg-config \
                 bison flex cmake glslang shaderc vulkan-headers \
