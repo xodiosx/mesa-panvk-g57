@@ -81,12 +81,14 @@ jobs:
           cat > "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py" << 'PYEOF'
           #!/usr/bin/env python3
           """
-          Strip PANVKDBG debug overhead from the Mesa fork's source tree.
+          Strip PANVKDBG debug output entirely from the Mesa fork's source
+          tree, before compilation. The calls are removed from the source
+          (not merely wrapped in `if (0)`), so there is no reliance on the
+          compiler dead-code-eliminating argument evaluation. This also
+          removes the format strings from the binary.
 
-          Wraps every `fprintf(stderr, "PANVKDBG ...")` call in `if (0)` so
-          -O2 / -O3 clang dead-code-eliminates the call and its argument
-          evaluation. Also adds an early return to the two BO/SHM dump
-          helpers in kbase_kmod.c (SIGBUS source). Idempotent.
+          Also adds an early return to the two BO/SHM dump helpers in
+          kbase_kmod.c (SIGBUS source). Idempotent.
           """
           import re
           import sys
@@ -99,12 +101,89 @@ jobs:
               "kbase_kmod_debug_dump_user_buffers",
           )
 
-          FPRINTF_RE = re.compile(
-              r'(?<!if \(0\) )\bfprintf\s*\(\s*stderr\s*,\s*(?="PANVKDBG)',
+          # Undo any previous `if (0) fprintf(stderr, "PANVKDBG` wrapping, so
+          # the delete logic has a single shape to handle. The fork has an
+          # earlier commit that wrapped some sites this way.
+          REWRAP_RE = re.compile(
+              r'if\s*\(\s*0\s*\)\s*(?=fprintf\s*\(\s*stderr\s*,\s*"PANVKDBG)'
           )
 
+          # Start of a PANVKDBG fprintf statement.
+          START_RE = re.compile(
+              r'fprintf\s*\(\s*stderr\s*,\s*(?="PANVKDBG)'
+          )
+
+          def _find_statement_end(src, open_paren_idx):
+              """Given the index of the '(' after `fprintf`, return the index
+              just past the matching ')' plus an optional trailing ';' and
+              newline. Respects string and character literals."""
+              depth = 0
+              i = open_paren_idx
+              in_str = False
+              in_chr = False
+              while i < len(src):
+                  c = src[i]
+                  if in_str:
+                      if c == "\\":
+                          i += 2
+                          continue
+                      if c == '"':
+                          in_str = False
+                  elif in_chr:
+                      if c == "\\":
+                          i += 2
+                          continue
+                      if c == "'":
+                          in_chr = False
+                  else:
+                      if c == '"':
+                          in_str = True
+                      elif c == "'":
+                          in_chr = True
+                      elif c == "(":
+                          depth += 1
+                      elif c == ")":
+                          depth -= 1
+                          if depth == 0:
+                              i += 1
+                              break
+                  i += 1
+
+              while i < len(src) and src[i] in " \t":
+                  i += 1
+              if i < len(src) and src[i] == ";":
+                  i += 1
+              if i < len(src) and src[i] == "\n":
+                  i += 1
+              return i
+
           def silence_fprintf(src):
-              return FPRINTF_RE.subn("if (0) fprintf(stderr, ", src)
+              """Delete every fprintf(stderr, "PANVKDBG ...)" statement.
+              Returns (new_src, count)."""
+              src = REWRAP_RE.sub("", src)
+              out = []
+              i = 0
+              count = 0
+              while i < len(src):
+                  idx = src.find("fprintf", i)
+                  if idx == -1:
+                      out.append(src[i:])
+                      break
+
+                  m = START_RE.match(src, idx)
+                  if not m:
+                      out.append(src[i:idx + len("fprintf")])
+                      i = idx + len("fprintf")
+                      continue
+
+                  open_paren = src.find("(", m.start())
+                  end = _find_statement_end(src, open_paren)
+
+                  out.append(src[i:idx])
+                  i = end
+                  count += 1
+
+              return "".join(out), count
 
           def early_return(src, func_name):
               pat = re.compile(
@@ -145,7 +224,7 @@ jobs:
                   orig = src
                   src, n = silence_fprintf(src)
                   if n:
-                      print(f"{path}: wrapped {n} PANVKDBG call(s)")
+                      print(f"{path}: removed {n} PANVKDBG statement(s)")
                       total_calls += n
                       total_files += 1
                   if src != orig:
@@ -165,7 +244,7 @@ jobs:
 
               print()
               print(f"Total files modified: {total_files}")
-              print(f"Total PANVKDBG calls wrapped: {total_calls}")
+              print(f"Total PANVKDBG statements removed: {total_calls}")
 
               remaining = 0
               for path in ROOT.rglob("*"):
@@ -175,7 +254,7 @@ jobs:
                       remaining += path.read_text().count('"PANVKDBG')
                   except UnicodeDecodeError:
                       pass
-              print(f"Total \"PANVKDBG string literals in tree: {remaining}")
+              print(f"Total \"PANVKDBG literals remaining in tree: {remaining}")
               return 0
 
           if __name__ == "__main__":
@@ -236,13 +315,19 @@ jobs:
               cd mesa-panvk
 
               echo "=============================================="
-              echo "Patching PANVKDBG debug calls in source tree ..."
+              echo "Removing PANVKDBG statements from source tree ..."
               echo "=============================================="
               if [[ ! -f /ci-scripts/patch_panvkdbg.py ]]; then
                 echo "ERROR: /ci-scripts/patch_panvkdbg.py not mounted" >&2
                 exit 1
               fi
               python3 /ci-scripts/patch_panvkdbg.py
+
+              echo "=============================================="
+              echo "Informational: residual PANVKDBG literals in tree ..."
+              echo "=============================================="
+              RESIDUAL=$(grep -r "\"PANVKDBG" src/panfrost/ | wc -l || true)
+              echo "Residual \"PANVKDBG literals in source tree: $RESIDUAL"
 
               meson setup build-bionic \
                 -Dbuildtype="$BUILD_TYPE" \
@@ -267,17 +352,18 @@ jobs:
               ninja -C build-bionic -j$(nproc) \
                 src/panfrost/vulkan/libvulkan_panfrost.so
 
+              echo "=============================================="
+              echo "Informational: PANVKDBG strings in built .so ..."
+              echo "=============================================="
+              SO_STRINGS=$(strings build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
+                             | grep -c "^PANVKDBG" || true)
+              echo "PANVKDBG strings in freshly built .so: $SO_STRINGS"
+
               mkdir -p /termux-out/lib
               mkdir -p /termux-out/share/vulkan/icd.d
 
               cp build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
                  /termux-out/lib/libvulkan_panfrost.so
-
-              echo "=============================================="
-              echo "PANVKDBG string count in binary (informational) ..."
-              echo "=============================================="
-              PANVKDBG_STRINGS=$(strings /termux-out/lib/libvulkan_panfrost.so | grep -c "^PANVKDBG" || true)
-              echo "PANVKDBG format strings in binary: $PANVKDBG_STRINGS"
 
               cat > /termux-out/share/vulkan/icd.d/panfrost_icd.aarch64.json <<JSON
               {
@@ -347,11 +433,14 @@ jobs:
             **Build types:** `${{ needs.prepare.outputs.types }}`
 
             ### Build customizations
-            - PANVKDBG debug output neutralized at the source level by the
-              CI itself (before compilation) with `if (0)` wrappers around
-              every `fprintf(stderr, "PANVKDBG ...")` call and early returns
-              in the two BO/SHM dump helpers. The compiler dead-code-
-              eliminates the calls and their argument evaluation at -O2/-O3.
+            - PANVKDBG debug statements are deleted from the source tree by
+              the CI before compilation. Unlike `if (0)` wrapping, this does
+              not depend on the compiler's dead-code elimination — the call
+              sites and their argument evaluation are physically gone from
+              the translation units, and the format strings do not appear in
+              the binary.
+            - Early returns added to the two BO/SHM dump helpers in
+              `kbase_kmod.c`.
 
             ### Files
             - `panvk-termux-aarch64-debugoptimized-*.tar.gz`
