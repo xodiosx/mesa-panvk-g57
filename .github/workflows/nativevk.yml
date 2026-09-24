@@ -75,47 +75,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify sigbus.patch exists at repo root
-        run: |
-          set -euo pipefail
-          PATCH="${{ github.workspace }}/sigbus.patch"
-          if [[ ! -f "$PATCH" ]]; then
-            echo "ERROR: sigbus.patch not found at repo root ($PATCH)"
-            ls -la "${{ github.workspace }}"
-            exit 1
-          fi
-          echo "Found patch:"
-          ls -lh "$PATCH"
-          echo "--- first 30 lines ---"
-          head -n 30 "$PATCH"
-
-      - name: Create PanVK silence header on runner
-        run: |
-          set -euo pipefail
-          HDR="${{ github.workspace }}/panvk_silence.h"
-          cat > "$HDR" <<'EOF'
-          #pragma once
-          #include <stdio.h>
-          #include <string.h>
-          #include <stdarg.h>
-
-          static inline int __panvk_silence_fprintf(FILE *fp, const char *fmt, ...) {
-              if (fp == stderr && fmt && strncmp(fmt, "PANVKDBG", 8) == 0)
-                  return 0;
-              va_list ap;
-              va_start(ap, fmt);
-              int r = vfprintf(fp, fmt, ap);
-              va_end(ap);
-              return r;
-          }
-
-          #define fprintf(fp, ...) __panvk_silence_fprintf((fp), __VA_ARGS__)
-          EOF
-          echo "--- wrote $HDR ---"
-          wc -l "$HDR"
-          echo "--- contents ---"
-          cat "$HDR"
-
       - name: Build PanVK (${{ matrix.build-type }}) inside Termux container
         run: |
           set -euo pipefail
@@ -125,14 +84,13 @@ jobs:
 
           docker run --rm \
             -v "${{ github.workspace }}/termux-out-${{ matrix.build-type }}:/termux-out" \
-            -v "${{ github.workspace }}:/patch:ro" \
             termux/termux-docker:aarch64 \
             bash -c '
               set -euo pipefail
               export TMPDIR="${TMPDIR:-$PREFIX/tmp}"
               export BUILD_TYPE="'"${{ matrix.build-type }}"'"
 
-              # Swap Aliyun for the official Termux mirror (Aliyun is often mid-sync)
+              # Use the official Termux mirror
               mkdir -p "$PREFIX/etc/apt/sources.list.d"
               echo "deb https://packages.termux.dev/apt/termux-main stable main" \
                 > "$PREFIX/etc/apt/sources.list.d/termux-main.list"
@@ -149,14 +107,13 @@ jobs:
                   exit 1
                 fi
               done
-
               pkg install -y x11-repo tur-repo
               pkg install -y \
                 git clang lld ninja python python-pip pkg-config \
                 bison flex cmake glslang shaderc vulkan-headers \
                 vulkan-loader-generic libandroid-shmem libdrm libxcb \
                 xorgproto libx11 libxshmfence zlib zstd libexpat libclc spirv-llvm-translator \
-                libxrandr libxrandr-static patch file
+                libxrandr libxrandr-static file
 
               pip install --break-system-packages meson mako pyyaml packaging
 
@@ -166,49 +123,21 @@ jobs:
               git clone --depth 1 https://github.com/xodiosx/mesa-panvk-g57.git mesa-panvk
               cd mesa-panvk
 
-              # ── Apply sigbus.patch from repo root (mounted at /patch) ──
-              if [[ -f /patch/sigbus.patch ]]; then
-                echo "=============================================="
-                echo "Applying /patch/sigbus.patch ..."
-                echo "=============================================="
-                if git apply --verbose /patch/sigbus.patch; then
-                  echo ">>> git apply succeeded"
-                else
-                  echo ">>> git apply failed, falling back to patch(1)"
-                  patch -p1 --batch --forward < /patch/sigbus.patch
-                fi
-                echo "--- patch applied, diff stat: ---"
-                git --no-pager diff --stat || true
-                echo "--- end of diff stat ---"
-              else
-                echo "WARNING: /patch/sigbus.patch not found, building unpatched"
-                ls -la /patch || true
-              fi
-
-              # ── Install PANVKDBG silence header (copied from host) ──
+              # ── Verify the source-level PANVKDBG neutralization is present ──
               echo "=============================================="
-              echo "Installing PANVKDBG silence header ..."
+              echo "Verifying PANVKDBG source patch is present ..."
               echo "=============================================="
-
-              if [[ ! -f /patch/panvk_silence.h ]]; then
-                echo "ERROR: /patch/panvk_silence.h missing — host step did not run"
-                ls -la /patch || true
+              SILENCED=$(grep -c "if (0) fprintf(stderr, \"PANVKDBG" \
+                           src/panfrost/lib/kmod/kbase_kmod.c || true)
+              DUMP_GUARDS=$(grep -c "DEBUG DISABLED: dump path stripped" \
+                              src/panfrost/lib/kmod/kbase_kmod.c || true)
+              echo "if (0) fprintf sites:       $SILENCED"
+              echo "dump-path early returns:    $DUMP_GUARDS"
+              if [[ "$SILENCED" -lt 10 || "$DUMP_GUARDS" -lt 2 ]]; then
+                echo "ERROR: PANVKDBG source patch missing or incomplete."
+                echo "Commit the local patch to the repo and retry."
                 exit 1
               fi
-
-              cp /patch/panvk_silence.h "$PWD/src/panvk_silence.h"
-              SILENCE_H="$PWD/src/panvk_silence.h"
-              echo "Installed at: $SILENCE_H"
-              wc -l "$SILENCE_H"
-              head -3 "$SILENCE_H"
-
-              # Feed it to every C/C++ compile via CFLAGS/CXXFLAGS.
-              # Meson reads these at setup time as default c_args/cpp_args.
-              export CFLAGS="-include $SILENCE_H"
-              export CXXFLAGS="-include $SILENCE_H"
-              echo "CFLAGS=$CFLAGS"
-              echo "CXXFLAGS=$CXXFLAGS"
-              # ──────────────────────────────────────────────────────────
 
               meson setup build-bionic \
                 -Dbuildtype="$BUILD_TYPE" \
@@ -239,19 +168,23 @@ jobs:
               cp build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
                  /termux-out/lib/libvulkan_panfrost.so
 
-              # ── Verify the silence header worked ──
+              # ── Verify PANVKDBG strings were dead-code-eliminated ──
               echo "=============================================="
               echo "Verifying PANVKDBG strings are gone from .so ..."
               echo "=============================================="
-              PANVKDBG_STRINGS=$(strings /termux-out/lib/libvulkan_panfrost.so | grep -c "PANVKDBG" || true)
-              echo "PANVKDBG string literals remaining: $PANVKDBG_STRINGS"
-              if [[ "$PANVKDBG_STRINGS" -lt 20 ]]; then
-                echo ">>> PASS: silence header worked (calls DCEd)"
-              else
-                echo ">>> WARNING: many PANVKDBG strings still present"
-                strings /termux-out/lib/libvulkan_panfrost.so | grep "PANVKDBG" | head -10 || true
+              PANVKDBG_STRINGS=$(strings /termux-out/lib/libvulkan_panfrost.so \
+                                   | grep -c "^PANVKDBG" || true)
+              echo "PANVKDBG format strings in binary: $PANVKDBG_STRINGS"
+
+              if [[ "$PANVKDBG_STRINGS" -ne 0 ]]; then
+                echo ">>> FAIL: $PANVKDBG_STRINGS PANVKDBG literals survived."
+                echo ">>> The compiler did not DCE the if(0) bodies."
+                echo ">>> Check that buildtype is debugoptimized or release, not debug."
+                strings /termux-out/lib/libvulkan_panfrost.so \
+                  | grep "PANVKDBG" | head -20 || true
+                exit 1
               fi
-              # ─────────────────────────────────────────────────────
+              echo ">>> PASS: 0 PANVKDBG strings in the binary"
 
               # ── ICD manifest ──
               cat > /termux-out/share/vulkan/icd.d/panfrost_icd.aarch64.json <<JSON
@@ -322,16 +255,19 @@ jobs:
             **Build types:** `${{ needs.prepare.outputs.types }}`
 
             ### Build customizations
-            - `sigbus.patch` applied (SHM debug dump SIGBUS fix)
-            - `PANVKDBG` debug fprintf calls silenced via a `-include`
-              wrapper — the compiler folds the check at compile time and
-              dead-code eliminates every PANVKDBG call site. Same runtime
-              performance as a source-level strip, no risk to control flow.
+            - PANVKDBG debug fprintf calls neutralized at the source level
+              with `if (0)` wrappers plus early returns in the two BO/SHM
+              dump helpers. The compiler dead-code-eliminates the calls
+              and their argument evaluation at -O2/-O3, removing the
+              CPU-side overhead from the frame path entirely.
+            - The former `sigbus.patch` is no longer required: the SIGBUS
+              source (dumping `gpu[0..15]` from a truncated mapping) is
+              inside a function that now returns immediately.
 
             ### Files
             - `panvk-termux-aarch64-debugoptimized-*.tar.gz` — full install tree (debug)
             - `panvk-termux-aarch64-release-*.tar.gz` — full install tree (release)
-            - `libvulkan_panfrost.so` — Vulkan driver (from the last-built variant)
+            - `libvulkan_panfrost.so` — Vulkan driver
             - `panfrost_icd.aarch64.json` — ICD manifest
 
             ### Install (Termux)
