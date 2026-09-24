@@ -217,6 +217,7 @@ jobs:
                   exit 1
                 fi
               done
+              pkg install -y x11-repo tur-repo
 
               pkg install -y \
                 git clang lld ninja python python-pip pkg-config \
