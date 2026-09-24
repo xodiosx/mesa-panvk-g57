@@ -186,35 +186,59 @@ jobs:
             's/#if defined(HAVE_MEMFD_CREATE) \&\& !defined __TERMUX__/#if defined(HAVE_MEMFD_CREATE)/' \
             src/util/anon_file.c || true
 
+      - name: Patch vendored vk_android_native_buffer.h (buffer_handle_t conflict)
+        working-directory: mesa-src
+        run: |
+          set -euo pipefail
+          FILE="include/vulkan/vk_android_native_buffer.h"
+          if [[ ! -f "$FILE" ]]; then
+            echo "ERROR: $FILE not found"
+            find . -name 'vk_android_native_buffer.h' -print
+            exit 1
+          fi
+
+          echo "==== $FILE before (buffer_handle_t lines) ===="
+          grep -n -C2 'buffer_handle_t' "$FILE" || true
+
+          # Replace the "typedef void *buffer_handle_t;" fallback with an
+          # include of the android_stub's cutils/native_handle.h, which
+          # provides the authoritative Android definition
+          # (typedef const native_handle_t* buffer_handle_t).
+          # The stub's include guard prevents later re-inclusion from
+          # triggering the redefinition conflict.
+          sed -i -E \
+            's|^([[:space:]]*)typedef[[:space:]]+void[[:space:]]*\*[[:space:]]*buffer_handle_t[[:space:]]*;.*$|\1#include <cutils/native_handle.h>|' \
+            "$FILE"
+
+          echo "==== $FILE after ===="
+          grep -n -C2 'buffer_handle_t\|cutils/native_handle' "$FILE" || true
+
+          if grep -qE 'typedef[[:space:]]+void[[:space:]]*\*[[:space:]]*buffer_handle_t' "$FILE"; then
+            echo "ERROR: fallback typedef still present after sed"
+            exit 1
+          fi
+          if ! grep -q 'cutils/native_handle.h' "$FILE"; then
+            echo "ERROR: replacement include not found after sed"
+            exit 1
+          fi
+          echo "OK: $FILE patched"
+
       - name: Stage libdrm + X11 + xcb headers into a workspace include dir
         run: |
           set -euo pipefail
-          # meson strips -I/usr/include* from pkg-config Cflags, and putting
-          # those paths on the NDK command line would shadow bionic headers.
-          # Stage everything into one workspace-local tree so meson keeps the
-          # path and bionic stays untouched.
           DEST="$GITHUB_WORKSPACE/mesa-src/external-include"
           rm -rf "$DEST"
           mkdir -p "$DEST"
 
-          # ---- libdrm: flat headers ----
           cp /usr/include/xf86drm.h     "$DEST/"
           cp /usr/include/xf86drmMode.h "$DEST/"
           cp /usr/include/libdrm/*.h    "$DEST/"
-
-          # ---- X11 (keeps X11/ prefix) ----
           cp -r /usr/include/X11 "$DEST/"
-
-          # ---- xcb (keeps xcb/ prefix) ----
           cp -r /usr/include/xcb "$DEST/"
 
           echo "==== $DEST (top level) ===="
           ls -la "$DEST"
-          echo "==== X11 sample ===="
-          ls "$DEST/X11" | head -20
-          echo "==== xcb sample ===="
-          ls "$DEST/xcb" | head -20
-          echo "==== sanity: the three headers that were failing ===="
+          echo "==== sanity ===="
           for h in xf86drm.h X11/Xlib.h xcb/xcb.h; do
             if [[ -f "$DEST/$h" ]]; then
               echo "OK: $DEST/$h"
@@ -275,9 +299,6 @@ jobs:
           mkdir -p shims
 
           "$TOOLCHAIN/bin/llvm-ar" cr shims/librt.a
-
-          # Every shim gets the same Cflags so mesa can find the staged
-          # headers regardless of which dep triggers the include.
 
           cat > shims/libdrm.pc <<EOF
           Name: libdrm
@@ -351,20 +372,10 @@ jobs:
           EOF
           done
 
-          echo "==== shims directory ===="
-          ls -la shims
-          echo "==== libdrm.pc ===="
-          cat shims/libdrm.pc
-          echo "==== x11-xcb.pc ===="
-          cat shims/x11-xcb.pc
-          echo "==== xcb.pc ===="
-          cat shims/xcb.pc
-
           echo "==== pkg-config sanity ===="
           PKG_CONFIG_LIBDIR="$MESON_WORKING_DIR/shims" pkg-config --cflags libdrm
           PKG_CONFIG_LIBDIR="$MESON_WORKING_DIR/shims" pkg-config --cflags x11-xcb
           PKG_CONFIG_LIBDIR="$MESON_WORKING_DIR/shims" pkg-config --cflags xcb
-          # ^ all three should print: -I${WORKSPACE}/mesa-src/external-include
 
       - name: Generate Android cross file
         working-directory: mesa-src
@@ -454,11 +465,8 @@ jobs:
           set -euo pipefail
           if grep -q "$GITHUB_WORKSPACE/mesa-src/external-include" build/build.ninja; then
             echo "OK: external-include IS on the compile line"
-            grep -m1 "external-include" build/build.ninja | head -c 400
-            echo
           else
             echo "ERROR: external-include is NOT in build.ninja"
-            echo "---- search for -I paths in build.ninja ----"
             grep -o '\-I[^ ]*' build/build.ninja | sort -u | head -40
             exit 1
           fi
@@ -493,8 +501,6 @@ jobs:
           }
           JSON
 
-          echo "==== ICD ===="
-          cat "$OUT/share/vulkan/icd.d/panfrost_icd.aarch64.json"
           echo "==== output tree ===="
           find "$OUT" -type f
 
