@@ -75,6 +75,117 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Write PANVKDBG patch script
+        run: |
+          mkdir -p "${{ github.workspace }}/ci-scripts"
+          cat > "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py" << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Strip PANVKDBG debug overhead from the Mesa fork's source tree.
+
+          Wraps every `fprintf(stderr, "PANVKDBG ...")` call in `if (0)` so
+          -O2 / -O3 clang dead-code-eliminates the call and its argument
+          evaluation. Also adds an early return to the two BO/SHM dump
+          helpers in kbase_kmod.c (SIGBUS source). Idempotent.
+          """
+          import re
+          import sys
+          from pathlib import Path
+
+          ROOT = Path("src/panfrost")
+          DUMP_HELPERS_FILE = Path("src/panfrost/lib/kmod/kbase_kmod.c")
+          DUMP_HELPERS = (
+              "kbase_kmod_debug_dump_native_bos",
+              "kbase_kmod_debug_dump_user_buffers",
+          )
+
+          FPRINTF_RE = re.compile(
+              r'(?<!if \(0\) )\bfprintf\s*\(\s*stderr\s*,\s*(?="PANVKDBG)',
+          )
+
+          def silence_fprintf(src):
+              return FPRINTF_RE.subn("if (0) fprintf(stderr, ", src)
+
+          def early_return(src, func_name):
+              pat = re.compile(
+                  re.escape(func_name) + r"\s*\([^;{]*?\)\s*\{", re.DOTALL
+              )
+              m = pat.search(src)
+              if not m:
+                  return src, False
+              brace = src.rfind("{", m.start(), m.end())
+              if brace < 0:
+                  return src, False
+              window = src[brace + 1 : brace + 250]
+              if "DEBUG DISABLED" in window:
+                  return src, False
+              insertion = (
+                  "\n   /* DEBUG DISABLED: dump path stripped for performance */\n"
+                  "   return;"
+              )
+              return src[: brace + 1] + insertion + src[brace + 1 :], True
+
+          def main():
+              if not ROOT.exists():
+                  print(f"ERROR: {ROOT} not found", file=sys.stderr)
+                  return 1
+
+              total_calls = 0
+              total_files = 0
+
+              for path in sorted(ROOT.rglob("*")):
+                  if path.suffix not in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp"):
+                      continue
+                  try:
+                      src = path.read_text()
+                  except UnicodeDecodeError:
+                      continue
+                  if '"PANVKDBG' not in src:
+                      continue
+                  orig = src
+                  src, n = silence_fprintf(src)
+                  if n:
+                      print(f"{path}: wrapped {n} PANVKDBG call(s)")
+                      total_calls += n
+                      total_files += 1
+                  if src != orig:
+                      path.write_text(src)
+
+              if DUMP_HELPERS_FILE.exists():
+                  src = DUMP_HELPERS_FILE.read_text()
+                  changed = False
+                  for fn in DUMP_HELPERS:
+                      src, ok = early_return(src, fn)
+                      state = "patched" if ok else "skipped (already patched or not found)"
+                      print(f"  {state}: {fn}")
+                      if ok:
+                          changed = True
+                  if changed:
+                      DUMP_HELPERS_FILE.write_text(src)
+
+              print()
+              print(f"Total files modified: {total_files}")
+              print(f"Total PANVKDBG calls wrapped: {total_calls}")
+
+              remaining = 0
+              for path in ROOT.rglob("*"):
+                  if path.suffix not in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp"):
+                      continue
+                  try:
+                      remaining += path.read_text().count('"PANVKDBG')
+                  except UnicodeDecodeError:
+                      pass
+              print(f"Total \"PANVKDBG string literals in tree: {remaining}")
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          chmod +x "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
+          echo "--- wrote ci-scripts/patch_panvkdbg.py ---"
+          wc -l "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
+          head -5 "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
+
       - name: Build PanVK (${{ matrix.build-type }}) inside Termux container
         run: |
           set -euo pipefail
@@ -84,18 +195,17 @@ jobs:
 
           docker run --rm \
             -v "${{ github.workspace }}/termux-out-${{ matrix.build-type }}:/termux-out" \
+            -v "${{ github.workspace }}/ci-scripts:/ci-scripts:ro" \
             termux/termux-docker:aarch64 \
             bash -c '
               set -euo pipefail
               export TMPDIR="${TMPDIR:-$PREFIX/tmp}"
               export BUILD_TYPE="'"${{ matrix.build-type }}"'"
 
-              # Use the official Termux mirror
               mkdir -p "$PREFIX/etc/apt/sources.list.d"
               echo "deb https://packages.termux.dev/apt/termux-main stable main" \
                 > "$PREFIX/etc/apt/sources.list.d/termux-main.list"
 
-              # Retry pkg update a few times
               for i in 1 2 3; do
                 if pkg update -y; then
                   break
@@ -107,13 +217,13 @@ jobs:
                   exit 1
                 fi
               done
-              pkg install -y x11-repo tur-repo
+
               pkg install -y \
                 git clang lld ninja python python-pip pkg-config \
                 bison flex cmake glslang shaderc vulkan-headers \
                 vulkan-loader-generic libandroid-shmem libdrm libxcb \
-                xorgproto libx11 libxshmfence zlib zstd libexpat libclc spirv-llvm-translator \
-                libxrandr libxrandr-static file
+                xorgproto libx11 libxshmfence zlib zstd libexpat \
+                libclc spirv-llvm-translator libxrandr libxrandr-static file
 
               pip install --break-system-packages meson mako pyyaml packaging
 
@@ -123,19 +233,25 @@ jobs:
               git clone --depth 1 https://github.com/xodiosx/mesa-panvk-g57.git mesa-panvk
               cd mesa-panvk
 
-              # ── Verify the source-level PANVKDBG neutralization is present ──
               echo "=============================================="
-              echo "Verifying PANVKDBG source patch is present ..."
+              echo "Patching PANVKDBG debug calls in source tree ..."
               echo "=============================================="
-              SILENCED=$(grep -c "if (0) fprintf(stderr, \"PANVKDBG" \
-                           src/panfrost/lib/kmod/kbase_kmod.c || true)
-              DUMP_GUARDS=$(grep -c "DEBUG DISABLED: dump path stripped" \
-                              src/panfrost/lib/kmod/kbase_kmod.c || true)
-              echo "if (0) fprintf sites:       $SILENCED"
-              echo "dump-path early returns:    $DUMP_GUARDS"
-              if [[ "$SILENCED" -lt 10 || "$DUMP_GUARDS" -lt 2 ]]; then
-                echo "ERROR: PANVKDBG source patch missing or incomplete."
-                echo "Commit the local patch to the repo and retry."
+              if [[ ! -f /ci-scripts/patch_panvkdbg.py ]]; then
+                echo "ERROR: /ci-scripts/patch_panvkdbg.py not mounted" >&2
+                exit 1
+              fi
+              python3 /ci-scripts/patch_panvkdbg.py
+
+              echo "=============================================="
+              echo "Sanity check: patch actually applied ..."
+              echo "=============================================="
+              SILENCED=$(grep -r "if (0) fprintf(stderr, \"PANVKDBG" src/panfrost/ | wc -l || true)
+              DUMP_GUARDS=$(grep -r "DEBUG DISABLED: dump path stripped" src/panfrost/ | wc -l || true)
+              echo "if (0) fprintf sites:    $SILENCED"
+              echo "dump-path early returns: $DUMP_GUARDS"
+              if [[ "$SILENCED" -lt 100 || "$DUMP_GUARDS" -lt 2 ]]; then
+                echo "ERROR: PANVKDBG source patch incomplete." >&2
+                echo "Expected >=100 sites and >=2 dump guards." >&2
                 exit 1
               fi
 
@@ -168,7 +284,6 @@ jobs:
               cp build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
                  /termux-out/lib/libvulkan_panfrost.so
 
-              # ── Verify PANVKDBG strings were dead-code-eliminated ──
               echo "=============================================="
               echo "Verifying PANVKDBG strings are gone from .so ..."
               echo "=============================================="
@@ -177,16 +292,13 @@ jobs:
               echo "PANVKDBG format strings in binary: $PANVKDBG_STRINGS"
 
               if [[ "$PANVKDBG_STRINGS" -ne 0 ]]; then
-                echo ">>> FAIL: $PANVKDBG_STRINGS PANVKDBG literals survived."
-                echo ">>> The compiler did not DCE the if(0) bodies."
-                echo ">>> Check that buildtype is debugoptimized or release, not debug."
+                echo ">>> FAIL: $PANVKDBG_STRINGS PANVKDBG literals survived." >&2
                 strings /termux-out/lib/libvulkan_panfrost.so \
                   | grep "PANVKDBG" | head -20 || true
                 exit 1
               fi
               echo ">>> PASS: 0 PANVKDBG strings in the binary"
 
-              # ── ICD manifest ──
               cat > /termux-out/share/vulkan/icd.d/panfrost_icd.aarch64.json <<JSON
               {
                   "ICD": {
@@ -255,20 +367,17 @@ jobs:
             **Build types:** `${{ needs.prepare.outputs.types }}`
 
             ### Build customizations
-            - PANVKDBG debug fprintf calls neutralized at the source level
-              with `if (0)` wrappers plus early returns in the two BO/SHM
-              dump helpers. The compiler dead-code-eliminates the calls
-              and their argument evaluation at -O2/-O3, removing the
-              CPU-side overhead from the frame path entirely.
-            - The former `sigbus.patch` is no longer required: the SIGBUS
-              source (dumping `gpu[0..15]` from a truncated mapping) is
-              inside a function that now returns immediately.
+            - PANVKDBG debug output neutralized at the source level by the
+              CI itself (before compilation) with `if (0)` wrappers around
+              every `fprintf(stderr, "PANVKDBG ...")` call and early returns
+              in the two BO/SHM dump helpers. The compiler dead-code-
+              eliminates the calls and their argument evaluation at -O2/-O3.
 
             ### Files
-            - `panvk-termux-aarch64-debugoptimized-*.tar.gz` — full install tree (debug)
-            - `panvk-termux-aarch64-release-*.tar.gz` — full install tree (release)
-            - `libvulkan_panfrost.so` — Vulkan driver
-            - `panfrost_icd.aarch64.json` — ICD manifest
+            - `panvk-termux-aarch64-debugoptimized-*.tar.gz`
+            - `panvk-termux-aarch64-release-*.tar.gz`
+            - `libvulkan_panfrost.so`
+            - `panfrost_icd.aarch64.json`
 
             ### Install (Termux)
             ```bash
