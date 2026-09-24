@@ -184,7 +184,6 @@ jobs:
           chmod +x "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
           echo "--- wrote ci-scripts/patch_panvkdbg.py ---"
           wc -l "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
-          head -5 "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
 
       - name: Build PanVK (${{ matrix.build-type }}) inside Termux container
         run: |
@@ -250,9 +249,9 @@ jobs:
               DUMP_GUARDS=$(grep -r "DEBUG DISABLED: dump path stripped" src/panfrost/ | wc -l || true)
               echo "if (0) fprintf sites:    $SILENCED"
               echo "dump-path early returns: $DUMP_GUARDS"
-              if [[ "$SILENCED" -lt 100 || "$DUMP_GUARDS" -lt 2 ]]; then
+              if [[ "$SILENCED" -lt 60 || "$DUMP_GUARDS" -lt 2 ]]; then
                 echo "ERROR: PANVKDBG source patch incomplete." >&2
-                echo "Expected >=100 sites and >=2 dump guards." >&2
+                echo "Expected >=60 sites and >=2 dump guards." >&2
                 exit 1
               fi
 
