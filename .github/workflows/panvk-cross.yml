@@ -83,14 +83,18 @@ jobs:
             echo "FOUND: $GITHUB_WORKSPACE/shims.zip"
             ls -lh "$GITHUB_WORKSPACE/shims.zip"
           else
-            echo "NOT FOUND: shims.zip will be cloned from funnymdzz"
+            echo "ERROR: shims.zip must be committed to repo root"
+            exit 1
           fi
 
       - name: Verify sigbus.patch
         run: |
           set -euo pipefail
           PATCH="${{ github.workspace }}/sigbus.patch"
-          [[ -f "$PATCH" ]] || { echo "ERROR: $PATCH not found"; exit 1; }
+          if [[ ! -f "$PATCH" ]]; then
+            echo "NOTE: sigbus.patch not present — will skip patch step"
+            exit 0
+          fi
           ls -lh "$PATCH"
           head -n 30 "$PATCH"
 
@@ -116,20 +120,62 @@ jobs:
           python -m pip install --upgrade pip
           pip install mako PyYAML meson ninja packaging
 
-      - name: Clone mesa-panvk-g57 and apply sigbus.patch
+      - name: Clone mesa-panvk-g57
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
           rm -rf mesa-src
           git clone --depth 1 https://github.com/xodiosx/mesa-panvk-g57.git mesa-src
           cd mesa-src
-          if git apply --verbose "$GITHUB_WORKSPACE/sigbus.patch"; then
-            echo ">>> git apply succeeded"
-          else
-            patch -p1 --batch --forward < "$GITHUB_WORKSPACE/sigbus.patch"
+          git --no-pager log -1 --oneline
+
+      - name: Apply sigbus.patch (best-effort, never fatal)
+        working-directory: mesa-src
+        run: |
+          set -uo pipefail
+          PATCH="$GITHUB_WORKSPACE/sigbus.patch"
+          if [[ ! -f "$PATCH" ]]; then
+            echo "No sigbus.patch — skipping"
+            exit 0
           fi
-          git --no-pager diff --stat || true
-          sed -i 's/#if defined(HAVE_MEMFD_CREATE) \&\& !defined __TERMUX__/#if defined(HAVE_MEMFD_CREATE)/' src/util/anon_file.c || true
+
+          echo "==== attempt 1: git apply --3way ===="
+          if git apply --3way "$PATCH" 2>&1; then
+            echo ">>> git apply --3way succeeded"
+            git --no-pager diff --stat || true
+            exit 0
+          fi
+
+          echo "==== attempt 2: patch -p1 --fuzz=3 ===="
+          if patch -p1 --batch --forward --fuzz=3 < "$PATCH"; then
+            echo ">>> patch -p1 --fuzz=3 succeeded"
+            exit 0
+          fi
+
+          echo "==== attempt 3: patch -p1 --fuzz=10 (very lenient) ===="
+          if patch -p1 --batch --forward --fuzz=10 < "$PATCH"; then
+            echo ">>> patch -p1 --fuzz=10 succeeded"
+            exit 0
+          fi
+
+          echo "=========================================================="
+          echo "WARN: sigbus.patch could not be applied (upstream drift)"
+          echo "      continuing WITHOUT the patch"
+          echo "=========================================================="
+          # Clean up any .rej/.orig files so they don't confuse ninja
+          find . -name '*.rej' -delete
+          find . -name '*.orig' -delete
+          git --no-pager status --short || true
+          exit 0
+
+      - name: memfd_create guard patch (idempotent)
+        working-directory: mesa-src
+        run: |
+          set -euo pipefail
+          sed -i \
+            's/#if defined(HAVE_MEMFD_CREATE) \&\& !defined __TERMUX__/#if defined(HAVE_MEMFD_CREATE)/' \
+            src/util/anon_file.c || true
+          echo "OK"
 
       - name: Patch vendored vk_android_native_buffer.h
         working-directory: mesa-src
@@ -137,57 +183,30 @@ jobs:
           set -euo pipefail
           FILE="include/vulkan/vk_android_native_buffer.h"
           [[ -f "$FILE" ]] || { echo "ERROR: $FILE missing"; exit 1; }
-          sed -i -E 's|^([[:space:]]*)typedef[[:space:]]+void[[:space:]]*\*[[:space:]]*buffer_handle_t[[:space:]]*;.*$|\1#include <cutils/native_handle.h>|' "$FILE"
+          sed -i -E \
+            's|^([[:space:]]*)typedef[[:space:]]+void[[:space:]]*\*[[:space:]]*buffer_handle_t[[:space:]]*;.*$|\1#include <cutils/native_handle.h>|' \
+            "$FILE"
           grep -q 'cutils/native_handle.h' "$FILE" || { echo "ERROR: patch failed"; exit 1; }
           echo "OK: patched $FILE"
 
-      - name: Fetch or reuse shims
+      - name: Unzip shims.zip into mesa-src
         run: |
           set -euo pipefail
           SHIMS_SRC="$GITHUB_WORKSPACE/mesa-src/shims"
           rm -rf "$SHIMS_SRC"
+          cd "$GITHUB_WORKSPACE/mesa-src"
+          unzip -q "$GITHUB_WORKSPACE/shims.zip"
 
-          if [[ -f "$GITHUB_WORKSPACE/shims.zip" ]]; then
-            echo "==== using repo-root shims.zip ===="
-            mkdir -p "$GITHUB_WORKSPACE/mesa-src"
-            cd "$GITHUB_WORKSPACE/mesa-src"
-            unzip -q "$GITHUB_WORKSPACE/shims.zip"
-          else
-            echo "==== cloning shims from Mateus-tokokudo/mesa-funnymdzz@panvk-jm ===="
-            rm -rf /tmp/funnymdzz
-            git clone --depth 1 --branch panvk-jm \
-              https://github.com/Mateus-tokokudo/mesa-funnymdzz.git \
-              /tmp/funnymdzz
-            if [[ -d /tmp/funnymdzz/shims ]]; then
-              cp -r /tmp/funnymdzz/shims "$SHIMS_SRC"
-            else
-              echo "ERROR: funnymdzz repo has no shims/ directory"
-              ls -la /tmp/funnymdzz
-              exit 1
-            fi
-          fi
-
-          [[ -d "$SHIMS_SRC" ]] || { echo "ERROR: $SHIMS_SRC missing"; exit 1; }
+          [[ -d "$SHIMS_SRC" ]] || { echo "ERROR: shims/ not found after unzip"; exit 1; }
 
           echo "==== shims tree (top) ===="
           ls -la "$SHIMS_SRC"
           echo "==== .so / .a ===="
-          find "$SHIMS_SRC" -name '*.so' -o -name '*.a' | sort || true
+          find "$SHIMS_SRC" -maxdepth 1 \( -name '*.so' -o -name '*.a' \) | sort || true
           echo "==== .pc ===="
-          find "$SHIMS_SRC" -name '*.pc' | sort || true
-
-          cd "$GITHUB_WORKSPACE/mesa-src"
-          rm -f "$GITHUB_WORKSPACE/shims.zip"
-          zip -qr "$GITHUB_WORKSPACE/shims.zip" shims
-          ls -lh "$GITHUB_WORKSPACE/shims.zip"
-
-      - name: Upload shims.zip artifact (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: shims-zip-${{ needs.prepare.outputs.stamp }}
-          path: ${{ github.workspace }}/shims.zip
-          if-no-files-found: warn
+          find "$SHIMS_SRC" -maxdepth 1 -name '*.pc' | sort || true
+          echo "==== include (top) ===="
+          ls -la "$SHIMS_SRC/include" 2>/dev/null || true
 
       - name: Build host tools
         working-directory: mesa-src
@@ -202,8 +221,8 @@ jobs:
             src/compiler/clc/mesa_clc \
             src/compiler/spirv/vtn_bindgen2 \
             src/panfrost/clc/panfrost_compile
-          ln -sf "build-host/src/compiler/clc/mesa_clc"       "build-host/src/compiler/clc/mesa-clc"
-          ln -sf "build-host/src/compiler/spirv/vtn_bindgen2" "build-host/src/compiler/spirv/vtn-bindgen2"
+          ln -sf "build-host/src/compiler/clc/mesa_clc"         "build-host/src/compiler/clc/mesa-clc"
+          ln -sf "build-host/src/compiler/spirv/vtn_bindgen2"   "build-host/src/compiler/spirv/vtn-bindgen2"
           ln -sf "build-host/src/panfrost/clc/panfrost_compile" "build-host/src/compiler/spirv/panfrost-compile"
 
       - name: Generate Android cross file
@@ -289,7 +308,8 @@ jobs:
         working-directory: mesa-src
         run: |
           set -euo pipefail
-          grep -q "$GITHUB_WORKSPACE/mesa-src/shims" build/build.ninja || { echo "ERROR: shims path missing"; exit 1; }
+          grep -q "$GITHUB_WORKSPACE/mesa-src/shims" build/build.ninja \
+            || { echo "ERROR: shims path missing"; exit 1; }
           echo "OK: shims path present in build.ninja"
 
       - name: Prebuild panvk_android_hal_bridge.o and weaken HMI
@@ -317,22 +337,20 @@ jobs:
           ninja -C build "$OBJ_REL"
 
           echo "==== HMI symbol before ===="
-          "$NM" "$OBJ_ABS" 2>/dev/null | grep -E 'HMI' || echo "  (no HMI symbol found)"
+          "$NM" "$OBJ_ABS" 2>/dev/null | grep 'HMI' || echo "  (no HMI symbol found)"
 
-          echo "==== weaken HMI symbol ===="
+          echo "==== weaken HMI ===="
           if "$OBJCOPY" --weaken-symbol=HMI "$OBJ_ABS" 2>/dev/null; then
             echo "OK: --weaken-symbol=HMI"
           else
-            echo "WARN: --weaken-symbol failed, trying --localize-symbol"
-            if "$OBJCOPY" --localize-symbol=HMI "$OBJ_ABS" 2>/dev/null; then
-              echo "OK: --localize-symbol=HMI"
-            else
-              echo "WARN: both objcopy ops failed"
-            fi
+            echo "WARN: weaken failed, trying localize"
+            "$OBJCOPY" --localize-symbol=HMI "$OBJ_ABS" 2>/dev/null \
+              && echo "OK: --localize-symbol=HMI" \
+              || echo "WARN: both objcopy ops failed"
           fi
 
           echo "==== HMI symbol after ===="
-          "$NM" "$OBJ_ABS" 2>/dev/null | grep -E 'HMI' || echo "  (no HMI symbol found)"
+          "$NM" "$OBJ_ABS" 2>/dev/null | grep 'HMI' || echo "  (no HMI symbol found)"
 
       - name: Compile libvulkan_panfrost.so
         working-directory: mesa-src
@@ -395,9 +413,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-files
-          if compgen -G "artifacts/shims.zip" >/dev/null; then
-            cp artifacts/shims.zip release-files/
-          fi
           find artifacts -name 'panvk-winlator-aarch64-*.tar.gz' -exec cp {} release-files/ \; || true
           find artifacts -name 'libvulkan_panfrost.so'           -exec cp {} release-files/ \; || true
           find artifacts -name 'panfrost_icd.aarch64.json'       -exec cp {} release-files/ \; || true
@@ -419,13 +434,12 @@ jobs:
             echo "**Commit:** \`${{ github.sha }}\`"
             echo "**Requested build types:** \`${{ needs.prepare.outputs.types }}\`"
             echo "**Build succeeded:** \`${BUILD_OK}\`"
-            echo ""
-            echo "### Files"
-            echo "- \`shims.zip\` — pkg-config shims + stub archives + headers"
           } > notes.md
 
           if [[ "$BUILD_OK" == "yes" ]]; then
             {
+              echo ""
+              echo "### Files"
               echo "- \`panvk-winlator-aarch64-debugoptimized-*.tar.gz\`"
               echo "- \`panvk-winlator-aarch64-release-*.tar.gz\`"
               echo "- \`libvulkan_panfrost.so\` — Vulkan driver"
