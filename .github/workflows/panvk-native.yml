@@ -1,4 +1,4 @@
-name: release PanVK for Termux (aarch64, native)
+name: release PanVK2 for Termux (aarch64, native)
 
 on:
   push:
