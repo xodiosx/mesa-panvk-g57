@@ -7,7 +7,9 @@ on:
         description: "Tag to create (leave empty to auto-generate)"
         required: false
         default: ""
-  
+  push:
+    branches: [winlator-pan]
+
 permissions:
   contents: write
 
@@ -137,8 +139,8 @@ jobs:
             - `PanVK-G57-WinlatorMali-candidate-*.zip` — packaged driver
             - Meson logs and provenance files if the build emitted them
 
-            ### Install (Winlator / Android container)
-            install using adrenotools in most emulators 
+            ### Install (Winlator / XoDos rebirth)
+            using adrenotools for most emulators 
             
           files: |
             artifacts/**/*
