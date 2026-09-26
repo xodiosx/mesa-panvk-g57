@@ -1,4 +1,4 @@
-name: Build PanVK for Winlator (aarch64, cross-compile via Android NDK)
+name: release PanVK + Zink for Winlator (aarch64, cross-compile)
 
 on:
   push:
@@ -6,15 +6,6 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      build_type:
-        description: "Build type"
-        type: choice
-        required: true
-        default: both
-        options:
-          - both
-          - debugoptimized
-          - release
       release_tag:
         description: "Tag to create (leave empty to auto-generate)"
         required: false
@@ -27,11 +18,10 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      date: ${{ steps.ts.outputs.date }}
-      time: ${{ steps.ts.outputs.time }}
+      date:  ${{ steps.ts.outputs.date }}
+      time:  ${{ steps.ts.outputs.time }}
       stamp: ${{ steps.ts.outputs.stamp }}
-      tag: ${{ steps.ts.outputs.tag }}
-      types: ${{ steps.ts.outputs.types }}
+      tag:   ${{ steps.ts.outputs.tag }}
     steps:
       - name: Compute build timestamp and tag
         id: ts
@@ -54,417 +44,480 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          CHOICE="${{ github.event.inputs.build_type }}"
-          case "$CHOICE" in
-            release)        TYPES='["release"]' ;;
-            debugoptimized) TYPES='["debugoptimized"]' ;;
-            *)              TYPES='["debugoptimized","release"]' ;;
-          esac
-          echo "types=$TYPES" >> "$GITHUB_OUTPUT"
-
-  build:
-    needs: prepare
+  prepare-winlator-branch:
+    needs: [prepare]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        build-type: ${{ fromJSON(needs.prepare.outputs.types) }}
-
+    permissions:
+      contents: write
+    env:
+      BASE_REPO:      "xodiosx/mesa-panvk-mali-g57"
+      WINLATOR_REPO:  "mexicanbr0auth/mesa-panvk-g57"
+      WINLATOR_BRANCH: "winlator-cl"
+      TARGET_BRANCH:  "winlator-pan"
+      EXCLUDE_PATHS:  ".github/workflows"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Report repo-root contents
+      - name: Configure git credentials
         run: |
           set -euo pipefail
-          ls -la "$GITHUB_WORKSPACE"
-          if [[ -f "$GITHUB_WORKSPACE/shims.zip" ]]; then
-            echo "FOUND: $GITHUB_WORKSPACE/shims.zip"
-            ls -lh "$GITHUB_WORKSPACE/shims.zip"
+          git config --local user.email "github-actions@users.noreply.github.com"
+          git config --local user.name  "github-actions"
+          git remote set-url origin \
+            "https://x-access-token:${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git remote -v
+
+      - name: Write patcher script
+        run: |
+          mkdir -p "${{ github.workspace }}/ci-scripts"
+          cat > "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py" << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Source-tree transformations applied before compilation.
+
+          1. Neutralize every `fprintf(stderr, "PANVKDBG ...")` statement
+             by replacing the call with `(void)0`.
+
+          2. Rename the PanVK Vulkan driver name to "panvcake".
+
+          3. Change the Vulkan driver ID reported by PanVK from
+             VK_DRIVER_ID_MESA_PANVK to a custom value.
+          """
+          import re
+          import sys
+          from pathlib import Path
+
+          ROOTS = [Path("src/panfrost"), Path("src/vulkan")]
+
+          REWRAP_RE = re.compile(
+              r'if\s*\(\s*0\s*\)\s*(?=fprintf\s*\(\s*stderr\s*,\s*"PANVKDBG)'
+          )
+          START_RE = re.compile(
+              r'fprintf\s*\(\s*stderr\s*,\s*(?="PANVKDBG)'
+          )
+
+          CUSTOM_DRIVER_ID = "((VkDriverId)0x0000CAFE)"
+          DRIVER_ID_RE = re.compile(r'\bVK_DRIVER_ID_MESA_PANVK\b')
+
+          DRIVER_NAME_PATTERNS = [
+              (re.compile(r'"Mesa PanVK"'), '"PanVCake"'),
+              (re.compile(r'"PanVK"'),      '"PanVCake"'),
+              (re.compile(r'"panvk"'),      '"panvcake"'),
+          ]
+
+          def _find_close_paren(src, open_paren_idx):
+              depth = 0
+              i = open_paren_idx
+              in_str = False
+              in_chr = False
+              while i < len(src):
+                  c = src[i]
+                  if in_str:
+                      if c == "\\":
+                          i += 2
+                          continue
+                      if c == '"':
+                          in_str = False
+                  elif in_chr:
+                      if c == "\\":
+                          i += 2
+                          continue
+                      if c == "'":
+                          in_chr = False
+                  else:
+                      if c == '"':
+                          in_str = True
+                      elif c == "'":
+                          in_chr = True
+                      elif c == "(":
+                          depth += 1
+                      elif c == ")":
+                          depth -= 1
+                          if depth == 0:
+                              return i + 1
+                  i += 1
+              return None
+
+          def silence_fprintf(src):
+              src = REWRAP_RE.sub("", src)
+              out = []
+              i = 0
+              count = 0
+              while i < len(src):
+                  idx = src.find("fprintf", i)
+                  if idx == -1:
+                      out.append(src[i:])
+                      break
+                  m = START_RE.match(src, idx)
+                  if not m:
+                      out.append(src[i:idx + len("fprintf")])
+                      i = idx + len("fprintf")
+                      continue
+                  open_paren = src.find("(", m.start())
+                  close_paren = _find_close_paren(src, open_paren)
+                  if close_paren is None:
+                      out.append(src[i:])
+                      break
+                  out.append(src[i:idx])
+                  out.append("(void)0")
+                  i = close_paren
+                  count += 1
+              return "".join(out), count
+
+          def rename_driver(src):
+              n_name = 0
+              n_id = 0
+              for pat, repl in DRIVER_NAME_PATTERNS:
+                  src, k = pat.subn(repl, src)
+                  n_name += k
+              src, k = DRIVER_ID_RE.subn(CUSTOM_DRIVER_ID, src)
+              n_id += k
+              return src, n_name, n_id
+
+          def main():
+              for root in ROOTS:
+                  if not root.exists():
+                      print(f"ERROR: {root} not found", file=sys.stderr)
+                      return 1
+              total_neutralized = 0
+              total_names = 0
+              total_ids = 0
+              files_modified = 0
+              for root in ROOTS:
+                  for path in sorted(root.rglob("*")):
+                      if path.suffix not in (".c", ".h", ".cpp", ".cc",
+                                             ".cxx", ".hpp"):
+                          continue
+                      try:
+                          src = path.read_text()
+                      except UnicodeDecodeError:
+                          continue
+                      orig = src
+                      if '"PANVKDBG' in src:
+                          src, n = silence_fprintf(src)
+                          if n:
+                              print(f"{path}: neutralized {n} PANVKDBG call(s)")
+                              total_neutralized += n
+                      before = src
+                      src, n_name, n_id = rename_driver(src)
+                      if src != before:
+                          if n_name or n_id:
+                              print(f"{path}: driver rename "
+                                    f"({n_name} name, {n_id} id)")
+                              total_names += n_name
+                              total_ids += n_id
+                      if src != orig:
+                          path.write_text(src)
+                          files_modified += 1
+              print()
+              print(f"Files modified:                   {files_modified}")
+              print(f"PANVKDBG calls neutralized:       {total_neutralized}")
+              print(f"Driver-name strings renamed:      {total_names}")
+              print(f"Driver-ID occurrences replaced:   {total_ids}")
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          chmod +x "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
+          wc -l "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
+
+      - name: Clone base + winlator source
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/base /tmp/winlator-src
+
+          echo "Branches available in $WINLATOR_REPO:"
+          git ls-remote --heads "https://github.com/$WINLATOR_REPO.git" \
+            | awk '{print "  " $2}' | sed 's|refs/heads/||' | sort
+
+          CANDIDATES="$WINLATOR_BRANCH winlator-cl winlator main master"
+          USED=""
+          for br in $CANDIDATES; do
+            if git ls-remote --heads \
+                 "https://github.com/$WINLATOR_REPO.git" \
+                 "refs/heads/$br" 2>/dev/null | grep -q "refs/heads/$br"; then
+              USED="$br"
+              echo ">>> matched candidate: $br"
+              break
+            fi
+          done
+          if [[ -z "$USED" ]]; then
+            USED=$(git ls-remote --symref \
+                     "https://github.com/$WINLATOR_REPO.git" HEAD 2>/dev/null \
+                   | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
+            echo ">>> no candidate matched; using repo default: ${USED:-<unknown>}"
+          fi
+          if [[ -z "$USED" ]]; then
+            echo "ERROR: no usable branch from $WINLATOR_REPO" >&2
+            exit 1
+          fi
+          echo "WINLATOR_BRANCH_USED=$USED" >> "$GITHUB_ENV"
+
+          git clone --depth 1 "https://github.com/$BASE_REPO.git" /tmp/base
+          git clone --depth 1 --branch "$USED" \
+            "https://github.com/$WINLATOR_REPO.git" /tmp/winlator-src
+
+          rm -rf /tmp/base/.git /tmp/winlator-src/.git
+
+      - name: Copy missing files from winlator source into base
+        run: |
+          set -euo pipefail
+          cd /tmp/winlator-src
+
+          is_excluded() {
+            local rel="$1"
+            for p in $EXCLUDE_PATHS; do
+              case "$rel" in
+                "$p"|"$p"/*) return 0 ;;
+              esac
+            done
+            return 1
+          }
+
+          COUNT=0
+          SKIPPED=0
+          while IFS= read -r rel; do
+            rel="${rel#./}"
+            [[ -z "$rel" ]] && continue
+            [[ "$rel" == ".git"* ]] && continue
+
+            if is_excluded "$rel"; then
+              echo "  ~ excluded: $rel"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            dest="/tmp/base/$rel"
+            if [[ -e "$dest" ]]; then continue; fi
+
+            mkdir -p "$(dirname "$dest")"
+            cp -a "/tmp/winlator-src/$rel" "$dest"
+            echo "  + $rel"
+            COUNT=$((COUNT + 1))
+          done < <(find . -type f -print | sort)
+
+          echo "Total new files copied: $COUNT  excluded: $SKIPPED"
+
+      - name: Generate patch (base → winlator) and apply
+        run: |
+          set -euo pipefail
+          cd /tmp
+
+          EXCLUDES=("--exclude=.git")
+          for p in $EXCLUDE_PATHS; do
+            EXCLUDES+=("--exclude=$p")
+          done
+
+          diff -ruN "${EXCLUDES[@]}" \
+            base winlator-src > /tmp/winlator.patch || true
+
+          cd /tmp/base
+          if [[ -s /tmp/winlator.patch ]]; then
+            if patch -p1 --batch --forward < /tmp/winlator.patch; then
+              echo ">>> patch applied cleanly onto base"
+            else
+              echo ">>> patch reported rejects; listing .rej:"
+              find . -name '*.rej' -print || true
+            fi
           else
-            echo "ERROR: shims.zip must be committed to repo root"
+            echo ">>> patch empty"
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/winlator-patch"
+          cp /tmp/winlator.patch "$GITHUB_WORKSPACE/winlator-patch/"
+
+      - name: Apply python patcher
+        run: |
+          set -euo pipefail
+          cd /tmp/base
+          python3 "$GITHUB_WORKSPACE/ci-scripts/patch_panvkdbg.py"
+
+      - name: Restore executable bits
+        run: |
+          set -euo pipefail
+          cd /tmp/base
+          while IFS= read -r f; do
+            case "$f" in
+              *.sh|*.bash|*.py|*.pl|*.rb|*.zsh) chmod +x "$f" || true ;;
+            esac
+          done < <(find . -type f -print)
+
+      - name: Commit and force-push to winlator branch
+        run: |
+          set -euo pipefail
+          cd /tmp/base
+
+          echo "=============================================="
+          echo "Stripping .github/workflows from the tree"
+          echo "=============================================="
+          rm -rf .github/workflows
+          find . -path './.git' -prune -o -type d -empty -print -delete 2>/dev/null || true
+
+          git init -q -b "$TARGET_BRANCH"
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name  "github-actions"
+
+          git remote add origin \
+            "https://x-access-token:${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+          git add -A
+          git commit -q -m "winlator: mixed source $(date -u +%Y%m%d-%H%M%S)"
+          git --no-pager log -1 --oneline
+          echo ">>> workflows in this commit:"
+          git ls-files .github/workflows/ 2>/dev/null || echo "    (none)"
+
+          echo ">>> force-pushing with PAT (workflow scope)"
+          git push --force origin "$TARGET_BRANCH"
+          echo ">>> push done"
+
+      - name: Upload winlator.patch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: winlator-source-patch-${{ needs.prepare.outputs.stamp }}
+          path: ${{ github.workspace }}/winlator-patch/winlator.patch
+          if-no-files-found: warn
+
+  build:
+    needs: [prepare, prepare-winlator-branch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      NDK_VERSION: 28.2.13676358
+      ANDROID_API: '35'
+      BUILD_JOBS: '2'
+    steps:
+      - name: Checkout winlator branch
+        uses: actions/checkout@v4
+        with:
+          ref: winlator
+          fetch-depth: 1
+          token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Report checked-out commit and CI scripts
+        run: |
+          set -euo pipefail
+          git --no-pager log -1 --oneline
+          ls -A | head -40
+          ls -la .github/winlatormali/ 2>/dev/null || echo "  (.github/winlatormali missing)"
+          ls -la .github/workflows/ 2>/dev/null || echo "  (.github/workflows missing — expected)"
+
+      - name: Verify build scripts are present
+        run: |
+          set -euo pipefail
+          MISSING=0
+          for f in .github/winlatormali/build.sh .github/winlatormali/package.py; do
+            if [[ ! -f "$f" ]]; then
+              echo "ERROR: $f missing on the winlator branch"
+              MISSING=1
+            else
+              echo "OK: $f"
+            fi
+          done
+          if [[ "$MISSING" -eq 1 ]]; then
+            find .github -maxdepth 3 -type f 2>/dev/null || true
             exit 1
           fi
 
-      - name: Verify sigbus.patch
-        run: |
-          set -euo pipefail
-          PATCH="${{ github.workspace }}/sigbus.patch"
-          if [[ ! -f "$PATCH" ]]; then
-            echo "NOTE: sigbus.patch not present — will skip patch step"
-            exit 0
-          fi
-          ls -lh "$PATCH"
-          head -n 30 "$PATCH"
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
-      - name: Install host build dependencies
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-              build-essential llvm-18-dev libclang-18-dev libclc-18-dev \
-              libllvmspirvlib-18-dev libelf-dev spirv-tools bison flex \
-              libdrm-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-              libxcb-randr0-dev libxcb-dri2-0-dev libxcb-dri3-dev \
-              libxcb-present-dev libxcb-shm0-dev libxcb-sync-dev \
-              libxcb-xfixes0-dev libxcb-keysyms1-dev libxcb-shape0-dev \
-              libxcb-render0-dev libxcb-render-util0-dev libxcb-xkb-dev \
-              libxcb-icccm4-dev libxcb-image0-dev libxcb-util0-dev \
-              libxrandr-dev libxshmfence-dev pkg-config ninja-build \
-              patch gettext zip unzip
-          python -m pip install --upgrade pip
-          pip install mako PyYAML meson ninja packaging
+          sudo apt-get install -y ninja-build cmake pkgconf bison flex ripgrep \
+            clang-19 llvm-19-dev libclang-19-dev libclang-cpp19-dev \
+            libclc-19 libclc-19-dev libllvmspirvlib-19-dev libdrm-dev \
+            zlib1g-dev python3-venv patchelf
+          python3 -m venv .ci-python
+          .ci-python/bin/pip install meson==1.8.3 Mako==1.3.10 \
+            packaging==25.0 PyYAML==6.0.2 ply==3.11
+          echo "$GITHUB_WORKSPACE/.ci-python/bin" >> "$GITHUB_PATH"
 
-      - name: Clone mesa-panvk-g57
+      - name: Install Android NDK
+        shell: bash
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          rm -rf mesa-src
-          git clone --depth 1 https://github.com/xodiosx/mesa-panvk-g57.git mesa-src
-          cd mesa-src
-          git --no-pager log -1 --oneline
-
-      - name: Apply sigbus.patch (best-effort, never fatal)
-        working-directory: mesa-src
-        run: |
-          set -uo pipefail
-          PATCH="$GITHUB_WORKSPACE/sigbus.patch"
-          if [[ ! -f "$PATCH" ]]; then
-            echo "No sigbus.patch — skipping"
-            exit 0
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           fi
+          "$SDKMANAGER" "ndk;$NDK_VERSION"
+          echo "PANVK_NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
-          echo "==== attempt 1: git apply --3way ===="
-          if git apply --3way "$PATCH" 2>&1; then
-            echo ">>> git apply --3way succeeded"
-            git --no-pager diff --stat || true
-            exit 0
-          fi
+      - name: Build host tools and Android driver
+        run: bash .github/winlatormali/build.sh
 
-          echo "==== attempt 2: patch -p1 --fuzz=3 ===="
-          if patch -p1 --batch --forward --fuzz=3 < "$PATCH"; then
-            echo ">>> patch -p1 --fuzz=3 succeeded"
-            exit 0
-          fi
+      - name: Validate ELF and create driver ZIP
+        run: python3 .github/winlatormali/package.py
 
-          echo "==== attempt 3: patch -p1 --fuzz=10 (very lenient) ===="
-          if patch -p1 --batch --forward --fuzz=10 < "$PATCH"; then
-            echo ">>> patch -p1 --fuzz=10 succeeded"
-            exit 0
-          fi
-
-          echo "=========================================================="
-          echo "WARN: sigbus.patch could not be applied (upstream drift)"
-          echo "      continuing WITHOUT the patch"
-          echo "=========================================================="
-          # Clean up any .rej/.orig files so they don't confuse ninja
-          find . -name '*.rej' -delete
-          find . -name '*.orig' -delete
-          git --no-pager status --short || true
-          exit 0
-
-      - name: memfd_create guard patch (idempotent)
-        working-directory: mesa-src
-        run: |
-          set -euo pipefail
-          sed -i \
-            's/#if defined(HAVE_MEMFD_CREATE) \&\& !defined __TERMUX__/#if defined(HAVE_MEMFD_CREATE)/' \
-            src/util/anon_file.c || true
-          echo "OK"
-
-      - name: Patch vendored vk_android_native_buffer.h
-        working-directory: mesa-src
-        run: |
-          set -euo pipefail
-          FILE="include/vulkan/vk_android_native_buffer.h"
-          [[ -f "$FILE" ]] || { echo "ERROR: $FILE missing"; exit 1; }
-          sed -i -E \
-            's|^([[:space:]]*)typedef[[:space:]]+void[[:space:]]*\*[[:space:]]*buffer_handle_t[[:space:]]*;.*$|\1#include <cutils/native_handle.h>|' \
-            "$FILE"
-          grep -q 'cutils/native_handle.h' "$FILE" || { echo "ERROR: patch failed"; exit 1; }
-          echo "OK: patched $FILE"
-
-      - name: Unzip shims.zip into mesa-src
-        run: |
-          set -euo pipefail
-          SHIMS_SRC="$GITHUB_WORKSPACE/mesa-src/shims"
-          rm -rf "$SHIMS_SRC"
-          cd "$GITHUB_WORKSPACE/mesa-src"
-          unzip -q "$GITHUB_WORKSPACE/shims.zip"
-
-          [[ -d "$SHIMS_SRC" ]] || { echo "ERROR: shims/ not found after unzip"; exit 1; }
-
-          echo "==== shims tree (top) ===="
-          ls -la "$SHIMS_SRC"
-          echo "==== .so / .a ===="
-          find "$SHIMS_SRC" -maxdepth 1 \( -name '*.so' -o -name '*.a' \) | sort || true
-          echo "==== .pc ===="
-          find "$SHIMS_SRC" -maxdepth 1 -name '*.pc' | sort || true
-          echo "==== include (top) ===="
-          ls -la "$SHIMS_SRC/include" 2>/dev/null || true
-
-      - name: Build host tools
-        working-directory: mesa-src
-        run: |
-          set -euo pipefail
-          meson setup build-host \
-              -Dplatforms=[] -Dgallium-drivers=[] -Dvulkan-drivers=[] \
-              -Dtools=panfrost -Dprecomp-compiler=enabled \
-              -Dinstall-precomp-compiler=true -Dllvm=enabled \
-              -Dmesa-clc=enabled -Dinstall-mesa-clc=true
-          ninja -C build-host \
-            src/compiler/clc/mesa_clc \
-            src/compiler/spirv/vtn_bindgen2 \
-            src/panfrost/clc/panfrost_compile
-          ln -sf "build-host/src/compiler/clc/mesa_clc"         "build-host/src/compiler/clc/mesa-clc"
-          ln -sf "build-host/src/compiler/spirv/vtn_bindgen2"   "build-host/src/compiler/spirv/vtn-bindgen2"
-          ln -sf "build-host/src/panfrost/clc/panfrost_compile" "build-host/src/compiler/spirv/panfrost-compile"
-
-      - name: Generate Android cross file
-        working-directory: mesa-src
-        run: |
-          set -euo pipefail
-          if [[ -n "${ANDROID_NDK_LATEST_HOME:-}" && -d "$ANDROID_NDK_LATEST_HOME" ]]; then
-            NDK="$ANDROID_NDK_LATEST_HOME"
-          else
-            NDK="/usr/local/lib/android/sdk/ndk/$(ls /usr/local/lib/android/sdk/ndk 2>/dev/null | sort -V | tail -1)"
-          fi
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-          MESON_WORKING_DIR="$GITHUB_WORKSPACE/mesa-src"
-          export MESON_WORKING_DIR ANDROID_NDK_HOME="$NDK"
-          API=30
-
-          cat > android.toml <<EOF
-          [binaries]
-          c         = '${TOOLCHAIN}/bin/aarch64-linux-android${API}-clang'
-          cpp       = '${TOOLCHAIN}/bin/aarch64-linux-android${API}-clang++'
-          ar        = '${TOOLCHAIN}/bin/llvm-ar'
-          strip     = '${TOOLCHAIN}/bin/llvm-strip'
-          ld        = '${TOOLCHAIN}/bin/ld.lld'
-          pkgconfig = '/usr/bin/pkg-config'
-
-          [host_machine]
-          system     = 'android'
-          cpu_family = 'aarch64'
-          cpu        = 'aarch64'
-          endian     = 'little'
-
-          [properties]
-          needs_exe_wrapper = true
-
-          [built-in options]
-          c_args        = ['-I${MESON_WORKING_DIR}/shims/include']
-          cpp_args      = ['-I${MESON_WORKING_DIR}/shims/include']
-          c_link_args   = ['-L${MESON_WORKING_DIR}/shims', '-Wl,--allow-shlib-undefined', '-Wl,--allow-multiple-definition']
-          cpp_link_args = ['-L${MESON_WORKING_DIR}/shims', '-Wl,--allow-shlib-undefined', '-Wl,--allow-multiple-definition']
-          EOF
-
-          envsubst < android.toml > /tmp/android_wrapper.toml
-          echo "==== /tmp/android_wrapper.toml ===="
-          cat /tmp/android_wrapper.toml
-
-      - name: Configure meson
-        working-directory: mesa-src
-        env:
-          PKG_CONFIG_LIBDIR: ${{ github.workspace }}/mesa-src/shims
-        run: |
-          set -euo pipefail
-          MESON_WORKING_DIR="$GITHUB_WORKSPACE/mesa-src"
-          export PATH="$MESON_WORKING_DIR/build-host/src/compiler/clc:$MESON_WORKING_DIR/build-host/src/compiler/spirv:$MESON_WORKING_DIR/build-host/src/panfrost/clc:$PATH"
-
-          rm -rf build
-
-          meson setup build \
-              --cross-file /tmp/android_wrapper.toml \
-              -Dbuildtype=${{ matrix.build-type }} \
-              -Dplatforms=android,x11 \
-              -Dandroid-stub=true \
-              -Dandroid-libbacktrace=disabled \
-              -Dplatform-sdk-version=30 \
-              -Dglx=disabled \
-              -Dgbm=disabled \
-              -Degl=disabled \
-              -Dopengl=false \
-              -Dgles1=disabled \
-              -Dgles2=disabled \
-              -Dglvnd=disabled \
-              -Dvalgrind=disabled \
-              -Dgallium-drivers= \
-              -Dshared-glapi=disabled \
-              -Dzstd=disabled \
-              -Dmesa-clc=system \
-              -Dprecomp-compiler=system \
-              -Dvulkan-drivers=panfrost \
-              -Dllvm=disabled \
-              -Dstrip=false \
-              -Dpanfrost-kmds=kbase,panthor
-
-      - name: Verify include + link paths
-        working-directory: mesa-src
-        run: |
-          set -euo pipefail
-          grep -q "$GITHUB_WORKSPACE/mesa-src/shims" build/build.ninja \
-            || { echo "ERROR: shims path missing"; exit 1; }
-          echo "OK: shims path present in build.ninja"
-
-      - name: Prebuild panvk_android_hal_bridge.o and weaken HMI
-        working-directory: mesa-src
-        env:
-          PKG_CONFIG_LIBDIR: ${{ github.workspace }}/mesa-src/shims
-          LIBRARY_PATH: ${{ github.workspace }}/mesa-src/shims
-        run: |
-          set -euo pipefail
-          MESON_WORKING_DIR="$GITHUB_WORKSPACE/mesa-src"
-          export PATH="$MESON_WORKING_DIR/build-host/src/compiler/clc:$MESON_WORKING_DIR/build-host/src/compiler/spirv:$MESON_WORKING_DIR/build-host/src/panfrost/clc:$PATH"
-
-          if [[ -n "${ANDROID_NDK_LATEST_HOME:-}" && -d "$ANDROID_NDK_LATEST_HOME" ]]; then
-            NDK="$ANDROID_NDK_LATEST_HOME"
-          else
-            NDK="/usr/local/lib/android/sdk/ndk/$(ls /usr/local/lib/android/sdk/ndk 2>/dev/null | sort -V | tail -1)"
-          fi
-          OBJCOPY="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objcopy"
-          NM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-
-          OBJ_REL="src/panfrost/vulkan/libvulkan_panfrost.so.p/panvk_android_hal_bridge.c.o"
-          OBJ_ABS="build/$OBJ_REL"
-
-          echo "==== building $OBJ_REL ===="
-          ninja -C build "$OBJ_REL"
-
-          echo "==== HMI symbol before ===="
-          "$NM" "$OBJ_ABS" 2>/dev/null | grep 'HMI' || echo "  (no HMI symbol found)"
-
-          echo "==== weaken HMI ===="
-          if "$OBJCOPY" --weaken-symbol=HMI "$OBJ_ABS" 2>/dev/null; then
-            echo "OK: --weaken-symbol=HMI"
-          else
-            echo "WARN: weaken failed, trying localize"
-            "$OBJCOPY" --localize-symbol=HMI "$OBJ_ABS" 2>/dev/null \
-              && echo "OK: --localize-symbol=HMI" \
-              || echo "WARN: both objcopy ops failed"
-          fi
-
-          echo "==== HMI symbol after ===="
-          "$NM" "$OBJ_ABS" 2>/dev/null | grep 'HMI' || echo "  (no HMI symbol found)"
-
-      - name: Compile libvulkan_panfrost.so
-        working-directory: mesa-src
-        env:
-          PKG_CONFIG_LIBDIR: ${{ github.workspace }}/mesa-src/shims
-          LIBRARY_PATH: ${{ github.workspace }}/mesa-src/shims
-          LDFLAGS: "-Wl,--allow-multiple-definition -Wl,--allow-shlib-undefined"
-        run: |
-          set -euo pipefail
-          MESON_WORKING_DIR="$GITHUB_WORKSPACE/mesa-src"
-          export PATH="$MESON_WORKING_DIR/build-host/src/compiler/clc:$MESON_WORKING_DIR/build-host/src/compiler/spirv:$MESON_WORKING_DIR/build-host/src/panfrost/clc:$PATH"
-          ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
-
-      - name: Package tarball
-        if: success()
-        run: |
-          set -euo pipefail
-          OUT="winlator-out-${{ matrix.build-type }}"
-          mkdir -p "$OUT/lib" "$OUT/share/vulkan/icd.d"
-          cp mesa-src/build/src/panfrost/vulkan/libvulkan_panfrost.so "$OUT/lib/"
-          printf '%s\n' \
-            '{' \
-            '    "file_format_version": "1.0.1",' \
-            '    "ICD": {' \
-            '        "library_path": "libvulkan_panfrost.so",' \
-            '        "api_version": "1.4.354",' \
-            '        "library_arch": "64"' \
-            '    }' \
-            '}' \
-            > "$OUT/share/vulkan/icd.d/panfrost_icd.aarch64.json"
-          TARBALL="panvk-winlator-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz"
-          tar -czvf "$TARBALL" -C "$OUT" .
-          ls -lh "$TARBALL"
-
-      - name: Upload build artifact
-        if: success()
+      - name: Upload candidate
         uses: actions/upload-artifact@v4
         with:
-          name: panvk-winlator-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}
-          path: |
-            winlator-out-${{ matrix.build-type }}/
-            panvk-winlator-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz
+          name: PanVK-G57-WinlatorMali-candidate-${{ needs.prepare.outputs.stamp }}
+          path: out-winlatormali/
           if-no-files-found: error
 
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PanVK-G57-WinlatorMali-build-logs-${{ needs.prepare.outputs.stamp }}
+          path: |
+            build-winlatormali-native/meson-logs/
+            build-winlatormali-android/meson-logs/
+            ci-winlatormali/build.log
+            ci-winlatormali/provenance.txt
+          if-no-files-found: ignore
+
   release:
-    if: always()
-    needs: [prepare, build]
+    needs: [prepare, prepare-winlator-branch, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
       - name: List downloaded files
-        run: find artifacts -type f 2>/dev/null || true
+        run: find artifacts -type f -exec ls -lh {} \;
 
-      - name: Collect files for release
+      - name: Drop empty artifact files
         run: |
-          set -euo pipefail
-          mkdir -p release-files
-          find artifacts -name 'panvk-winlator-aarch64-*.tar.gz' -exec cp {} release-files/ \; || true
-          find artifacts -name 'libvulkan_panfrost.so'           -exec cp {} release-files/ \; || true
-          find artifacts -name 'panfrost_icd.aarch64.json'       -exec cp {} release-files/ \; || true
-          ls -la release-files
-
-      - name: Build release notes
-        run: |
-          set -euo pipefail
-          BUILD_OK="yes"
-          if ! compgen -G "release-files/panvk-winlator-aarch64-*.tar.gz" >/dev/null; then
-            BUILD_OK="no"
-          fi
-
-          {
-            echo "## PanVK for Winlator (aarch64, cross-compile via Android NDK)"
-            echo ""
-            echo "**Build date (UTC):** \`${{ needs.prepare.outputs.date }}\`"
-            echo "**Build time (UTC):** \`${{ needs.prepare.outputs.time }}\`"
-            echo "**Commit:** \`${{ github.sha }}\`"
-            echo "**Requested build types:** \`${{ needs.prepare.outputs.types }}\`"
-            echo "**Build succeeded:** \`${BUILD_OK}\`"
-          } > notes.md
-
-          if [[ "$BUILD_OK" == "yes" ]]; then
-            {
-              echo ""
-              echo "### Files"
-              echo "- \`panvk-winlator-aarch64-debugoptimized-*.tar.gz\`"
-              echo "- \`panvk-winlator-aarch64-release-*.tar.gz\`"
-              echo "- \`libvulkan_panfrost.so\` — Vulkan driver"
-              echo "- \`panfrost_icd.aarch64.json\` — ICD manifest"
-              echo ""
-              echo "### Install (Winlator / Android container)"
-              echo '```bash'
-              echo 'tar -xzf panvk-winlator-aarch64-release-*.tar.gz -C /path/to/rootfs'
-              echo 'export VK_ICD_FILENAMES=/path/to/rootfs/share/vulkan/icd.d/panfrost_icd.aarch64.json'
-              echo 'export LD_LIBRARY_PATH=/path/to/rootfs/lib:$LD_LIBRARY_PATH'
-              echo '```'
-            } >> notes.md
-          fi
-
-          cat notes.md
+          find artifacts -type f -empty -print -delete || true
+          find artifacts -type f -exec ls -lh {} \;
 
       - name: Create GitHub Release
-        if: hashFiles('release-files/*') != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          name: "${{ needs.prepare.outputs.tag }} — PanVK Winlator build ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
-          body_path: notes.md
-          files: release-files/*
-          fail_on_unmatched_files: false
+          name: "${{ needs.prepare.outputs.tag }} — PanVK for Winlator ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
+          body: |
+            ## PanVK for Winlator (aarch64, cross-compile via Android NDK)
+
+            Cross-compiled on `ubuntu-24.04` using NDK `28.2.13676358`
+            and Android API `35`.
+
+            **Build date (UTC):** `${{ needs.prepare.outputs.date }}`
+            **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
+            **Commit:** `${{ github.sha }}`
+
+            ### Source provenance
+            - Base: `xodiosx/mesa-panvk-mali-g57`
+            - Winlator source: `mexicanbr0auth/mesa-panvk-g57` (winlator-cl)
+            - Copied missing files, patched common files, applied
+              PANVKDBG neutralizer + driver rename.
+            - `.github/workflows` intentionally not modified.
+
+            Pre-patch diff attached as `winlator.patch`.
+
+            ### Files
+            - `PanVK-G57-WinlatorMali-candidate-*.zip` — packaged driver
+            - `winlator.patch` — diff of files present in both trees
+          files: |
+            artifacts/**/*
           overwrite_files: true
           generate_release_notes: true
           prerelease: true
