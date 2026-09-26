@@ -10,7 +10,7 @@ on:
         description: "Build type"
         type: choice
         required: true
-        default: both
+        default: release
         options:
           - both
           - debugoptimized
@@ -254,10 +254,13 @@ jobs:
 
           mkdir -p "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
           chmod 777 "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
+          chmod 777 "${{ github.workspace }}"
 
+          # Mount the workflow workspace into the container at /workspace so
+          # the patched tree can be overlaid onto it before we exit.
           docker run --rm \
             -e PUSH_TOKEN="${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}" \
-            -e PUSH_TARGET="${{ github.repository }}" \
+            -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/termux-out-${{ matrix.build-type }}:/termux-out" \
             -v "${{ github.workspace }}/ci-scripts:/ci-scripts:ro" \
             termux/termux-docker:aarch64 \
@@ -340,9 +343,6 @@ jobs:
               DIFF_RC=$?
               set -e
               echo "diff exit code: $DIFF_RC  (0=identical, 1=differences, 2=error)"
-              if [[ $DIFF_RC -eq 2 ]]; then
-                echo ">>> WARNING: diff returned 2 (error). Patch may be truncated." >&2
-              fi
 
               set +e
               diff -rq \
@@ -361,44 +361,38 @@ jobs:
               cat /termux-out/panvk-patcher-diff-summary.txt || true
               echo "--- end patcher diff summary ---"
 
-              cd mesa-panvk
+              # ══════════════════════════════════════════════════════
+              # Overlay the patched tree onto the workflow workspace.
+              # This is the tree that will be committed and pushed to
+              # the current repo after this step exits.
+              #
+              # Only files that differ will actually change on the
+              # remote; identical files produce no diff on commit.
+              # No deletions are performed (cp -a does not remove
+              # files that exist only in the target).
+              # ══════════════════════════════════════════════════════
+              echo "=============================================="
+              echo "Overlaying patched tree onto workflow workspace ..."
+              echo "=============================================="
+              cd "$TMPDIR/mesa-panvk"
+              # Copy everything except the git metadata and build dirs.
+              # cp -a merges directory contents, overwriting files that
+              # already exist, and adding files that do not.
+              for entry in $(ls -A); do
+                case "$entry" in
+                  .git|build-bionic|build-host) continue ;;
+                esac
+                cp -a "$entry" /workspace/
+              done
+              echo "Overlay done."
+              echo "--- files changed in /workspace (count) ---"
+              cd /workspace
+              ls -la | head -40
 
               # ──────────────────────────────────────────────────────
-              # Force-push the patched tree back to the source repo.
-              # Always runs when a token is available. Uses the standard
-              # GITHUB_TOKEN by default (no setup needed); falls back to
-              # GH_PUSH_TOKEN if you set one.
+              # Build (for the release artifact) — untouched clone tree.
               # ──────────────────────────────────────────────────────
-              if [[ -n "${PUSH_TOKEN:-}" ]]; then
-                echo "=============================================="
-                echo "Force-pushing patched tree to source repo ..."
-                echo "=============================================="
-                git config user.email "github-actions@users.noreply.github.com"
-                git config user.name  "github-actions"
-                git add -A
-                if git diff --cached --quiet; then
-                  echo ">>> No staged changes; nothing to push."
-                else
-                  git commit -m "CI: neutralize PANVKDBG + rename driver to panvcake ($(date -u +%Y%m%d-%H%M%S))"
-                  BRANCH=$(git rev-parse --abbrev-ref HEAD)
-                  git remote set-url origin \
-                    "https://x-access-token:${PUSH_TOKEN}@github.com/${PUSH_TARGET}.git"
-                  echo ">>> pushing HEAD -> ${PUSH_TARGET}:${BRANCH} (force)"
-                  set +e
-                  git push --force origin "HEAD:refs/heads/${BRANCH}"
-                  PUSH_RC=$?
-                  set -e
-                  if [[ $PUSH_RC -ne 0 ]]; then
-                    echo ">>> WARNING: git push failed with exit code $PUSH_RC" >&2
-                  else
-                    echo ">>> push succeeded"
-                  fi
-                fi
-              else
-                echo "=============================================="
-                echo "Force-push skipped (no token available)"
-                echo "=============================================="
-              fi
+              cd "$TMPDIR/mesa-panvk"
 
               echo "=============================================="
               echo "Informational: residual PANVKDBG literals in tree ..."
@@ -440,11 +434,6 @@ jobs:
               SO_STRINGS=$(strings build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
                              | grep -c "^PANVKDBG" || true)
               echo "PANVKDBG strings in freshly built panvk .so: $SO_STRINGS"
-
-              echo "=============================================="
-              echo "Listing all built .so files ..."
-              echo "=============================================="
-              find build-bionic -name "*.so" -o -name "*.so.*" -type f | sort
 
               mkdir -p /termux-out/lib
               mkdir -p /termux-out/share/vulkan/icd.d
@@ -489,6 +478,40 @@ jobs:
               echo "=== sizes ==="
               ls -lh /termux-out/lib/
             '
+
+      - name: Commit and push overlay to current repo
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}"
+
+          # The checkout step already gave us the current repo's files.
+          # The container step just overlaid the patched tree on top.
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name  "github-actions"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo ">>> No changes to commit."
+          else
+            echo "--- staged changes summary ---"
+            git diff --cached --stat | tail -40
+            echo "--- end summary ---"
+
+            BRANCH="${{ github.ref_name }}"
+            # On a workflow_dispatch run, GITHUB_REF_NAME is the branch.
+            # On a tag push, GITHUB_REF_NAME is the tag; fall back to main.
+            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+              BRANCH="main"
+            fi
+            echo ">>> pushing to branch: ${BRANCH}"
+
+            git commit -m "CI: sync Patched Mesa tree from xodiosx/mesa-panvk-mali-g57 ($(date -u +%Y%m%d-%H%M%S))"
+            git push origin "HEAD:refs/heads/${BRANCH}"
+            echo ">>> push succeeded"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Package tarball (${{ matrix.build-type }})
         run: |
@@ -558,13 +581,11 @@ jobs:
             ### What is included
             - **PanVK** — Vulkan driver for Mali-G57 (Valhall JM) via kbase
             - **Zink** — Gallium driver that provides OpenGL/GLES on top of
-              Vulkan. Because Zink translates GL calls to Vulkan and PanVK
-              is the Vulkan backend, OpenGL applications running under
-              Zink will use PanVK.
+              Vulkan.
 
             ### Customizations
             - PANVKDBG debug statements are neutralized at the source
-              level before compilation (replaced with `(void)0`).
+              level before compilation.
             - PanVK driver name reported in
               `VkPhysicalDeviceDriverProperties::driverName` is set to
               **`panvcake`**.
@@ -576,7 +597,7 @@ jobs:
             - `panvk-zink-termux-aarch64-release-${{ needs.prepare.outputs.stamp }}.tar.gz`
             - `libvulkan_panfrost.so` — PanVK Vulkan driver
             - `libgallium_dri.so` — contains the Zink Gallium driver
-            - `panfrost_icd.aarch64.json` — ICD manifest for the loader
+            - `panfrost_icd.aarch64.json` — ICD manifest
             - `panvk-patcher-diff.patch` — source diff (pristine → patched)
 
             ### Install (Termux)
@@ -591,14 +612,6 @@ jobs:
 
             tar -xzf panvk-zink-termux-aarch64-release-${RELEASE_STAMP}.tar.gz -C $PREFIX
             export DISPLAY=:0
-            ```
-
-            Or, using a single one-liner with this release's exact tag:
-
-            ```bash
-            curl -L \
-              "https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare.outputs.tag }}/panvk-zink-termux-aarch64-release-${{ needs.prepare.outputs.stamp }}.tar.gz" \
-              | tar -xz -C $PREFIX
             ```
 
             ### Run Vulkan (PanVK)
@@ -616,19 +629,7 @@ jobs:
             export WSI_X11_TERMUX=1
             export PANVK_NO_AFBC=1
             export PANVK_SPLIT_SUBMIT=1
-
-            # glmark2 benchmark test
             glmark2
-            ```
-
-            ### Verify
-
-            ```bash
-            vulkaninfo | grep -i "driverName\\|panvcake"
-            # expect: driverName = panvcake
-
-            glxinfo | grep -i "OpenGL renderer"
-            # expect renderer to be "zink (panvcake ...)" or similar
             ```
           files: |
             artifacts/*.tar.gz
