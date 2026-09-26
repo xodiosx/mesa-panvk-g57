@@ -19,11 +19,6 @@ on:
         description: "Tag to create (leave empty to auto-generate)"
         required: false
         default: ""
-      push_to_source_repo:
-        description: "Force-push the patched source back to the source repo"
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: write
@@ -260,12 +255,8 @@ jobs:
           mkdir -p "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
           chmod 777 "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
 
-          # Fall back to the workflow's own GITHUB_TOKEN when no explicit
-          # GH_PUSH_TOKEN secret has been set. This lets the push work in
-          # the same repo without any extra setup.
           docker run --rm \
             -e PUSH_TOKEN="${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}" \
-            -e PUSH_ENABLED="${{ github.event.inputs.push_to_source_repo || 'false' }}" \
             -e PUSH_TARGET="${{ github.repository }}" \
             -v "${{ github.workspace }}/termux-out-${{ matrix.build-type }}:/termux-out" \
             -v "${{ github.workspace }}/ci-scripts:/ci-scripts:ro" \
@@ -374,15 +365,11 @@ jobs:
 
               # ──────────────────────────────────────────────────────
               # Force-push the patched tree back to the source repo.
-              # Mirrors the old "Sync Mesa Repo" workflow: commit the
-              # in-container tree, set the remote URL with the token,
-              # push --force.
-              #
-              # Uses the standard GITHUB_TOKEN by default (no setup
-              # needed); falls back to GH_PUSH_TOKEN if you set one.
-              # Only runs when push_to_source_repo is true.
+              # Always runs when a token is available. Uses the standard
+              # GITHUB_TOKEN by default (no setup needed); falls back to
+              # GH_PUSH_TOKEN if you set one.
               # ──────────────────────────────────────────────────────
-              if [[ "${PUSH_ENABLED}" = "true" && -n "${PUSH_TOKEN:-}" ]]; then
+              if [[ -n "${PUSH_TOKEN:-}" ]]; then
                 echo "=============================================="
                 echo "Force-pushing patched tree to source repo ..."
                 echo "=============================================="
@@ -394,18 +381,22 @@ jobs:
                 else
                   git commit -m "CI: neutralize PANVKDBG + rename driver to panvcake ($(date -u +%Y%m%d-%H%M%S))"
                   BRANCH=$(git rev-parse --abbrev-ref HEAD)
-                  # Set the remote URL with the token baked in.
                   git remote set-url origin \
                     "https://x-access-token:${PUSH_TOKEN}@github.com/${PUSH_TARGET}.git"
                   echo ">>> pushing HEAD -> ${PUSH_TARGET}:${BRANCH} (force)"
+                  set +e
                   git push --force origin "HEAD:refs/heads/${BRANCH}"
-                  echo ">>> push succeeded"
+                  PUSH_RC=$?
+                  set -e
+                  if [[ $PUSH_RC -ne 0 ]]; then
+                    echo ">>> WARNING: git push failed with exit code $PUSH_RC" >&2
+                  else
+                    echo ">>> push succeeded"
+                  fi
                 fi
               else
                 echo "=============================================="
-                echo "Force-push skipped"
-                echo "  PUSH_ENABLED = ${PUSH_ENABLED}"
-                echo "  token present = $([[ -n "${PUSH_TOKEN:-}" ]] && echo yes || echo no)"
+                echo "Force-push skipped (no token available)"
                 echo "=============================================="
               fi
 
