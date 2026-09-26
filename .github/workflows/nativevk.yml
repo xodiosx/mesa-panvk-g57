@@ -10,7 +10,7 @@ on:
         description: "Build type"
         type: choice
         required: true
-        default: release
+        default: both
         options:
           - both
           - debugoptimized
@@ -19,6 +19,11 @@ on:
         description: "Tag to create (leave empty to auto-generate)"
         required: false
         default: ""
+      push_to_source_repo:
+        description: "Force-push the patched source back to the source repo"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -84,30 +89,22 @@ jobs:
           Source-tree transformations applied before compilation.
 
           1. Neutralize every `fprintf(stderr, "PANVKDBG ...")` statement
-             by replacing the call with `(void)0` and keeping the trailing
-             `;`. This removes the runtime debug output but leaves the C
-             syntax intact, so unbraced `if (...) fprintf(...)` patterns
-             remain valid. The compiler drops `(void)0;` at -O2/-O3.
+             by replacing the call with `(void)0`.
 
           2. Rename the PanVK Vulkan driver name to "panvcake".
 
           3. Change the Vulkan driver ID reported by PanVK from
              VK_DRIVER_ID_MESA_PANVK to a custom value.
-
-          No other patches are applied.
           """
           import re
           import sys
           from pathlib import Path
 
-          # Search both the PanVK source tree and the shared Vulkan runtime;
-          # the driver name/ID may be assigned via a helper in either.
           ROOTS = [Path("src/panfrost"), Path("src/vulkan")]
 
           REWRAP_RE = re.compile(
               r'if\s*\(\s*0\s*\)\s*(?=fprintf\s*\(\s*stderr\s*,\s*"PANVKDBG)'
           )
-
           START_RE = re.compile(
               r'fprintf\s*\(\s*stderr\s*,\s*(?="PANVKDBG)'
           )
@@ -115,8 +112,6 @@ jobs:
           CUSTOM_DRIVER_ID = "((VkDriverId)0x0000CAFE)"
           DRIVER_ID_RE = re.compile(r'\bVK_DRIVER_ID_MESA_PANVK\b')
 
-          # Order matters: longest match first so "Mesa PanVK" is not
-          # partially matched by the shorter "PanVK" rule.
           DRIVER_NAME_PATTERNS = [
               (re.compile(r'"Mesa PanVK"'), '"PanVCake"'),
               (re.compile(r'"PanVK"'),      '"PanVCake"'),
@@ -125,7 +120,6 @@ jobs:
 
 
           def _find_close_paren(src, open_paren_idx):
-              """Return the index just past the matching ')'. None if unbalanced."""
               depth = 0
               i = open_paren_idx
               in_str = False
@@ -160,9 +154,6 @@ jobs:
 
 
           def silence_fprintf(src):
-              """Replace every fprintf(stderr, "PANVKDBG ...") call with
-              `(void)0`, keeping the surrounding statement (and the trailing
-              `;`) intact so the C syntax never breaks."""
               src = REWRAP_RE.sub("", src)
               out = []
               i = 0
@@ -270,6 +261,8 @@ jobs:
           chmod 777 "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
 
           docker run --rm \
+            -e GH_PUSH_TOKEN="${{ secrets.GH_PUSH_TOKEN }}" \
+            -e PUSH_ENABLED="${{ github.event.inputs.push_to_source_repo || 'false' }}" \
             -v "${{ github.workspace }}/termux-out-${{ matrix.build-type }}:/termux-out" \
             -v "${{ github.workspace }}/ci-scripts:/ci-scripts:ro" \
             termux/termux-docker:aarch64 \
@@ -311,7 +304,7 @@ jobs:
                 libxrandr libxrandr-static mesa-demos osmesa \
                 pulseaudio termux-x11-nightly patch file perl mesa-dev libglvnd-dev libglvnd
 
-              pip install --break-system-packages meson mako pyyaml packaging setuptools
+              pip install --break-system-packages meson mako mako pyyaml packaging setuptools
 
               mkdir -p "$TMPDIR"
               cd "$TMPDIR"
@@ -341,21 +334,32 @@ jobs:
               echo "=============================================="
               cd "$TMPDIR"
 
+              # Explicit --exclude=<name> for each entry; diff does not
+              # support tar-style --exclude-vcs.
+              set +e
               diff -ruN \
-                --exclude-vcs \
-                --exclude=".github" \
-                --exclude="build-bionic" \
-                --exclude="build-host" \
+                --exclude=.git \
+                --exclude=.github \
+                --exclude=build-bionic \
+                --exclude=build-host \
                 mesa-panvk-pristine mesa-panvk \
-                > /termux-out/panvk-patcher-diff.patch || true
+                > /termux-out/panvk-patcher-diff.patch
+              DIFF_RC=$?
+              set -e
+              echo "diff exit code: $DIFF_RC  (0=identical, 1=differences, 2=error)"
+              if [[ $DIFF_RC -eq 2 ]]; then
+                echo ">>> WARNING: diff returned 2 (error). Patch may be truncated." >&2
+              fi
 
+              set +e
               diff -rq \
-                --exclude-vcs \
-                --exclude=".github" \
-                --exclude="build-bionic" \
-                --exclude="build-host" \
+                --exclude=.git \
+                --exclude=.github \
+                --exclude=build-bionic \
+                --exclude=build-host \
                 mesa-panvk-pristine mesa-panvk \
-                > /termux-out/panvk-patcher-diff-summary.txt 2>&1 || true
+                > /termux-out/panvk-patcher-diff-summary.txt 2>&1
+              set -e
 
               ls -lh /termux-out/panvk-patcher-diff.patch \
                      /termux-out/panvk-patcher-diff-summary.txt
@@ -365,6 +369,35 @@ jobs:
               echo "--- end patcher diff summary ---"
 
               cd mesa-panvk
+
+              # ──────────────────────────────────────────────────────
+              # Optional: force-push the patched tree back to the source
+              # repo. Requires a PAT with repo scope in the GH_PUSH_TOKEN
+              # secret. Skipped unless push_to_source_repo is true.
+              # ──────────────────────────────────────────────────────
+              if [[ "${PUSH_ENABLED}" = "true" && -n "${GH_PUSH_TOKEN:-}" ]]; then
+                echo "=============================================="
+                echo "Force-pushing patched tree to source repo ..."
+                echo "=============================================="
+                git config user.email "ci@users.noreply.github.com"
+                git config user.name "CI"
+                git add -A
+                if git diff --cached --quiet; then
+                  echo ">>> No staged changes; nothing to push."
+                else
+                  git commit -m "CI: neutralize PANVKDBG + rename driver to panvcake ($(date -u +%Y%m%d-%H%M%S))"
+                  git remote set-url origin \
+                    "https://x-access-token:${GH_PUSH_TOKEN}@github.com/xodiosx/mesa-panvk-mali-g57.git"
+                  BRANCH=$(git rev-parse --abbrev-ref HEAD)
+                  echo ">>> pushing HEAD -> origin/${BRANCH} (force)"
+                  git push --force origin "HEAD:refs/heads/${BRANCH}"
+                  echo ">>> push succeeded"
+                fi
+              else
+                echo "=============================================="
+                echo "Force-push skipped (PUSH_ENABLED=${PUSH_ENABLED}, token present: $([[ -n "${GH_PUSH_TOKEN:-}" ]] && echo yes || echo no))"
+                echo "=============================================="
+              fi
 
               echo "=============================================="
               echo "Informational: residual PANVKDBG literals in tree ..."
@@ -500,8 +533,6 @@ jobs:
 
       - name: Drop empty artifact files
         run: |
-          echo "--- files before ---"
-          find artifacts -type f -exec ls -lh {} \;
           echo "--- removing empty files ---"
           find artifacts -type f -empty -print -delete || true
           echo "--- files after ---"
@@ -532,39 +563,9 @@ jobs:
               is the Vulkan backend, OpenGL applications running under
               Zink will use PanVK.
 
-            ### Build options
-            Meson setup matches the local `build-bionic` script, extended
-            with the flags required for Zink:
-
-            ```
-            -Dbuildtype=<release|debugoptimized>
-            -Dpanvk-use-kbase=true
-            -Dvulkan-drivers=panfrost
-            -Dgallium-drivers=zink
-            -Dplatforms=x11
-            -Ddebug=false
-            -Dstrip=true
-            -Dbuild-tests=false
-            -Dc_link_args=-landroid-shmem
-            -Dcpp_link_args=-landroid-shmem
-            -Dpanfrost-kmds=kbase,panthor
-            -Dopengl=true
-            -Dgles2=enabled
-            -Degl=enabled
-            -Dglx=disabled
-            -Dgbm=disabled
-            -Dshared-glapi=enabled
-            -Dlibunwind=disabled
-            -Dvalgrind=disabled
-            -Dperfetto=false
-            -Dprefix=$PREFIX
-            ```
-
             ### Customizations
             - PANVKDBG debug statements are neutralized at the source
-              level before compilation (replaced with `(void)0`, which the
-              compiler drops at -O2/-O3). No format strings reach the
-              binary.
+              level before compilation (replaced with `(void)0`).
             - PanVK driver name reported in
               `VkPhysicalDeviceDriverProperties::driverName` is set to
               **`panvcake`**.
@@ -576,7 +577,6 @@ jobs:
             - `panvk-zink-termux-aarch64-release-${{ needs.prepare.outputs.stamp }}.tar.gz`
             - `libvulkan_panfrost.so` — PanVK Vulkan driver
             - `libgallium_dri.so` — contains the Zink Gallium driver
-            - `libEGL.so.*`, `libglapi.so.*` — GL/EGL loaders
             - `panfrost_icd.aarch64.json` — ICD manifest for the loader
             - `panvk-patcher-diff.patch` — source diff (pristine → patched)
 
