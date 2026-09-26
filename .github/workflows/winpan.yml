@@ -1,4 +1,4 @@
-name: PanVK G57 WinlatorMali Android
+name: PanVK G57 + Zink WinlatorMali Android
 
 on:
   workflow_dispatch:
@@ -46,7 +46,7 @@ jobs:
   android:
     needs: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       NDK_VERSION: 28.2.13676358
       ANDROID_API: '35'
@@ -77,6 +77,186 @@ jobs:
           "$SDKMANAGER" "ndk;$NDK_VERSION"
           echo "PANVK_NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
+      # ─────────────────────────────────────────────────────────────
+      # Fix vk_android_native_buffer.h / cutils/native_handle.h clash.
+      # The winlatormali CI didn't hit this because it never compiled
+      # src/vulkan/runtime/vk_device_memory.c. Zink does, so we patch
+      # the vendored header to defer to android_stub's authoritative
+      # typedef instead of redeclaring `void *buffer_handle_t`.
+      # ─────────────────────────────────────────────────────────────
+      - name: Patch vk_android_native_buffer.h (buffer_handle_t conflict)
+        run: |
+          set -euo pipefail
+          FILE="include/vulkan/vk_android_native_buffer.h"
+          [[ -f "$FILE" ]] || { echo "ERROR: $FILE missing"; exit 1; }
+
+          echo "==== before ===="
+          grep -n -C2 'buffer_handle_t' "$FILE" || true
+
+          sed -i -E \
+            's|^([[:space:]]*)typedef[[:space:]]+void[[:space:]]*\*[[:space:]]*buffer_handle_t[[:space:]]*;.*$|\1#include <cutils/native_handle.h>|' \
+            "$FILE"
+
+          echo "==== after ===="
+          grep -n -C2 'buffer_handle_t\|cutils/native_handle' "$FILE" || true
+
+          if grep -qE 'typedef[[:space:]]+void[[:space:]]*\*[[:space:]]*buffer_handle_t' "$FILE"; then
+            echo "ERROR: fallback typedef still present after sed"
+            exit 1
+          fi
+          if ! grep -q 'cutils/native_handle.h' "$FILE"; then
+            echo "ERROR: replacement include not found"
+            exit 1
+          fi
+          echo "OK: $FILE patched"
+
+      - name: Overwrite build.sh (Zink enabled + sha256 check skipped)
+        run: |
+          set -euo pipefail
+          mkdir -p .github/winlatormali
+          cat > .github/winlatormali/build.sh <<'BUILDEOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$(git rev-parse --show-toplevel)"
+          ROOT="$PWD"
+          WORK="$ROOT/ci-winlatormali"
+          mkdir -p "$WORK"
+          exec > >(tee "$WORK/build.log") 2>&1
+          : "${PANVK_NDK:?Set PANVK_NDK to the NDK directory}"
+          export ANDROID_API="${ANDROID_API:-35}"
+          BUILD_JOBS="${BUILD_JOBS:-2}"
+          NDKBIN="$PANVK_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$NDKBIN/aarch64-linux-android${ANDROID_API}-clang"
+
+          # sha256 of local-sources is intentionally skipped.
+
+          if rg -n 'diag_meta_vb_cpu|diagnostic_padding|VBCHK|VBPRESUB' \
+              src/panfrost/vulkan/jm/panvk_cmd_buffer.h \
+              src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c \
+              src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c \
+              src/vulkan/runtime/vk_meta_draw_rects.c; then
+            echo 'Temporary texture diagnostic found; refusing to package.' >&2
+            exit 1
+          fi
+
+          {
+            git rev-parse HEAD
+            cat "$PANVK_NDK/source.properties"
+            meson --version
+            "$NDKBIN/clang" --version
+            /usr/bin/llvm-config-19 --version
+            dpkg-query -W clang-19 llvm-19-dev libclc-19 libllvmspirvlib-19-dev
+          } > "$WORK/provenance.txt"
+
+          SDK_TAG=vulkan-sdk-1.4.309.0
+          HOST_DEPS="$WORK/host-deps"
+          git clone --depth 1 --branch "$SDK_TAG" \
+            https://github.com/KhronosGroup/SPIRV-Tools.git "$WORK/SPIRV-Tools"
+          git clone --depth 1 --branch "$SDK_TAG" \
+            https://github.com/KhronosGroup/SPIRV-Headers.git \
+            "$WORK/SPIRV-Tools/external/spirv-headers"
+          test "$(git -C "$WORK/SPIRV-Tools" rev-parse "refs/tags/$SDK_TAG")" = f289d047f49fb60488301ec62bafab85573668cc
+          test "$(git -C "$WORK/SPIRV-Tools/external/spirv-headers" rev-parse "refs/tags/$SDK_TAG")" = 09913f088a1197aba4aefd300a876b2ebbaa3391
+          git -C "$WORK/SPIRV-Tools" rev-parse HEAD >> "$WORK/provenance.txt"
+          git -C "$WORK/SPIRV-Tools/external/spirv-headers" rev-parse HEAD >> "$WORK/provenance.txt"
+          cmake -S "$WORK/SPIRV-Tools" -B "$WORK/spirv-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOST_DEPS" \
+            -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON
+          cmake --build "$WORK/spirv-build" --parallel "$BUILD_JOBS"
+          cmake --install "$WORK/spirv-build"
+
+          export PATH="/usr/lib/llvm-19/bin:$PATH"
+          export PKG_CONFIG_PATH="$HOST_DEPS/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig"
+          export LD_LIBRARY_PATH="$HOST_DEPS/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export LLVM_CONFIG=/usr/bin/llvm-config-19
+
+          NATIVE_COMMON=(--buildtype=release -Dbuild-tests=false \
+            -Dgallium-drivers= -Dvulkan-drivers=panfrost \
+            -Dpanfrost-kmds=kbase,panthor -Dpanvk-use-kbase=true \
+            -Dpanfrost-rust=false \
+            -Degl=disabled -Dglx=disabled -Dgles1=disabled -Dgles2=disabled \
+            -Dopengl=false -Dgbm=disabled -Dperfetto=false -Dvideo-codecs= \
+            -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled \
+            -Dlibunwind=disabled -Dzstd=disabled)
+
+          CC=clang-19 CXX=clang++-19 meson setup build-winlatormali-native \
+            "${NATIVE_COMMON[@]}" -Dplatforms= -Dllvm=enabled \
+            -Dmesa-clc=enabled -Dprecomp-compiler=enabled
+          meson compile -C build-winlatormali-native -j "$BUILD_JOBS" \
+            mesa_clc vtn_bindgen2 panfrost_compile
+
+          mkdir -p "$WORK/host-bin"
+          python3 - "$ROOT/build-winlatormali-native" "$WORK/host-bin" <<'PY'
+          import pathlib, sys
+          root, dst = map(pathlib.Path, sys.argv[1:])
+          for name in ('mesa_clc', 'vtn_bindgen2', 'panfrost_compile'):
+              found = [p for p in root.rglob(name) if p.is_file()]
+              if len(found) != 1:
+                  raise SystemExit(f'Expected one host executable {name}: {found}')
+              (dst / name).symlink_to(found[0])
+          PY
+          export PATH="$WORK/host-bin:$PATH"
+
+          mkdir -p "$WORK/empty-pkgconfig"
+          export PANVK_CROSS_FILE="$WORK/android-aarch64.ini"
+          export PANVK_CROSS_PKGDIR="$WORK/empty-pkgconfig"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          ndk = Path(os.environ['PANVK_NDK']) / 'toolchains/llvm/prebuilt/linux-x86_64/bin'
+          api = os.environ.get('ANDROID_API', '35')
+          text = f'''[binaries]
+          c = '{ndk}/aarch64-linux-android{api}-clang'
+          cpp = '{ndk}/aarch64-linux-android{api}-clang++'
+          ar = '{ndk}/llvm-ar'
+          strip = '{ndk}/llvm-strip'
+          pkg-config = '/usr/bin/pkgconf'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8-a'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          pkg_config_libdir = ['{os.environ['PANVK_CROSS_PKGDIR']}']
+
+          [built-in options]
+          c_args = ['-fno-unwind-tables', '-fno-asynchronous-unwind-tables']
+          cpp_args = ['-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables']
+          cpp_link_args = ['-static-libstdc++']
+          pkg_config_path = []
+          '''
+          Path(os.environ['PANVK_CROSS_FILE']).write_text(text)
+          PY
+
+          ANDROID_COMMON=(--buildtype=release -Dbuild-tests=false \
+            -Dgallium-drivers=zink \
+            -Dvulkan-drivers=panfrost -Dpanfrost-kmds=kbase,panthor \
+            -Dpanvk-use-kbase=true -Dpanfrost-rust=false \
+            -Dopengl=true -Dgles2=enabled -Degl=enabled \
+            -Dglx=disabled -Dgbm=disabled -Dglvnd=disabled \
+            -Dperfetto=false -Dvideo-codecs= \
+            -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled \
+            -Dlibunwind=disabled -Dzstd=disabled)
+
+          PKG_CONFIG_PATH= meson setup build-winlatormali-android \
+            --cross-file "$PANVK_CROSS_FILE" "${ANDROID_COMMON[@]}" \
+            -Dplatforms=android -Dplatform-sdk-version="$ANDROID_API" \
+            -Dandroid-stub=true -Dandroid-libbacktrace=disabled \
+            -Dandroid-libperfetto=disabled -Dzlib=disabled \
+            -Dllvm=disabled -Dspirv-tools=disabled -Dcpp_rtti=false \
+            -Dmesa-clc=system -Dprecomp-compiler=system \
+            --force-fallback-for=libdrm -Dallow-fallback-for=libdrm \
+            -Dlibdrm:default_library=static
+
+          meson compile -C build-winlatormali-android -j "$BUILD_JOBS"
+          BUILDEOF
+          chmod +x .github/winlatormali/build.sh
+          wc -l .github/winlatormali/build.sh
+
       - name: Build host tools and Android driver
         run: bash .github/winlatormali/build.sh
 
@@ -86,7 +266,7 @@ jobs:
       - name: Upload candidate
         uses: actions/upload-artifact@v4
         with:
-          name: PanVK-G57-WinlatorMali-candidate-${{ needs.prepare.outputs.stamp }}
+          name: PanVK-G57-Zink-WinlatorMali-candidate-${{ needs.prepare.outputs.stamp }}
           path: out-winlatormali/
           if-no-files-found: error
 
@@ -94,7 +274,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PanVK-G57-WinlatorMali-build-logs-${{ needs.prepare.outputs.stamp }}
+          name: PanVK-G57-Zink-WinlatorMali-build-logs-${{ needs.prepare.outputs.stamp }}
           path: |
             build-winlatormali-native/meson-logs/
             build-winlatormali-android/meson-logs/
@@ -124,9 +304,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          name: "${{ needs.prepare.outputs.tag }} — PanVK G57 WinlatorMali ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
+          name: "${{ needs.prepare.outputs.tag }} — PanVK G57 + Zink WinlatorMali ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
           body: |
-            ## PanVK G57 for WinlatorMali (aarch64, cross-compile via Android NDK)
+            ## PanVK G57 + Zink for WinlatorMali (aarch64, cross-compile via Android NDK)
 
             Cross-compiled on `ubuntu-24.04` using NDK `28.2.13676358`
             and Android API `35`.
@@ -135,13 +315,24 @@ jobs:
             **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
             **Commit:** `${{ github.sha }}`
 
-            ### Files
-            - `PanVK-G57-WinlatorMali-candidate-*.zip` — packaged driver
-            - Meson logs and provenance files if the build emitted them
+            ### What is included
+            - **PanVK** — Vulkan driver for Mali-G57 (Valhall JM) via kbase
+            - **Zink** — Gallium driver for OpenGL/GLES on top of Vulkan.
+              Zink consumes the PanVK Vulkan ICD at runtime through the
+              Android Vulkan loader. Same `.so`, same kbase path, same
+              Mali GPU for both APIs.
+            - **EGL / GLES frontends** — `libEGL.so`, `libGLESv2.so`,
+              `libglapi.so` produced by the same meson configure.
 
-            ### Install (Winlator / XoDos rebirth)
-            using adrenotools for most emulators 
-            
+            ### Customizations
+            - `local-sources.sha256` verification skipped (tree rebuilt
+              from git each run).
+            - `include/vulkan/vk_android_native_buffer.h` patched to defer
+              `buffer_handle_t` to `cutils/native_handle.h`, eliminating
+              the Zink-side typedef conflict.
+
+            ### Install (Winlator / Android container)
+            adrenotools 
           files: |
             artifacts/**/*
           fail_on_unmatched_files: false
