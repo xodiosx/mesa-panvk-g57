@@ -83,7 +83,11 @@ jobs:
           """
           Source-tree transformations applied before compilation.
 
-          1. Delete every `fprintf(stderr, "PANVKDBG ...")` statement.
+          1. Neutralize every `fprintf(stderr, "PANVKDBG ...")` statement
+             by replacing the call with `(void)0` and keeping the trailing
+             `;`. This removes the runtime debug output but leaves the C
+             syntax intact, so unbraced `if (...) fprintf(...)` patterns
+             remain valid. The compiler drops `(void)0;` at -O2/-O3.
 
           2. Rename the PanVK Vulkan driver name to "panvcake".
 
@@ -98,6 +102,8 @@ jobs:
 
           ROOT = Path("src/panfrost")
 
+          # Strip any leftover `if (0) ` prefix from a previous run so the
+          # main loop always sees a bare `fprintf(stderr, "PANVKDBG`.
           REWRAP_RE = re.compile(
               r'if\s*\(\s*0\s*\)\s*(?=fprintf\s*\(\s*stderr\s*,\s*"PANVKDBG)'
           )
@@ -116,7 +122,8 @@ jobs:
           ]
 
 
-          def _find_statement_end(src, open_paren_idx):
+          def _find_close_paren(src, open_paren_idx):
+              """Return the index just past the matching ')'. None if unbalanced."""
               depth = 0
               i = open_paren_idx
               in_str = False
@@ -145,20 +152,15 @@ jobs:
                       elif c == ")":
                           depth -= 1
                           if depth == 0:
-                              i += 1
-                              break
+                              return i + 1
                   i += 1
-
-              while i < len(src) and src[i] in " \t":
-                  i += 1
-              if i < len(src) and src[i] == ";":
-                  i += 1
-              if i < len(src) and src[i] == "\n":
-                  i += 1
-              return i
+              return None
 
 
           def silence_fprintf(src):
+              """Replace every fprintf(stderr, "PANVKDBG ...") call with
+              `(void)0`, keeping the surrounding statement (and the trailing
+              `;`) intact so the C syntax never breaks."""
               src = REWRAP_RE.sub("", src)
               out = []
               i = 0
@@ -176,10 +178,15 @@ jobs:
                       continue
 
                   open_paren = src.find("(", m.start())
-                  end = _find_statement_end(src, open_paren)
+                  close_paren = _find_close_paren(src, open_paren)
+                  if close_paren is None:
+                      # Malformed; leave the rest alone.
+                      out.append(src[i:])
+                      break
 
                   out.append(src[i:idx])
-                  i = end
+                  out.append("(void)0")
+                  i = close_paren
                   count += 1
 
               return "".join(out), count
@@ -201,7 +208,7 @@ jobs:
                   print(f"ERROR: {ROOT} not found", file=sys.stderr)
                   return 1
 
-              total_removed = 0
+              total_neutralized = 0
               total_names = 0
               total_ids = 0
               files_modified = 0
@@ -220,8 +227,8 @@ jobs:
                   if '"PANVKDBG' in src:
                       src, n = silence_fprintf(src)
                       if n:
-                          print(f"{path}: removed {n} PANVKDBG statement(s)")
-                          total_removed += n
+                          print(f"{path}: neutralized {n} PANVKDBG call(s)")
+                          total_neutralized += n
 
                   before = src
                   src, n_name, n_id = rename_driver(src)
@@ -237,10 +244,10 @@ jobs:
                       files_modified += 1
 
               print()
-              print(f"Files modified:                  {files_modified}")
-              print(f"PANVKDBG statements removed:     {total_removed}")
-              print(f"Driver-name strings renamed:     {total_names}")
-              print(f"Driver-ID occurrences replaced:  {total_ids}")
+              print(f"Files modified:                   {files_modified}")
+              print(f"PANVKDBG calls neutralized:       {total_neutralized}")
+              print(f"Driver-name strings renamed:      {total_names}")
+              print(f"Driver-ID occurrences replaced:   {total_ids}")
 
               return 0
 
@@ -318,7 +325,7 @@ jobs:
               cd mesa-panvk
 
               echo "=============================================="
-              echo "Removing PANVKDBG statements and renaming driver ..."
+              echo "Neutralizing PANVKDBG calls and renaming driver ..."
               echo "=============================================="
               if [[ ! -f /ci-scripts/patch_panvkdbg.py ]]; then
                 echo "ERROR: /ci-scripts/patch_panvkdbg.py not mounted" >&2
@@ -540,9 +547,10 @@ jobs:
             ```
 
             ### Customizations
-            - PANVKDBG debug statements are deleted from the source tree
-              before compilation, so no format strings or call sites reach
-              the binary.
+            - PANVKDBG debug statements are neutralized at the source
+              level before compilation (replaced with `(void)0`, which the
+              compiler drops at -O2/-O3). No format strings reach the
+              binary.
             - PanVK driver name reported in
               `VkPhysicalDeviceDriverProperties::driverName` is set to
               **`panvcake`**.
@@ -561,8 +569,6 @@ jobs:
             ### Install (Termux)
 
             ```bash
-            # Pin to this exact release. Replace release/debugoptimized to
-            # match the build type you want.
             RELEASE_TAG="${{ needs.prepare.outputs.tag }}"
             RELEASE_STAMP="${{ needs.prepare.outputs.stamp }}"
             RELEASE_REPO="${{ github.repository }}"
