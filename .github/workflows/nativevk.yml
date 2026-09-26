@@ -75,31 +75,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Write PANVKDBG patch script
+      - name: Write PANVKDBG + driver-rename patch script
         run: |
           mkdir -p "${{ github.workspace }}/ci-scripts"
           cat > "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py" << 'PYEOF'
           #!/usr/bin/env python3
           """
-          Strip PANVKDBG debug output entirely from the Mesa fork's source
-          tree, before compilation. The calls are removed from the source
-          (not merely wrapped in `if (0)`), so there is no reliance on the
-          compiler dead-code-eliminating argument evaluation. This also
-          removes the format strings from the binary.
+          Source-tree transformations applied before compilation.
 
-          Also adds an early return to the two BO/SHM dump helpers in
-          kbase_kmod.c (SIGBUS source). Idempotent.
+          1. Delete every `fprintf(stderr, "PANVKDBG ...")` statement (and
+             any `if (0)` wrappers left over from previous runs), so the
+             debug calls and their format strings never reach the binary.
+
+          2. Rename the PanVK Vulkan driver name to "panvcake". This is
+             the string reported in
+             VkPhysicalDeviceDriverProperties::driverName, which is what
+             vulkaninfo, DXVK HUD, and glxinfo (via Zink) display.
+
+          3. Change the Vulkan driver ID reported by PanVK from
+             VK_DRIVER_ID_MESA_PANVK to a custom value, so tools that
+             match on the standard Mesa PanVK ID no longer do so.
+
+          No other patches are applied. In particular, the earlier BO/SHM
+          dump-helper early returns have been removed from this script.
           """
           import re
           import sys
           from pathlib import Path
 
           ROOT = Path("src/panfrost")
-          DUMP_HELPERS_FILE = Path("src/panfrost/lib/kmod/kbase_kmod.c")
-          DUMP_HELPERS = (
-              "kbase_kmod_debug_dump_native_bos",
-              "kbase_kmod_debug_dump_user_buffers",
-          )
 
           REWRAP_RE = re.compile(
               r'if\s*\(\s*0\s*\)\s*(?=fprintf\s*\(\s*stderr\s*,\s*"PANVKDBG)'
@@ -108,6 +112,21 @@ jobs:
           START_RE = re.compile(
               r'fprintf\s*\(\s*stderr\s*,\s*(?="PANVKDBG)'
           )
+
+          # Custom driver ID reported in place of VK_DRIVER_ID_MESA_PANVK.
+          # Standard Vulkan IDs sit in the 1..30 range; 0xCAFE (51966) is
+          # comfortably outside it. The cast keeps the type VkDriverId so
+          # -Werror=enum-conversion (if enabled) does not fire.
+          CUSTOM_DRIVER_ID = "((VkDriverId)0x0000CAFE)"
+
+          DRIVER_ID_RE = re.compile(r'\bVK_DRIVER_ID_MESA_PANVK\b')
+
+          DRIVER_NAME_PATTERNS = [
+              (re.compile(r'"Mesa PanVK"'), '"PanVCake"'),
+              (re.compile(r'"PanVK"'),      '"PanVCake"'),
+              (re.compile(r'"panvk"'),      '"panvcake"'),
+          ]
+
 
           def _find_statement_end(src, open_paren_idx):
               depth = 0
@@ -150,7 +169,9 @@ jobs:
                   i += 1
               return i
 
+
           def silence_fprintf(src):
+              """Delete every fprintf(stderr, "PANVKDBG ...") statement."""
               src = REWRAP_RE.sub("", src)
               out = []
               i = 0
@@ -176,77 +197,69 @@ jobs:
 
               return "".join(out), count
 
-          def early_return(src, func_name):
-              pat = re.compile(
-                  re.escape(func_name) + r"\s*\([^;{]*?\)\s*\{", re.DOTALL
-              )
-              m = pat.search(src)
-              if not m:
-                  return src, False
-              brace = src.rfind("{", m.start(), m.end())
-              if brace < 0:
-                  return src, False
-              window = src[brace + 1 : brace + 250]
-              if "DEBUG DISABLED" in window:
-                  return src, False
-              insertion = (
-                  "\n   /* DEBUG DISABLED: dump path stripped for performance */\n"
-                  "   return;"
-              )
-              return src[: brace + 1] + insertion + src[brace + 1 :], True
+
+          def rename_driver(src):
+              """Rename driver name strings and replace the driver ID."""
+              n_name = 0
+              n_id = 0
+              for pat, repl in DRIVER_NAME_PATTERNS:
+                  src, k = pat.subn(repl, src)
+                  n_name += k
+              src, k = DRIVER_ID_RE.subn(CUSTOM_DRIVER_ID, src)
+              n_id += k
+              return src, n_name, n_id
+
 
           def main():
               if not ROOT.exists():
                   print(f"ERROR: {ROOT} not found", file=sys.stderr)
                   return 1
 
-              total_calls = 0
-              total_files = 0
+              total_removed = 0
+              total_names = 0
+              total_ids = 0
+              files_modified = 0
 
               for path in sorted(ROOT.rglob("*")):
-                  if path.suffix not in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp"):
+                  if path.suffix not in (".c", ".h", ".cpp", ".cc",
+                                         ".cxx", ".hpp"):
                       continue
                   try:
                       src = path.read_text()
                   except UnicodeDecodeError:
                       continue
-                  if '"PANVKDBG' not in src:
-                      continue
+
                   orig = src
-                  src, n = silence_fprintf(src)
-                  if n:
-                      print(f"{path}: removed {n} PANVKDBG statement(s)")
-                      total_calls += n
-                      total_files += 1
+
+                  # 1. Delete PANVKDBG statements
+                  if '"PANVKDBG' in src:
+                      src, n = silence_fprintf(src)
+                      if n:
+                          print(f"{path}: removed {n} PANVKDBG statement(s)")
+                          total_removed += n
+
+                  # 2. Rename driver name and ID
+                  before = src
+                  src, n_name, n_id = rename_driver(src)
+                  if src != before:
+                      if n_name or n_id:
+                          print(f"{path}: driver rename "
+                                f"({n_name} name, {n_id} id)")
+                          total_names += n_name
+                          total_ids += n_id
+
                   if src != orig:
                       path.write_text(src)
-
-              if DUMP_HELPERS_FILE.exists():
-                  src = DUMP_HELPERS_FILE.read_text()
-                  changed = False
-                  for fn in DUMP_HELPERS:
-                      src, ok = early_return(src, fn)
-                      state = "patched" if ok else "skipped (already patched or not found)"
-                      print(f"  {state}: {fn}")
-                      if ok:
-                          changed = True
-                  if changed:
-                      DUMP_HELPERS_FILE.write_text(src)
+                      files_modified += 1
 
               print()
-              print(f"Total files modified: {total_files}")
-              print(f"Total PANVKDBG statements removed: {total_calls}")
+              print(f"Files modified:                  {files_modified}")
+              print(f"PANVKDBG statements removed:     {total_removed}")
+              print(f"Driver-name strings renamed:     {total_names}")
+              print(f"Driver-ID occurrences replaced:  {total_ids}")
 
-              remaining = 0
-              for path in ROOT.rglob("*"):
-                  if path.suffix not in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp"):
-                      continue
-                  try:
-                      remaining += path.read_text().count('"PANVKDBG')
-                  except UnicodeDecodeError:
-                      pass
-              print(f"Total \"PANVKDBG literals remaining in tree: {remaining}")
               return 0
+
 
           if __name__ == "__main__":
               sys.exit(main())
@@ -309,7 +322,7 @@ jobs:
               cd mesa-panvk
 
               echo "=============================================="
-              echo "Removing PANVKDBG statements from source tree ..."
+              echo "Removing PANVKDBG statements and renaming driver ..."
               echo "=============================================="
               if [[ ! -f /ci-scripts/patch_panvkdbg.py ]]; then
                 echo "ERROR: /ci-scripts/patch_panvkdbg.py not mounted" >&2
@@ -359,11 +372,6 @@ jobs:
               echo "=============================================="
               echo "Building entire tree (panvk + zink + GL/EGL) ..."
               echo "=============================================="
-              # Build everything. This produces, among other things:
-              #   src/panfrost/vulkan/libvulkan_panfrost.so    (PanVK)
-              #   src/gallium/targets/dri/libgallium_dri.so    (contains zink)
-              #   src/egl/libEGL.so.*                          (EGL loader)
-              #   src/mapi/shared-glapi/libglapi.so.*          (GL API dispatch)
               ninja -C build-bionic -j$(nproc)
 
               echo "=============================================="
@@ -378,20 +386,13 @@ jobs:
               echo "=============================================="
               find build-bionic -name "*.so" -o -name "*.so.*" -type f | sort
 
-              # ──────────────────────────────────────────────────────────
-              # Package output tree.
-              # ──────────────────────────────────────────────────────────
               mkdir -p /termux-out/lib
               mkdir -p /termux-out/share/vulkan/icd.d
 
-              # Copy every .so produced by the build, preserving symlinks.
-              # This picks up panvk, zink (in libgallium_dri.so), libEGL,
-              # libglapi, and any other shared objects Mesa emitted.
               while IFS= read -r so; do
                 cp -a "$so" /termux-out/lib/
               done < <(find build-bionic \( -name "*.so" -o -name "*.so.*" \) -type f)
 
-              # Also copy any .so that were emitted as symlinks only
               while IFS= read -r so; do
                 target=$(readlink "$so" || true)
                 if [[ -n "$target" ]]; then
@@ -399,8 +400,6 @@ jobs:
                 fi
               done < <(find build-bionic \( -name "*.so" -o -name "*.so.*" \) -type l)
 
-              # Belt-and-braces: explicitly grab the primary artifacts if
-              # they exist at their canonical paths.
               for f in \
                 build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
                 build-bionic/src/gallium/targets/dri/libgallium_dri.so \
@@ -412,10 +411,6 @@ jobs:
                 [[ -e "$f" ]] && cp -a "$f" /termux-out/lib/ || true
               done
 
-              # ──────────────────────────────────────────────────────────
-              # ICD manifest for PanVK. Zink will pick this up through the
-              # Vulkan loader when it needs a physical device.
-              # ──────────────────────────────────────────────────────────
               cat > /termux-out/share/vulkan/icd.d/panfrost_icd.aarch64.json <<JSON
               {
                   "ICD": {
@@ -474,9 +469,7 @@ jobs:
             ## PanVK + Zink for Termux (aarch64, native build)
 
             Built natively inside Termux (`termux/termux-docker:aarch64`)
-            on `ubuntu-24.04-arm` — same toolchain class as an on-device
-            native Termux build (Termux Clang/LLD, target
-            `aarch64-linux-android35`).
+            on `ubuntu-24.04-arm`.
 
             **Build date (UTC):** `${{ needs.prepare.outputs.date }}`
             **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
@@ -490,40 +483,19 @@ jobs:
               is the Vulkan backend, OpenGL applications running under
               Zink will use PanVK.
 
-            ### Build options
-            Meson setup matches the local `build-bionic` script, extended
-            with the flags required for Zink:
+            ### Source customizations
+            - All `fprintf(stderr, "PANVKDBG ...")` calls are deleted from
+              the source tree before compilation. Their format strings do
+              not reach the binary.
+            - PanVK driver name reported in
+              `VkPhysicalDeviceDriverProperties::driverName` is set to
+              **`panvcake`**.
+            - PanVK driver ID is changed from `VK_DRIVER_ID_MESA_PANVK`
+              to `(VkDriverId)0x0000CAFE`, a custom non-standard value.
+              Tools that match on the standard Mesa PanVK ID will no longer
+              recognize the driver as PanVK.
 
-            ```
-            -Dbuildtype=<release|debugoptimized>
-            -Dpanvk-use-kbase=true
-            -Dvulkan-drivers=panfrost
-            -Dgallium-drivers=zink
-            -Dplatforms=x11
-            -Ddebug=false
-            -Dstrip=true
-            -Dbuild-tests=false
-            -Dc_link_args=-landroid-shmem
-            -Dcpp_link_args=-landroid-shmem
-            -Dpanfrost-kmds=kbase,panthor
-            -Dopengl=true
-            -Dgles2=enabled
-            -Degl=enabled
-            -Dglx=disabled
-            -Dgbm=disabled
-            -Dshared-glapi=enabled
-            -Dlibunwind=disabled
-            -Dvalgrind=disabled
-            -Dperfetto=false
-            -Dprefix=$PREFIX
-            ```
-
-            ### Customizations
-            - PANVKDBG debug statements are deleted from the source tree
-              before compilation, so no format strings or call sites reach
-              the binary.
-            - Early returns added to the two BO/SHM dump helpers in
-              `kbase_kmod.c`.
+            No other source patches are applied.
 
             ### Files
             - `panvk-zink-termux-aarch64-debugoptimized-*.tar.gz`
@@ -535,32 +507,29 @@ jobs:
 
             ### Install (Termux)
             ```bash
-            
-            curl -LO panvk-zink-termux-aarch64-release-*.tar.gz
             tar -xzf panvk-zink-termux-aarch64-release-*.tar.gz -C $PREFIX
             export DISPLAY=:0
-            
-            
-            # Vulkan: point the loader at PanVK
+
+            # Vulkan: point the loader at PanVK (now "panvcake")
             export VK_ICD_FILENAMES=$PREFIX/share/vulkan/icd.d/panfrost_icd.aarch64.json
-            vkmark 
-            
+            vkmark
+
             # Zink: force Mesa to use Zink for OpenGL
             export MESA_LOADER_DRIVER_OVERRIDE=zink
             export GALLIUM_DRIVER=zink
             export WSI_X11_TERMUX=1
             export PANVK_NO_AFBC=1
             export PANVK_SPLIT_SUBMIT=1
-            
-            # Run glmark2 benchmark test
+
             glmark2
             ```
 
             ### Verify
             ```bash
-            vulkaninfo | grep -i panvk
+            vulkaninfo | grep -i "driverName\\|panvcake"
+            # expect: driverName = panvcake
             glxinfo | grep -i "OpenGL renderer"
-            # expect renderer to be "zink (Mali-G57 …)" or similar
+            # expect: "zink (panvcake ...)" or similar
             ```
           files: |
             artifacts/*.tar.gz
