@@ -1,15 +1,48 @@
-name: PanVK G57 WinlatorMali Android 
+name: PanVK G57 WinlatorMali Android
 
 on:
   workflow_dispatch:
-  push:
-    branches: [winlator-pan]
-
+    inputs:
+      release_tag:
+        description: "Tag to create (leave empty to auto-generate)"
+        required: false
+        default: ""
+  
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      date:  ${{ steps.ts.outputs.date }}
+      time:  ${{ steps.ts.outputs.time }}
+      stamp: ${{ steps.ts.outputs.stamp }}
+      tag:   ${{ steps.ts.outputs.tag }}
+    steps:
+      - name: Compute build timestamp and tag
+        id: ts
+        run: |
+          DATE=$(date -u +'%Y-%m-%d')
+          TIME=$(date -u +'%H%M%S')
+          STAMP="${DATE}-${TIME}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "date=$DATE"           >> "$GITHUB_OUTPUT"
+          echo "time=$TIME"           >> "$GITHUB_OUTPUT"
+          echo "stamp=$STAMP"         >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+          else
+            TAG="build-${DATE}-${TIME}-${SHORT_SHA}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   android:
+    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -18,6 +51,7 @@ jobs:
       BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v4
+
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -29,6 +63,7 @@ jobs:
           .ci-python/bin/pip install meson==1.8.3 Mako==1.3.10 \
             packaging==25.0 PyYAML==6.0.2 ply==3.11
           echo "$GITHUB_WORKSPACE/.ci-python/bin" >> "$GITHUB_PATH"
+
       - name: Install Android NDK
         shell: bash
         run: |
@@ -39,24 +74,77 @@ jobs:
           fi
           "$SDKMANAGER" "ndk;$NDK_VERSION"
           echo "PANVK_NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
       - name: Build host tools and Android driver
         run: bash .github/winlatormali/build.sh
+
       - name: Validate ELF and create driver ZIP
         run: python3 .github/winlatormali/package.py
+
       - name: Upload candidate
         uses: actions/upload-artifact@v4
         with:
-          name: PanVK-G57-WinlatorMali
+          name: PanVK-G57-WinlatorMali-candidate-${{ needs.prepare.outputs.stamp }}
           path: out-winlatormali/
           if-no-files-found: error
+
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PanVK-G57-WinlatorMali-build-logs
+          name: PanVK-G57-WinlatorMali-build-logs-${{ needs.prepare.outputs.stamp }}
           path: |
             build-winlatormali-native/meson-logs/
             build-winlatormali-android/meson-logs/
             ci-winlatormali/build.log
             ci-winlatormali/provenance.txt
           if-no-files-found: ignore
+
+  release:
+    needs: [prepare, android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List downloaded files
+        run: find artifacts -type f -exec ls -lh {} \;
+
+      - name: Drop empty artifact files
+        run: |
+          find artifacts -type f -empty -print -delete || true
+          find artifacts -type f -exec ls -lh {} \;
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: "${{ needs.prepare.outputs.tag }} — PanVK G57 WinlatorMali ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
+          body: |
+            ## PanVK G57 for WinlatorMali (aarch64, cross-compile via Android NDK)
+
+            Cross-compiled on `ubuntu-24.04` using NDK `28.2.13676358`
+            and Android API `35`.
+
+            **Build date (UTC):** `${{ needs.prepare.outputs.date }}`
+            **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
+            **Commit:** `${{ github.sha }}`
+
+            ### Files
+            - `PanVK-G57-WinlatorMali-candidate-*.zip` — packaged driver
+            - Meson logs and provenance files if the build emitted them
+
+            ### Install (Winlator / Android container)
+            install using adrenotools in most emulators 
+            
+          files: |
+            artifacts/**/*
+          fail_on_unmatched_files: false
+          overwrite_files: true
+          generate_release_notes: true
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
