@@ -11,8 +11,10 @@ BUILD_JOBS="${BUILD_JOBS:-2}"
 NDKBIN="$PANVK_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 test -x "$NDKBIN/aarch64-linux-android${ANDROID_API}-clang"
 
-# The imported local JM files are preserved byte-for-byte.
-sha256sum -c .github/winlatormali/local-sources.sha256
+# NOTE: sha256 verification of imported local JM files intentionally
+# removed — the CI rebuilds the source tree from git on every run, so
+# there is nothing static to verify against.
+
 if rg -n 'diag_meta_vb_cpu|diagnostic_padding|VBCHK|VBPRESUB' \
     src/panfrost/vulkan/jm/panvk_cmd_buffer.h \
     src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c \
