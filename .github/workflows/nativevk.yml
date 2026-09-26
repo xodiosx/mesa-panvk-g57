@@ -10,7 +10,7 @@ on:
         description: "Build type"
         type: choice
         required: true
-        default: both
+        default: release
         options:
           - both
           - debugoptimized
@@ -100,10 +100,10 @@ jobs:
           import sys
           from pathlib import Path
 
-          ROOT = Path("src/panfrost")
+          # Search both the PanVK source tree and the shared Vulkan runtime;
+          # the driver name/ID may be assigned via a helper in either.
+          ROOTS = [Path("src/panfrost"), Path("src/vulkan")]
 
-          # Strip any leftover `if (0) ` prefix from a previous run so the
-          # main loop always sees a bare `fprintf(stderr, "PANVKDBG`.
           REWRAP_RE = re.compile(
               r'if\s*\(\s*0\s*\)\s*(?=fprintf\s*\(\s*stderr\s*,\s*"PANVKDBG)'
           )
@@ -115,6 +115,8 @@ jobs:
           CUSTOM_DRIVER_ID = "((VkDriverId)0x0000CAFE)"
           DRIVER_ID_RE = re.compile(r'\bVK_DRIVER_ID_MESA_PANVK\b')
 
+          # Order matters: longest match first so "Mesa PanVK" is not
+          # partially matched by the shorter "PanVK" rule.
           DRIVER_NAME_PATTERNS = [
               (re.compile(r'"Mesa PanVK"'), '"PanVCake"'),
               (re.compile(r'"PanVK"'),      '"PanVCake"'),
@@ -180,7 +182,6 @@ jobs:
                   open_paren = src.find("(", m.start())
                   close_paren = _find_close_paren(src, open_paren)
                   if close_paren is None:
-                      # Malformed; leave the rest alone.
                       out.append(src[i:])
                       break
 
@@ -204,44 +205,46 @@ jobs:
 
 
           def main():
-              if not ROOT.exists():
-                  print(f"ERROR: {ROOT} not found", file=sys.stderr)
-                  return 1
+              for root in ROOTS:
+                  if not root.exists():
+                      print(f"ERROR: {root} not found", file=sys.stderr)
+                      return 1
 
               total_neutralized = 0
               total_names = 0
               total_ids = 0
               files_modified = 0
 
-              for path in sorted(ROOT.rglob("*")):
-                  if path.suffix not in (".c", ".h", ".cpp", ".cc",
-                                         ".cxx", ".hpp"):
-                      continue
-                  try:
-                      src = path.read_text()
-                  except UnicodeDecodeError:
-                      continue
+              for root in ROOTS:
+                  for path in sorted(root.rglob("*")):
+                      if path.suffix not in (".c", ".h", ".cpp", ".cc",
+                                             ".cxx", ".hpp"):
+                          continue
+                      try:
+                          src = path.read_text()
+                      except UnicodeDecodeError:
+                          continue
 
-                  orig = src
+                      orig = src
 
-                  if '"PANVKDBG' in src:
-                      src, n = silence_fprintf(src)
-                      if n:
-                          print(f"{path}: neutralized {n} PANVKDBG call(s)")
-                          total_neutralized += n
+                      if '"PANVKDBG' in src:
+                          src, n = silence_fprintf(src)
+                          if n:
+                              print(f"{path}: neutralized {n} PANVKDBG call(s)")
+                              total_neutralized += n
 
-                  before = src
-                  src, n_name, n_id = rename_driver(src)
-                  if src != before:
-                      if n_name or n_id:
-                          print(f"{path}: driver rename "
-                                f"({n_name} name, {n_id} id)")
-                          total_names += n_name
-                          total_ids += n_id
+                      before = src
+                      src, n_name, n_id = rename_driver(src)
+                      if src != before:
+                          if n_name or n_id:
+                              print(f"{path}: driver rename "
+                                    f"({n_name} name, {n_id} id)")
+                              total_names += n_name
+                              total_ids += n_id
 
-                  if src != orig:
-                      path.write_text(src)
-                      files_modified += 1
+                      if src != orig:
+                          path.write_text(src)
+                          files_modified += 1
 
               print()
               print(f"Files modified:                   {files_modified}")
@@ -477,6 +480,8 @@ jobs:
           name: panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}
           path: |
             termux-out-${{ matrix.build-type }}/
+            !termux-out-${{ matrix.build-type }}/panvk-patcher-diff.patch
+            !termux-out-${{ matrix.build-type }}/panvk-patcher-diff-summary.txt
             panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz
           if-no-files-found: error
 
@@ -491,7 +496,16 @@ jobs:
           merge-multiple: true
 
       - name: List downloaded files
-        run: find artifacts -type f
+        run: find artifacts -type f -exec ls -lh {} \;
+
+      - name: Drop empty artifact files
+        run: |
+          echo "--- files before ---"
+          find artifacts -type f -exec ls -lh {} \;
+          echo "--- removing empty files ---"
+          find artifacts -type f -empty -print -delete || true
+          echo "--- files after ---"
+          find artifacts -type f -exec ls -lh {} \;
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
