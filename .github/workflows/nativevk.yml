@@ -10,7 +10,7 @@ on:
         description: "Build type"
         type: choice
         required: true
-        default: release
+        default: both
         options:
           - both
           - debugoptimized
@@ -256,8 +256,6 @@ jobs:
           chmod 777 "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
           chmod 777 "${{ github.workspace }}"
 
-          # Mount the workflow workspace into the container at /workspace so
-          # the patched tree can be overlaid onto it before we exit.
           docker run --rm \
             -e PUSH_TOKEN="${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}" \
             -v "${{ github.workspace }}:/workspace" \
@@ -363,31 +361,35 @@ jobs:
 
               # ══════════════════════════════════════════════════════
               # Overlay the patched tree onto the workflow workspace.
-              # This is the tree that will be committed and pushed to
-              # the current repo after this step exits.
               #
-              # Only files that differ will actually change on the
-              # remote; identical files produce no diff on commit.
-              # No deletions are performed (cp -a does not remove
-              # files that exist only in the target).
+              # Uses a tar pipe instead of `cp -a` so we can exclude
+              # patterns at any directory depth. Excluded from the
+              # overlay:
+              #   .git, .github       - VCS metadata for the clone
+              #   build-bionic/host   - build outputs
+              #   *.md                - markdown docs from the clone
+              #
+              # tar extraction is non-destructive: files that exist in
+              # /workspace and are not in the tar remain untouched.
+              # Only files present in the tar are written.
               # ══════════════════════════════════════════════════════
               echo "=============================================="
               echo "Overlaying patched tree onto workflow workspace ..."
               echo "=============================================="
               cd "$TMPDIR/mesa-panvk"
-              # Copy everything except the git metadata and build dirs.
-              # cp -a merges directory contents, overwriting files that
-              # already exist, and adding files that do not.
-              for entry in $(ls -A); do
-                case "$entry" in
-                  .git|build-bionic|build-host) continue ;;
-                esac
-                cp -a "$entry" /workspace/
-              done
-              echo "Overlay done."
-              echo "--- files changed in /workspace (count) ---"
-              cd /workspace
-              ls -la | head -40
+
+              tar -cf - \
+                --exclude=.git \
+                --exclude=.github \
+                --exclude=build-bionic \
+                --exclude=build-host \
+                --exclude="*.md" \
+                . | tar -xf - -C /workspace
+
+              echo "Overlay done (excluding *.md)."
+
+              echo "--- top-level entries in /workspace after overlay ---"
+              ls -A /workspace | head -40
 
               # ──────────────────────────────────────────────────────
               # Build (for the release artifact) — untouched clone tree.
@@ -484,8 +486,6 @@ jobs:
           set -euo pipefail
           cd "${{ github.workspace }}"
 
-          # The checkout step already gave us the current repo's files.
-          # The container step just overlaid the patched tree on top.
           git config user.email "github-actions@users.noreply.github.com"
           git config user.name  "github-actions"
 
@@ -499,14 +499,12 @@ jobs:
             echo "--- end summary ---"
 
             BRANCH="${{ github.ref_name }}"
-            # On a workflow_dispatch run, GITHUB_REF_NAME is the branch.
-            # On a tag push, GITHUB_REF_NAME is the tag; fall back to main.
             if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
               BRANCH="main"
             fi
             echo ">>> pushing to branch: ${BRANCH}"
 
-            git commit -m "CI: sync Patched Mesa tree from xodiosx/mesa-panvk-mali-g57 ($(date -u +%Y%m%d-%H%M%S))"
+            git commit -m "CI: sync patched Mesa tree from xodiosx/mesa-panvk-mali-g57 ($(date -u +%Y%m%d-%H%M%S))"
             git push origin "HEAD:refs/heads/${BRANCH}"
             echo ">>> push succeeded"
           fi
