@@ -1,4 +1,4 @@
-name: release Panfrost (OpenGL) for Termux (aarch64, native)
+name: release2 PanVK + Zink for Termux (aarch64, native)
 
 on:
   push:
@@ -6,6 +6,10 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      source_repo:
+        description: "Optional. Source repo to build from. Empty = build the current repo."
+        required: false
+        default: ""
       build_type:
         description: "Build type"
         type: choice
@@ -75,48 +79,180 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify sigbus.patch exists at repo root
+      - name: Write PANVKDBG + driver-rename patch script
         run: |
-          set -euo pipefail
-          PATCH="${{ github.workspace }}/sigbus.patch"
-          if [[ ! -f "$PATCH" ]]; then
-            echo "ERROR: sigbus.patch not found at repo root ($PATCH)"
-            ls -la "${{ github.workspace }}"
-            exit 1
-          fi
-          echo "Found patch:"
-          ls -lh "$PATCH"
-          echo "--- first 30 lines ---"
-          head -n 30 "$PATCH"
+          mkdir -p "${{ github.workspace }}/ci-scripts"
+          cat > "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py" << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Source-tree transformations applied before compilation.
 
-      - name: Create silence header on runner
-        run: |
-          set -euo pipefail
-          HDR="${{ github.workspace }}/panvk_silence.h"
-          cat > "$HDR" <<'EOF'
-          #pragma once
-          #include <stdio.h>
-          #include <string.h>
-          #include <stdarg.h>
+          1. Neutralize every `fprintf(stderr, "PANVKDBG ...")` statement
+             by replacing the call with `(void)0`.
 
-          static inline int __panvk_silence_fprintf(FILE *fp, const char *fmt, ...) {
-              if (fp == stderr && fmt && strncmp(fmt, "PANVKDBG", 8) == 0)
-                  return 0;
-              va_list ap;
-              va_start(ap, fmt);
-              int r = vfprintf(fp, fmt, ap);
-              va_end(ap);
-              return r;
-          }
+          2. Rename the PanVK Vulkan driver name to "panvcake".
 
-          #define fprintf(fp, ...) __panvk_silence_fprintf((fp), __VA_ARGS__)
-          EOF
-          echo "--- wrote $HDR ---"
-          wc -l "$HDR"
-          echo "--- contents ---"
-          cat "$HDR"
+          3. Change the Vulkan driver ID reported by PanVK from
+             VK_DRIVER_ID_MESA_PANVK to a custom value.
+          """
+          import re
+          import sys
+          from pathlib import Path
 
-      - name: Build Panfrost (${{ matrix.build-type }}) inside Termux container
+          ROOTS = [Path("src/panfrost"), Path("src/vulkan")]
+
+          REWRAP_RE = re.compile(
+              r'if\s*\(\s*0\s*\)\s*(?=fprintf\s*\(\s*stderr\s*,\s*"PANVKDBG)'
+          )
+          START_RE = re.compile(
+              r'fprintf\s*\(\s*stderr\s*,\s*(?="PANVKDBG)'
+          )
+
+          CUSTOM_DRIVER_ID = "((VkDriverId)0x0000CAFE)"
+          DRIVER_ID_RE = re.compile(r'\bVK_DRIVER_ID_MESA_PANVK\b')
+
+          DRIVER_NAME_PATTERNS = [
+              (re.compile(r'"Mesa PanVK"'), '"PanVCake"'),
+              (re.compile(r'"PanVK"'),      '"PanVCake"'),
+              (re.compile(r'"panvk"'),      '"panvcake"'),
+          ]
+
+
+          def _find_close_paren(src, open_paren_idx):
+              depth = 0
+              i = open_paren_idx
+              in_str = False
+              in_chr = False
+              while i < len(src):
+                  c = src[i]
+                  if in_str:
+                      if c == "\\":
+                          i += 2
+                          continue
+                      if c == '"':
+                          in_str = False
+                  elif in_chr:
+                      if c == "\\":
+                          i += 2
+                          continue
+                      if c == "'":
+                          in_chr = False
+                  else:
+                      if c == '"':
+                          in_str = True
+                      elif c == "'":
+                          in_chr = True
+                      elif c == "(":
+                          depth += 1
+                      elif c == ")":
+                          depth -= 1
+                          if depth == 0:
+                              return i + 1
+                  i += 1
+              return None
+
+
+          def silence_fprintf(src):
+              src = REWRAP_RE.sub("", src)
+              out = []
+              i = 0
+              count = 0
+              while i < len(src):
+                  idx = src.find("fprintf", i)
+                  if idx == -1:
+                      out.append(src[i:])
+                      break
+
+                  m = START_RE.match(src, idx)
+                  if not m:
+                      out.append(src[i:idx + len("fprintf")])
+                      i = idx + len("fprintf")
+                      continue
+
+                  open_paren = src.find("(", m.start())
+                  close_paren = _find_close_paren(src, open_paren)
+                  if close_paren is None:
+                      out.append(src[i:])
+                      break
+
+                  out.append(src[i:idx])
+                  out.append("(void)0")
+                  i = close_paren
+                  count += 1
+
+              return "".join(out), count
+
+
+          def rename_driver(src):
+              n_name = 0
+              n_id = 0
+              for pat, repl in DRIVER_NAME_PATTERNS:
+                  src, k = pat.subn(repl, src)
+                  n_name += k
+              src, k = DRIVER_ID_RE.subn(CUSTOM_DRIVER_ID, src)
+              n_id += k
+              return src, n_name, n_id
+
+
+          def main():
+              for root in ROOTS:
+                  if not root.exists():
+                      print(f"ERROR: {root} not found", file=sys.stderr)
+                      return 1
+
+              total_neutralized = 0
+              total_names = 0
+              total_ids = 0
+              files_modified = 0
+
+              for root in ROOTS:
+                  for path in sorted(root.rglob("*")):
+                      if path.suffix not in (".c", ".h", ".cpp", ".cc",
+                                             ".cxx", ".hpp"):
+                          continue
+                      try:
+                          src = path.read_text()
+                      except UnicodeDecodeError:
+                          continue
+
+                      orig = src
+
+                      if '"PANVKDBG' in src:
+                          src, n = silence_fprintf(src)
+                          if n:
+                              print(f"{path}: neutralized {n} PANVKDBG call(s)")
+                              total_neutralized += n
+
+                      before = src
+                      src, n_name, n_id = rename_driver(src)
+                      if src != before:
+                          if n_name or n_id:
+                              print(f"{path}: driver rename "
+                                    f"({n_name} name, {n_id} id)")
+                              total_names += n_name
+                              total_ids += n_id
+
+                      if src != orig:
+                          path.write_text(src)
+                          files_modified += 1
+
+              print()
+              print(f"Files modified:                   {files_modified}")
+              print(f"PANVKDBG calls neutralized:       {total_neutralized}")
+              print(f"Driver-name strings renamed:      {total_names}")
+              print(f"Driver-ID occurrences replaced:   {total_ids}")
+
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          chmod +x "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
+          echo "--- wrote ci-scripts/patch_panvkdbg.py ---"
+          wc -l "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
+
+      - name: Build PanVK + Zink (${{ matrix.build-type }}) inside Termux container
         run: |
           set -euo pipefail
 
@@ -124,27 +260,35 @@ jobs:
           chmod 777 "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
 
           docker run --rm \
+            -e SOURCE_REPO_URL="${{ github.event.inputs.source_repo }}" \
+            -v "${{ github.workspace }}:/workspace:ro" \
             -v "${{ github.workspace }}/termux-out-${{ matrix.build-type }}:/termux-out" \
-            -v "${{ github.workspace }}:/patch:ro" \
+            -v "${{ github.workspace }}/ci-scripts:/ci-scripts:ro" \
             termux/termux-docker:aarch64 \
             bash -c '
               set -euo pipefail
               export TMPDIR="${TMPDIR:-$PREFIX/tmp}"
               export BUILD_TYPE="'"${{ matrix.build-type }}"'"
 
-              # Swap Aliyun for the official Termux mirror
               mkdir -p "$PREFIX/etc/apt/sources.list.d"
               echo "deb https://packages.termux.dev/apt/termux-main stable main" \
                 > "$PREFIX/etc/apt/sources.list.d/termux-main.list"
 
               for i in 1 2 3; do
-                if pkg update -y; then break; fi
+                if pkg update -y; then
+                  break
+                fi
                 echo "pkg update attempt $i failed, retrying in 10s..."
                 sleep 10
-                if [[ $i -eq 3 ]]; then echo "pkg update failed" >&2; exit 1; fi
+                if [[ $i -eq 3 ]]; then
+                  echo "pkg update failed after 3 attempts" >&2
+                  exit 1
+                fi
               done
 
-              pkg install x11-repo tur-repo -y
+              pkg install -y x11-repo tur-repo
+              pkg update -y || true
+
               pkg install -y \
                 git clang lld binutils cmake autoconf automake libtool make python python-pip ninja llvm bison flex pkg-config \
                 fontconfig freetype gnutls libgnutls libgmp \
@@ -163,83 +307,167 @@ jobs:
 
               mkdir -p "$TMPDIR"
               cd "$TMPDIR"
-              rm -rf mesa-panvk
-              git clone --depth 1 https://github.com/xodiosx/mesa-panvk-g57.git mesa-panvk
+              rm -rf mesa-panvk mesa-panvk-pristine
+
+              # ─────────────────────────────────────────────────────
+              # Source selection:
+              #   - SOURCE_REPO_URL set  -> clone it
+              #   - SOURCE_REPO_URL empty -> copy from /workspace
+              # ─────────────────────────────────────────────────────
+              if [[ -n "${SOURCE_REPO_URL:-}" ]]; then
+                echo "=============================================="
+                echo "Cloning source repo: $SOURCE_REPO_URL"
+                echo "=============================================="
+                git clone --depth 1 "$SOURCE_REPO_URL" mesa-panvk
+              else
+                echo "=============================================="
+                echo "No source_repo input; building current workspace"
+                echo "=============================================="
+                mkdir -p mesa-panvk
+                cd /workspace
+                for entry in $(ls -A); do
+                  case "$entry" in
+                    .git|.github|ci-scripts) continue ;;
+                    termux-out-*|build-*)    continue ;;
+                    *.tar.gz|*.tar.xz|*.zip) continue ;;
+                  esac
+                  cp -a "$entry" "$TMPDIR/mesa-panvk/"
+                done
+              fi
+
+              cd "$TMPDIR/mesa-panvk"
+
+              echo "=============================================="
+              echo "Snapshotting pristine tree for diff ..."
+              echo "=============================================="
+              cp -a . "$TMPDIR/mesa-panvk-pristine"
+              du -sh "$TMPDIR/mesa-panvk-pristine"
+
+              echo "=============================================="
+              echo "Neutralizing PANVKDBG calls and renaming driver ..."
+              echo "=============================================="
+              if [[ ! -f /ci-scripts/patch_panvkdbg.py ]]; then
+                echo "ERROR: /ci-scripts/patch_panvkdbg.py not mounted" >&2
+                exit 1
+              fi
+              python3 /ci-scripts/patch_panvkdbg.py
+
+              echo "=============================================="
+              echo "Generating patcher diff (pristine -> patched) ..."
+              echo "=============================================="
+              cd "$TMPDIR"
+
+              set +e
+              diff -ruN \
+                --exclude=.git \
+                --exclude=.github \
+                --exclude=build-bionic \
+                --exclude=build-host \
+                mesa-panvk-pristine mesa-panvk \
+                > /termux-out/panvk-patcher-diff.patch
+              DIFF_RC=$?
+              set -e
+              echo "diff exit code: $DIFF_RC  (0=identical, 1=differences, 2=error)"
+
+              set +e
+              diff -rq \
+                --exclude=.git \
+                --exclude=.github \
+                --exclude=build-bionic \
+                --exclude=build-host \
+                mesa-panvk-pristine mesa-panvk \
+                > /termux-out/panvk-patcher-diff-summary.txt 2>&1
+              set -e
+
+              ls -lh /termux-out/panvk-patcher-diff.patch \
+                     /termux-out/panvk-patcher-diff-summary.txt
+
+              echo "--- patcher diff summary ---"
+              cat /termux-out/panvk-patcher-diff-summary.txt || true
+              echo "--- end patcher diff summary ---"
+
               cd mesa-panvk
 
-              if [[ -f /patch/sigbus.patch ]]; then
-                echo "Applying /patch/sigbus.patch ..."
-                if git apply --verbose /patch/sigbus.patch; then
-                  echo ">>> git apply succeeded"
-                else
-                  echo ">>> git apply failed, falling back to patch(1)"
-                  patch -p1 --batch --forward < /patch/sigbus.patch
-                fi
-                git --no-pager diff --stat || true
-              else
-                echo "WARNING: /patch/sigbus.patch not found"
-              fi
-
-              if [[ ! -f /patch/panvk_silence.h ]]; then
-                echo "ERROR: /patch/panvk_silence.h missing"
-                exit 1
-              fi
-              cp /patch/panvk_silence.h "$PWD/src/panvk_silence.h"
-              export CFLAGS="-include $PWD/src/panvk_silence.h"
-              export CXXFLAGS="-include $PWD/src/panvk_silence.h"
-
-              # ── CRITICAL FIX: Patch pan_device.c using Perl ──
               echo "=============================================="
-              echo "Patching pan_device.c for new pan_query_core_count signature..."
+              echo "Informational: residual PANVKDBG literals in tree ..."
               echo "=============================================="
+              RESIDUAL=$(grep -r "\"PANVKDBG" src/panfrost/ | wc -l || true)
+              echo "Residual \"PANVKDBG literals in source tree: $RESIDUAL"
 
-              PAN_DEVICE_C="src/gallium/drivers/panfrost/pan_device.c"
-              if [[ ! -f "$PAN_DEVICE_C" ]]; then
-                echo "ERROR: $PAN_DEVICE_C does not exist!"
-                exit 1
-              fi
-              echo "Found pan_device.c at: $PAN_DEVICE_C"
-
-              perl -0777 -pi -e "s/dev->core_count\s*=\s*pan_query_core_count\(&dev->kmod\.dev->props,\s*&dev->core_id_range\);/dev->core_count = pan_query_core_count(&dev->kmod.dev->props);\n   dev->core_id_range = pan_query_core_id_range(&dev->kmod.dev->props);/g;" "$PAN_DEVICE_C"
-
-              echo "--- Verification of pan_query_core calls: ---"
-              grep -n "pan_query_core" "$PAN_DEVICE_C" | head -n 10
-              # ─────────────────────────────────────────────────────
-
-              # CRITICAL FIX: Build BOTH kbase AND panthor kmods.
-              # The CSF code in pan_csf.c unconditionally references panthor_kmod_* symbols,
-              # even when only kbase is used at runtime. Building both provides the
-              # missing symbols at link time. Runtime guard still prevents GL on kbase.
               meson setup build-bionic \
                 -Dbuildtype="$BUILD_TYPE" \
-                -Dvulkan-drivers= \
-                -Dgallium-drivers=panfrost \
-                -Dpanfrost-kmds=kbase,panthor \
+                -Dpanvk-use-kbase=true \
+                -Dvulkan-drivers=panfrost \
+                -Dgallium-drivers=zink \
                 -Dplatforms=x11 \
-                -Dglvnd=enabled \
+                -Ddebug=false \
+                -Dstrip=true \
                 -Dbuild-tests=false \
+                -Dc_link_args=-landroid-shmem \
+                -Dcpp_link_args=-landroid-shmem \
+                -Dpanfrost-kmds=kbase,panthor \
+                -Dopengl=true \
+                -Dgles2=enabled \
+                -Degl=enabled \
+                -Dglx=disabled \
+                -Dgbm=disabled \
+                -Dshared-glapi=enabled \
                 -Dlibunwind=disabled \
                 -Dvalgrind=disabled \
                 -Dperfetto=false \
-                -Dprefix="$PREFIX" \
-                -Dc_link_args=-landroid-shmem \
-                -Dcpp_link_args=-landroid-shmem
+                -Dprefix="$PREFIX"
 
+              echo "=============================================="
+              echo "Building entire tree (panvk + zink + GL/EGL) ..."
+              echo "=============================================="
               ninja -C build-bionic -j$(nproc)
 
+              echo "=============================================="
+              echo "Informational: PANVKDBG strings in built panvk .so ..."
+              echo "=============================================="
+              SO_STRINGS=$(strings build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
+                             | grep -c "^PANVKDBG" || true)
+              echo "PANVKDBG strings in freshly built panvk .so: $SO_STRINGS"
+
               mkdir -p /termux-out/lib
+              mkdir -p /termux-out/share/vulkan/icd.d
 
-              GALLIUM_SO=$(find build-bionic -name "libgallium*.so" | head -n1)
-              if [[ -z "$GALLIUM_SO" ]]; then
-                echo "ERROR: libgallium*.so not found"
-                find build-bionic -name "*.so" | head -20
-                exit 1
-              fi
-              echo "Found driver: $GALLIUM_SO"
-              cp "$GALLIUM_SO" /termux-out/lib/libgallium_dri.so
+              while IFS= read -r so; do
+                cp -a "$so" /termux-out/lib/
+              done < <(find build-bionic \( -name "*.so" -o -name "*.so.*" \) -type f)
 
-              echo "=== /termux-out ==="
-              find /termux-out -type f
+              while IFS= read -r so; do
+                target=$(readlink "$so" || true)
+                if [[ -n "$target" ]]; then
+                  cp -a "$so" /termux-out/lib/ 2>/dev/null || true
+                fi
+              done < <(find build-bionic \( -name "*.so" -o -name "*.so.*" \) -type l)
+
+              for f in \
+                build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
+                build-bionic/src/gallium/targets/dri/libgallium_dri.so \
+                build-bionic/src/egl/libEGL.so \
+                build-bionic/src/gallium/targets/egl/libEGL_mesa.so \
+                build-bionic/src/mapi/shared-glapi/libglapi.so \
+                build-bionic/src/glx/libGLX_mesa.so
+              do
+                [[ -e "$f" ]] && cp -a "$f" /termux-out/lib/ || true
+              done
+
+              cat > /termux-out/share/vulkan/icd.d/panfrost_icd.aarch64.json <<JSON
+              {
+                  "ICD": {
+                      "api_version": "1.4.354",
+                      "library_arch": "64",
+                      "library_path": "$PREFIX/lib/libvulkan_panfrost.so"
+                  },
+                  "file_format_version": "1.0.1"
+              }
+              JSON
+
+              echo "=== /termux-out tree ==="
+              find /termux-out -type f -o -type l | sort
+              echo "=== sizes ==="
               ls -lh /termux-out/lib/
             '
 
@@ -247,17 +475,29 @@ jobs:
         run: |
           set -euo pipefail
           cd "termux-out-${{ matrix.build-type }}"
-          TARBALL="panfrost-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz"
-          tar -czvf "../${TARBALL}" .
+          TARBALL="panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz"
+          tar -czvf "../${TARBALL}" lib/ share/
           ls -lh "../${TARBALL}"
+
+      - name: Upload patcher diff (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-patcher-diff-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}
+          path: |
+            termux-out-${{ matrix.build-type }}/panvk-patcher-diff.patch
+            termux-out-${{ matrix.build-type }}/panvk-patcher-diff-summary.txt
+          if-no-files-found: warn
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: panfrost-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}
+          name: panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}
           path: |
             termux-out-${{ matrix.build-type }}/
-            panfrost-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz
+            !termux-out-${{ matrix.build-type }}/panvk-patcher-diff.patch
+            !termux-out-${{ matrix.build-type }}/panvk-patcher-diff-summary.txt
+            panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz
           if-no-files-found: error
 
   release:
@@ -271,39 +511,91 @@ jobs:
           merge-multiple: true
 
       - name: List downloaded files
-        run: find artifacts -type f
+        run: find artifacts -type f -exec ls -lh {} \;
+
+      - name: Drop empty artifact files
+        run: |
+          echo "--- removing empty files ---"
+          find artifacts -type f -empty -print -delete || true
+          echo "--- files after ---"
+          find artifacts -type f -exec ls -lh {} \;
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          name: "${{ needs.prepare.outputs.tag }} — Panfrost Build ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
+          name: "${{ needs.prepare.outputs.tag }} — PanVK + Zink for Termux ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
           body: |
-            ## Panfrost (OpenGL) for Termux (aarch64, native build)
+            ## PanVK + Zink for Termux (aarch64, native build)
 
             Built natively inside Termux (`termux/termux-docker:aarch64`)
-            on `ubuntu-24.04-arm` — same toolchain class as an on-device
-            native Termux build.
+            on `ubuntu-24.04-arm`.
 
             **Build date (UTC):** `${{ needs.prepare.outputs.date }}`
             **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
             **Commit:** `${{ github.sha }}`
+            **Build types:** `${{ needs.prepare.outputs.types }}`
 
-            ### Build customizations
-            - `sigbus.patch` applied (SHM debug dump SIGBUS fix)
-            - `PANVKDBG` debug fprintf calls silenced via a `-include` wrapper
-            - **Patched `pan_device.c`:** Fixed `pan_query_core_count` API mismatch
-            - **Built with `kbase,panthor` kmods:** Resolved undefined `panthor_kmod_*`
-              symbols referenced by `pan_csf.c`
-            - **Note:** Builds the unified Gallium (OpenGL) DRI module.
+            ### What is included
+            - **PanVK** — Vulkan driver for Mali-G57 (Valhall JM) via kbase
+            - **Zink** — Gallium driver that provides OpenGL/GLES on top of
+              Vulkan.
+
+            ### Customizations
+            - PANVKDBG debug statements are neutralized at the source
+              level before compilation.
+            - PanVK driver name reported in
+              `VkPhysicalDeviceDriverProperties::driverName` is set to
+              **`panvcake`**.
+            - PanVK driver ID changed from `VK_DRIVER_ID_MESA_PANVK` to
+              `(VkDriverId)0x0000CAFE`.
+
+            ### Files
+            - `panvk-zink-termux-aarch64-debugoptimized-${{ needs.prepare.outputs.stamp }}.tar.gz`
+            - `panvk-zink-termux-aarch64-release-${{ needs.prepare.outputs.stamp }}.tar.gz`
+            - `libvulkan_panfrost.so` — PanVK Vulkan driver
+            - `libgallium_dri.so` — contains the Zink Gallium driver
+            - `panfrost_icd.aarch64.json` — ICD manifest
+            - `panvk-patcher-diff.patch` — source diff (pristine → patched)
 
             ### Install (Termux)
+
             ```bash
-            tar -xzf panfrost-termux-aarch64-release-*.tar.gz -C $PREFIX
+            RELEASE_TAG="${{ needs.prepare.outputs.tag }}"
+            RELEASE_STAMP="${{ needs.prepare.outputs.stamp }}"
+            RELEASE_REPO="${{ github.repository }}"
+
+            curl -L -o panvk-zink-termux-aarch64-release-${RELEASE_STAMP}.tar.gz \
+              "https://github.com/${RELEASE_REPO}/releases/download/${RELEASE_TAG}/panvk-zink-termux-aarch64-release-${RELEASE_STAMP}.tar.gz"
+
+            tar -xzf panvk-zink-termux-aarch64-release-${RELEASE_STAMP}.tar.gz -C $PREFIX
+            export DISPLAY=:0
+            ```
+
+            ### Run Vulkan (PanVK)
+
+            ```bash
+            export VK_ICD_FILENAMES=$PREFIX/share/vulkan/icd.d/panfrost_icd.aarch64.json
+            vkmark
+            ```
+
+            ### Run OpenGL/GLES (Zink)
+
+            ```bash
+            export MESA_LOADER_DRIVER_OVERRIDE=zink
+            export GALLIUM_DRIVER=zink
+            export WSI_X11_TERMUX=1
+            export PANVK_NO_AFBC=1
+            export PANVK_SPLIT_SUBMIT=1
+            glmark2
             ```
           files: |
             artifacts/*.tar.gz
+            artifacts/**/libvulkan_panfrost.so
             artifacts/**/libgallium_dri.so
+            artifacts/**/panfrost_icd.aarch64.json
+            artifacts/**/panvk-patcher-diff.patch
+            artifacts/**/panvk-patcher-diff-summary.txt
           overwrite_files: true
           generate_release_notes: true
           prerelease: true
