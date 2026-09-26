@@ -254,11 +254,8 @@ jobs:
 
           mkdir -p "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
           chmod 777 "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
-          chmod 777 "${{ github.workspace }}"
 
           docker run --rm \
-            -e PUSH_TOKEN="${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}" \
-            -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/termux-out-${{ matrix.build-type }}:/termux-out" \
             -v "${{ github.workspace }}/ci-scripts:/ci-scripts:ro" \
             termux/termux-docker:aarch64 \
@@ -360,42 +357,31 @@ jobs:
               echo "--- end patcher diff summary ---"
 
               # ══════════════════════════════════════════════════════
-              # Overlay the patched tree onto the workflow workspace.
+              # Package the patched tree as a tarball in /termux-out
+              # (writable by the container) so the runner can extract
+              # it into the workspace with its own UID.
               #
-              # Uses a tar pipe instead of `cp -a` so we can exclude
-              # patterns at any directory depth. Excluded from the
-              # overlay:
-              #   .git, .github       - VCS metadata for the clone
-              #   build-bionic/host   - build outputs
-              #   *.md                - markdown docs from the clone
-              #
-              # tar extraction is non-destructive: files that exist in
-              # /workspace and are not in the tar remain untouched.
-              # Only files present in the tar are written.
+              # Excludes .git, .github, build dirs, and every *.md
+              # file. tar stores symlinks as symlinks and only lists
+              # files that exist; the host-side extraction will not
+              # touch anything else in the workspace.
               # ══════════════════════════════════════════════════════
               echo "=============================================="
-              echo "Overlaying patched tree onto workflow workspace ..."
+              echo "Packaging patched tree for workspace overlay ..."
               echo "=============================================="
               cd "$TMPDIR/mesa-panvk"
-
-              tar -cf - \
+              tar -czf /termux-out/patched-tree.tar.gz \
                 --exclude=.git \
                 --exclude=.github \
                 --exclude=build-bionic \
                 --exclude=build-host \
                 --exclude="*.md" \
-                . | tar -xf - -C /workspace
-
-              echo "Overlay done (excluding *.md)."
-
-              echo "--- top-level entries in /workspace after overlay ---"
-              ls -A /workspace | head -40
+                .
+              ls -lh /termux-out/patched-tree.tar.gz
 
               # ──────────────────────────────────────────────────────
-              # Build (for the release artifact) — untouched clone tree.
+              # Build for the release artifact — untouched clone tree.
               # ──────────────────────────────────────────────────────
-              cd "$TMPDIR/mesa-panvk"
-
               echo "=============================================="
               echo "Informational: residual PANVKDBG literals in tree ..."
               echo "=============================================="
@@ -478,8 +464,32 @@ jobs:
               echo "=== /termux-out tree ==="
               find /termux-out -type f -o -type l | sort
               echo "=== sizes ==="
-              ls -lh /termux-out/lib/
+              ls -lh /termux-out/lib/ /termux-out/patched-tree.tar.gz
             '
+
+      - name: Overlay patched tree into workspace
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}"
+
+          TARBALL="termux-out-${{ matrix.build-type }}/patched-tree.tar.gz"
+          if [[ ! -f "$TARBALL" ]]; then
+            echo "ERROR: $TARBALL not found" >&2
+            exit 1
+          fi
+
+          echo "--- tarball size ---"
+          ls -lh "$TARBALL"
+
+          echo "--- extracting into workspace (no-same-owner, no-same-permissions) ---"
+          tar -xzf "$TARBALL" \
+            -C "${{ github.workspace }}" \
+            --no-same-owner \
+            --no-same-permissions \
+            --overwrite
+
+          echo "--- top-level entries in workspace after overlay ---"
+          ls -A "${{ github.workspace }}" | head -40
 
       - name: Commit and push overlay to current repo
         run: |
@@ -516,7 +526,7 @@ jobs:
           set -euo pipefail
           cd "termux-out-${{ matrix.build-type }}"
           TARBALL="panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz"
-          tar -czvf "../${TARBALL}" .
+          tar -czvf "../${TARBALL}" lib/ share/
           ls -lh "../${TARBALL}"
 
       - name: Upload patcher diff (always)
@@ -537,6 +547,7 @@ jobs:
             termux-out-${{ matrix.build-type }}/
             !termux-out-${{ matrix.build-type }}/panvk-patcher-diff.patch
             !termux-out-${{ matrix.build-type }}/panvk-patcher-diff-summary.txt
+            !termux-out-${{ matrix.build-type }}/patched-tree.tar.gz
             panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz
           if-no-files-found: error
 
