@@ -74,8 +74,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Write PANVKDBG + driver-rename patch script
+      - name: Write patcher script
         run: |
           mkdir -p "${{ github.workspace }}/ci-scripts"
           cat > "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py" << 'PYEOF'
@@ -248,6 +250,90 @@ jobs:
           echo "--- wrote ci-scripts/patch_panvkdbg.py ---"
           wc -l "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
 
+      # ─────────────────────────────────────────────────────────────
+      # Clone the source repo, apply our patcher, and sync into the
+      # current repo. Runs entirely on the runner (simple permissions).
+      # ─────────────────────────────────────────────────────────────
+      - name: Clone source repo and apply patcher
+        run: |
+          set -euo pipefail
+          SRC="${{ github.workspace }}/_src"
+          rm -rf "$SRC"
+          git clone --depth 1 \
+            https://github.com/xodiosx/mesa-panvk-mali-g57.git "$SRC"
+
+          cd "$SRC"
+          echo "=============================================="
+          echo "Applying patcher to source repo ..."
+          echo "=============================================="
+          python3 "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
+
+          echo "=============================================="
+          echo "Patcher done. Diff summary vs pristine remote ..."
+          echo "=============================================="
+          cd "$SRC"
+          git --no-pager diff --stat || true
+
+      - name: Overlay source repo into workspace
+        run: |
+          set -euo pipefail
+          SRC="${{ github.workspace }}/_src"
+          DST="${{ github.workspace }}"
+
+          echo "--- syncing $SRC -> $DST (excluding VCS + markdown + binaries) ---"
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='*.md' \
+            --exclude='*.tar.gz' \
+            --exclude='*.tar.xz' \
+            --exclude='*.zip' \
+            --exclude='_src/' \
+            --exclude='ci-scripts/' \
+            --exclude='termux-out-*/' \
+            --exclude='build*/' \
+            "$SRC/" "$DST/"
+
+          rm -rf "$SRC"
+          echo "--- workspace top-level after overlay ---"
+          ls -A "$DST" | head -40
+
+      - name: Commit and push synced source to current repo
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}"
+
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name  "github-actions"
+
+          git add -A -- \
+            ':(exclude)ci-scripts' \
+            ':(exclude)termux-out-*' \
+            ':(exclude)build-*'
+
+          if git diff --cached --quiet; then
+            echo ">>> No source changes to commit."
+          else
+            echo "--- staged changes summary ---"
+            git diff --cached --stat | tail -40
+            echo "--- end summary ---"
+
+            BRANCH="${{ github.ref_name }}"
+            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+              BRANCH="main"
+            fi
+            echo ">>> pushing to branch: ${BRANCH}"
+
+            git commit -m "CI: sync patched Mesa tree from xodiosx/mesa-panvk-mali-g57 ($(date -u +%Y%m%d-%H%M%S))"
+            git push origin "HEAD:refs/heads/${BRANCH}"
+            echo ">>> push succeeded"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # ─────────────────────────────────────────────────────────────
+      # Build inside the Termux container.
+      # ─────────────────────────────────────────────────────────────
       - name: Build PanVK + Zink (${{ matrix.build-type }}) inside Termux container
         run: |
           set -euo pipefail
@@ -308,7 +394,6 @@ jobs:
               echo "Snapshotting pristine clone for diff ..."
               echo "=============================================="
               cp -a mesa-panvk mesa-panvk-pristine
-              echo "Snapshot at: $TMPDIR/mesa-panvk-pristine"
               du -sh mesa-panvk-pristine
 
               cd mesa-panvk
@@ -316,10 +401,6 @@ jobs:
               echo "=============================================="
               echo "Neutralizing PANVKDBG calls and renaming driver ..."
               echo "=============================================="
-              if [[ ! -f /ci-scripts/patch_panvkdbg.py ]]; then
-                echo "ERROR: /ci-scripts/patch_panvkdbg.py not mounted" >&2
-                exit 1
-              fi
               python3 /ci-scripts/patch_panvkdbg.py
 
               echo "=============================================="
@@ -352,36 +433,8 @@ jobs:
               ls -lh /termux-out/panvk-patcher-diff.patch \
                      /termux-out/panvk-patcher-diff-summary.txt
 
-              echo "--- patcher diff summary ---"
-              cat /termux-out/panvk-patcher-diff-summary.txt || true
-              echo "--- end patcher diff summary ---"
+              cd mesa-panvk
 
-              # ══════════════════════════════════════════════════════
-              # Package the patched tree as a tarball in /termux-out
-              # (writable by the container) so the runner can extract
-              # it into the workspace with its own UID.
-              #
-              # Excludes .git, .github, build dirs, and every *.md
-              # file. tar stores symlinks as symlinks and only lists
-              # files that exist; the host-side extraction will not
-              # touch anything else in the workspace.
-              # ══════════════════════════════════════════════════════
-              echo "=============================================="
-              echo "Packaging patched tree for workspace overlay ..."
-              echo "=============================================="
-              cd "$TMPDIR/mesa-panvk"
-              tar -czf /termux-out/patched-tree.tar.gz \
-                --exclude=.git \
-                --exclude=.github \
-                --exclude=build-bionic \
-                --exclude=build-host \
-                --exclude="*.md" \
-                .
-              ls -lh /termux-out/patched-tree.tar.gz
-
-              # ──────────────────────────────────────────────────────
-              # Build for the release artifact — untouched clone tree.
-              # ──────────────────────────────────────────────────────
               echo "=============================================="
               echo "Informational: residual PANVKDBG literals in tree ..."
               echo "=============================================="
@@ -459,67 +512,11 @@ jobs:
               }
               JSON
 
-              echo "=== ICD ==="
-              cat /termux-out/share/vulkan/icd.d/panfrost_icd.aarch64.json
               echo "=== /termux-out tree ==="
               find /termux-out -type f -o -type l | sort
               echo "=== sizes ==="
-              ls -lh /termux-out/lib/ /termux-out/patched-tree.tar.gz
+              ls -lh /termux-out/lib/
             '
-
-      - name: Overlay patched tree into workspace
-        run: |
-          set -euo pipefail
-          cd "${{ github.workspace }}"
-
-          TARBALL="termux-out-${{ matrix.build-type }}/patched-tree.tar.gz"
-          if [[ ! -f "$TARBALL" ]]; then
-            echo "ERROR: $TARBALL not found" >&2
-            exit 1
-          fi
-
-          echo "--- tarball size ---"
-          ls -lh "$TARBALL"
-
-          echo "--- extracting into workspace (no-same-owner, no-same-permissions) ---"
-          tar -xzf "$TARBALL" \
-            -C "${{ github.workspace }}" \
-            --no-same-owner \
-            --no-same-permissions \
-            --overwrite
-
-          echo "--- top-level entries in workspace after overlay ---"
-          ls -A "${{ github.workspace }}" | head -40
-
-      - name: Commit and push overlay to current repo
-        run: |
-          set -euo pipefail
-          cd "${{ github.workspace }}"
-
-          git config user.email "github-actions@users.noreply.github.com"
-          git config user.name  "github-actions"
-
-          git add -A
-
-          if git diff --cached --quiet; then
-            echo ">>> No changes to commit."
-          else
-            echo "--- staged changes summary ---"
-            git diff --cached --stat | tail -40
-            echo "--- end summary ---"
-
-            BRANCH="${{ github.ref_name }}"
-            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-              BRANCH="main"
-            fi
-            echo ">>> pushing to branch: ${BRANCH}"
-
-            git commit -m "CI: sync patched Mesa tree from xodiosx/mesa-panvk-mali-g57 ($(date -u +%Y%m%d-%H%M%S))"
-            git push origin "HEAD:refs/heads/${BRANCH}"
-            echo ">>> push succeeded"
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Package tarball (${{ matrix.build-type }})
         run: |
@@ -547,7 +544,6 @@ jobs:
             termux-out-${{ matrix.build-type }}/
             !termux-out-${{ matrix.build-type }}/panvk-patcher-diff.patch
             !termux-out-${{ matrix.build-type }}/panvk-patcher-diff-summary.txt
-            !termux-out-${{ matrix.build-type }}/patched-tree.tar.gz
             panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz
           if-no-files-found: error
 
