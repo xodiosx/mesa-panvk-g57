@@ -21,11 +21,11 @@ panvk_cmd_alloc_from_pool(struct panvk_cmd_buffer *cmdbuf,
    struct pan_ptr ptr =
       pan_pool_alloc_aligned(&pool->base, info.size, info.alignment);
 
+   if (ptr.cpu)
+      memset(ptr.cpu, 0, info.size);
+
    if (!ptr.gpu) {
-      fprintf(stderr, "PANVKDBG cmd_alloc_from_pool FAILED (pool=%s, sz=%zu align=%u): %s\n",
-              pool == &cmdbuf->desc_pool ? "desc" :
-              pool == &cmdbuf->tls_pool   ? "tls"   : "other",
-              info.size, info.alignment, "set error");
+      (void)0;
       VkResult error =
          panvk_catch_indirect_alloc_failure(VK_ERROR_OUT_OF_DEVICE_MEMORY);
       vk_command_buffer_set_error(&cmdbuf->vk, error);

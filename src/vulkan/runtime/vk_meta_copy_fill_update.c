@@ -971,8 +971,7 @@ build_image_to_buffer_shader(const struct vk_meta_device *meta,
    if (!getenv("PANVK_COPY_PROBE_RAW_TEXEL")) {
       texel = convert_texel(b, iview_fmt, buf_fmt, texel);
    } else {
-      fprintf(stderr,
-              "PANVKDBG COPY_RAW_TEXEL: bypassing convert_texel after nir_txf\\n");
+      (void)0;
    }
 
 
@@ -1285,17 +1284,7 @@ copy_buffer_image_prepare_compute_push_const(
 
    if (getenv("PANVK_TRACE_WSI_COPY") &&
        key->key_type == VK_META_OBJECT_KEY_COPY_IMAGE_TO_BUFFER) {
-      fprintf(stderr,
-              "PANVKDBG COPY_PUSH cmd=%p buffer=%p DST=%016llx "
-              "row_stride=%u image_stride=%u range=%u,%u,%u..%u,%u,%u "
-              "wg=%u,%u,%u\n",
-              (void *)vk_command_buffer_to_handle(cmd),
-              (void *)(uintptr_t)buffer, (unsigned long long)info.buf.addr,
-              info.buf.row_stride, info.buf.image_stride,
-              info.copy_id_range.start.x, info.copy_id_range.start.y,
-              info.copy_id_range.start.z, info.copy_id_range.end.x,
-              info.copy_id_range.end.y, info.copy_id_range.end.z,
-              wg_count[0], wg_count[1], wg_count[2]);
+      (void)0;
    }
 
    disp->CmdPushConstants(vk_command_buffer_to_handle(cmd), pipeline_layout,
@@ -1421,9 +1410,7 @@ copy_image_to_buffer_region(
    };
 
    if (getenv("PANVK_TRACE_WSI_COPY"))
-      fprintf(stderr, "PANVKDBG COPY_BIND cmd=%p view=%p set=0 binding=0\n",
-              (void *)vk_command_buffer_to_handle(cmd),
-              (void *)(uintptr_t)iview);
+      (void)0;
 
    disp->CmdPushDescriptorSetKHR(vk_command_buffer_to_handle(cmd),
                                  VK_PIPELINE_BIND_POINT_COMPUTE,

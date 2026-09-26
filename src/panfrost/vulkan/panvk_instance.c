@@ -263,7 +263,7 @@ panvk_init_dri_options(struct panvk_instance *instance)
 {
    panvk_parse_dri_options(&instance->drirc,
                            &(driConfigFileParseParams) {
-                              .driverName = "panvk",
+                              .driverName = "panvcake",
                               .applicationName = instance->vk.app_info.app_name,
                               .applicationVersion = instance->vk.app_info.app_version,
                               .engineName = instance->vk.app_info.engine_name,

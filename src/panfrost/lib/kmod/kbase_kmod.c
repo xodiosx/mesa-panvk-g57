@@ -325,10 +325,7 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
          buf, buf_size, KBASE_GPUPROP_COHERENCY_NUM_CORE_GROUPS, 0);
       uint32_t cg0 = (uint32_t)kbase_gpuprop_get(
          buf, buf_size, KBASE_GPUPROP_COHERENCY_GROUP_0, 0);
-      if (0) fprintf(stderr, "PANVKDBG kbase props: js_present=0x%x jsf=%x,%x,%x num_cg=%u cg0=0x%x tiler_features=0x%x shader_present=0x%llx\n",
-              js_present, jsf0, jsf1, jsf2, ncg, cg0,
-              props->tiler_features,
-              (unsigned long long)props->shader_present);
+      (void)0;
    }
 
    /* TEXTURE_FEATURES_0..2 are consecutive keys, but TEXTURE_FEATURES_3
@@ -1181,10 +1178,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    mesa_logd("kbase: %s driver, uAPI version %d.%d",
              is_csf ? "CSF" : "JM", ver.major, ver.minor);
 
-   if (0) fprintf(stderr, "PANVKDBG kbase uAPI: %s %u.%u\\n",
-           is_csf ? "CSF" : "JM",
-           (unsigned)ver.major,
-           (unsigned)ver.minor);
+   (void)0;
 
    /* Set context creation flags.  Zero for maximum compatibility; this also
     * creates the kernel-side context. */
@@ -1232,8 +1226,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
        mesa_logw("kbase: KBASE_IOCTL_MEM_EXEC_INIT failed: %s "
                  "(executable BO allocation will not work)", strerror(errno));
     }
-    if (0) fprintf(stderr, "PANVKDBG kbase MEM_EXEC_INIT %s\n",
-            exec_init_failed ? "FAILED (shaders -> rw)" : "ok (shaders -> exec)");
+    (void)0;
 
     /* Initialise the JIT allocator.  This must happen before any allocation
      * is made: besides setting up JIT, on 64-bit clients this is what carves
@@ -1483,9 +1476,7 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
       return NULL;
    }
 
-   if (0) fprintf(stderr, "PANVKDBG USERBUF_SIZE_TEST exact=%" PRIu64
-           " mod4096=%" PRIu64 "\n",
-           size, size & (page_size - 1));
+   (void)0;
 
    struct kbase_kmod_bo *kbase_bo =
       pan_kmod_dev_alloc(dev, sizeof(*kbase_bo));
@@ -1519,9 +1510,7 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
       },
    };
 
-   if (0) fprintf(stderr, "PANVKDBG USERBUF import ptr=%p size=%" PRIu64
-           " flags=%016" PRIx64 "\n",
-           ptr, size, import_flags);
+   (void)0;
 
    if (ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req)) {
       mesa_loge("kbase: USER_BUFFER KBASE_IOCTL_MEM_IMPORT failed: %s",
@@ -1534,13 +1523,7 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
    const bool need_mmap =
       (req.out.flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) != 0;
 
-   if (0) fprintf(stderr, "PANVKDBG USERBUF ioctl gpu_va=%016" PRIx64
-           " pages=%" PRIu64 " out_flags=%016" PRIx64
-           " need_mmap=%d\n",
-           (uint64_t)req.out.gpu_va,
-           (uint64_t)req.out.va_pages,
-           (uint64_t)req.out.flags,
-           need_mmap);
+   (void)0;
 
    if (!bo_size) {
       mesa_loge("kbase: USER_BUFFER returned zero-sized allocation");
@@ -1594,22 +1577,12 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
       kbase_dev->userbuf_gpu_ptrs[idx] = kbase_bo->gpu_mapping;
       kbase_dev->userbuf_sizes[idx] = bo_size;
 
-      if (0) fprintf(stderr, "PANVKDBG USERBUF REGISTER gpu=%016" PRIx64
-              " cpu=%p gpumap=%p size=%" PRIu64
-              " count=%u\n",
-              kbase_bo->gpu_va,
-              kbase_bo->cpu_ptr,
-              kbase_bo->gpu_mapping,
-              bo_size,
-              kbase_dev->userbuf_count);
+      (void)0;
    } else {
       mesa_loge("kbase: USER_BUFFER diagnostic registry full");
    }
 
-   if (0) fprintf(stderr, "PANVKDBG USERBUF READY cpu=%p gpu=%016" PRIx64
-           " gpu_map=%p size=%" PRIu64 "\n",
-           kbase_bo->cpu_ptr, kbase_bo->gpu_va,
-           kbase_bo->gpu_mapping, bo_size);
+   (void)0;
 
    return &kbase_bo->base;
 }
@@ -1617,8 +1590,6 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
 void
 kbase_kmod_debug_dump_native_bos(struct pan_kmod_dev *dev)
 {
-   /* DEBUG DISABLED: dump path stripped for performance */
-   return;
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
 
@@ -1650,116 +1621,26 @@ kbase_kmod_debug_dump_native_bos(struct pan_kmod_dev *dev)
       int sync_ret =
          pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &sync_req);
 
-      if (0) fprintf(stderr, "PANVKDBG NATIVEBO CSYNC gpu=%016" PRIx64
-              " cpu=%p size=%" PRIu64 " ret=%d errno=%d\\n",
-              kbase_dev->debug_bo_vas[i], p, size,
-              sync_ret, sync_ret ? errno : 0);
+      (void)0;
 
       if (sync_ret)
          continue;
 
       uint64_t center = ((240ull * 640ull) + 320ull) * 4ull;
 
-      if (0) fprintf(stderr, "PANVKDBG NATIVEBO[%u] gpu=%016" PRIx64
-              " size=%" PRIu64
-              " P0=%02x %02x %02x %02x "
-              "%02x %02x %02x %02x "
-              "%02x %02x %02x %02x "
-              "%02x %02x %02x %02x\n",
-              i,
-              kbase_dev->debug_bo_vas[i],
-              size,
-              p[0], p[1], p[2], p[3],
-              p[4], p[5], p[6], p[7],
-              p[8], p[9], p[10], p[11],
-              p[12], p[13], p[14], p[15]);
+      (void)0;
 
       if (center + 16 <= size) {
          const uint8_t *c = p + center;
 
-         if (0) fprintf(stderr, "PANVKDBG NATIVEBO[%u] CENTER="
-                 "%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x\n",
-                 i,
-                 c[0], c[1], c[2], c[3],
-                 c[4], c[5], c[6], c[7],
-                 c[8], c[9], c[10], c[11],
-                 c[12], c[13], c[14], c[15]);
+         (void)0;
       }
    }
 }
 
 void
-kbase_kmod_debug_dump_user_buffers(struct pan_kmod_dev *dev)
+kbase_kmod_debug_dump_user_buffers(UNUSED struct pan_kmod_dev *dev)
 {
-   /* DEBUG DISABLED: dump path stripped for performance */
-   return;
-   struct kbase_kmod_dev *kbase_dev =
-      container_of(dev, struct kbase_kmod_dev, base);
-
-   for (unsigned i = 0; i < kbase_dev->userbuf_count; i++) {
-      const uint8_t *cpu = kbase_dev->userbuf_cpu_ptrs[i];
-      const uint8_t *gpu = kbase_dev->userbuf_gpu_ptrs[i];
-      uint64_t size = kbase_dev->userbuf_sizes[i];
-
-      if (!cpu || !gpu || size < 16)
-         continue;
-
-      uint64_t center = 0;
-      if (size >= 640ull * 480ull * 4ull)
-         center = ((240ull * 640ull) + 320ull) * 4ull;
-
-      if (0) fprintf(stderr, "PANVKDBG SHM[%u] CPU0 "
-              "%02x %02x %02x %02x "
-              "%02x %02x %02x %02x "
-              "%02x %02x %02x %02x "
-              "%02x %02x %02x %02x\n",
-              i,
-              cpu[0], cpu[1], cpu[2], cpu[3],
-              cpu[4], cpu[5], cpu[6], cpu[7],
-              cpu[8], cpu[9], cpu[10], cpu[11],
-              cpu[12], cpu[13], cpu[14], cpu[15]);
-
-      if (0) fprintf(stderr, "PANVKDBG SHM[%u] GPU0 "
-              "%02x %02x %02x %02x "
-              "%02x %02x %02x %02x "
-              "%02x %02x %02x %02x "
-              "%02x %02x %02x %02x\n",
-              i,
-              gpu[0], gpu[1], gpu[2], gpu[3],
-              gpu[4], gpu[5], gpu[6], gpu[7],
-              gpu[8], gpu[9], gpu[10], gpu[11],
-              gpu[12], gpu[13], gpu[14], gpu[15]);
-
-      if (center + 16 <= size) {
-         cpu += center;
-         gpu += center;
-
-         if (0) fprintf(stderr, "PANVKDBG SHM[%u] CPUC "
-                 "%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x\n",
-                 i,
-                 cpu[0], cpu[1], cpu[2], cpu[3],
-                 cpu[4], cpu[5], cpu[6], cpu[7],
-                 cpu[8], cpu[9], cpu[10], cpu[11],
-                 cpu[12], cpu[13], cpu[14], cpu[15]);
-
-         if (0) fprintf(stderr, "PANVKDBG SHM[%u] GPUC "
-                 "%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x "
-                 "%02x %02x %02x %02x\n",
-                 i,
-                 gpu[0], gpu[1], gpu[2], gpu[3],
-                 gpu[4], gpu[5], gpu[6], gpu[7],
-                 gpu[8], gpu[9], gpu[10], gpu[11],
-                 gpu[12], gpu[13], gpu[14], gpu[15]);
-      }
-   }
 }
 
 unsigned
@@ -1929,9 +1810,9 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
    uint64_t alloc_gpu_va;
 
    if (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT) {
-      /* Growable region: nothing committed up-front, grown in 2 MB
-       * increments on GPU page fault (matches panfork's heap setup). */
-      commit_pages = 0;
+      /* Growable region: pre-commit 16 MB to prevent GPF latency stalls
+       * and kbase watchdog timeouts, grown in 2 MB increments on page fault. */
+      commit_pages = MIN2(va_pages, (16 * 1024 * 1024) / page_size);
       extension = (2 * 1024 * 1024) / page_size;
    }
 
@@ -2028,12 +1909,7 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
       kbase_dev->debug_bo_ptrs[idx] = kbase_bo->cpu_ptr;
       kbase_dev->debug_bo_sizes[idx] = kbase_bo->base.size;
 
-      if (0) fprintf(stderr, "PANVKDBG NATIVEBO REGISTER gpu=%016" PRIx64
-              " cpu=%p size=%" PRIu64 " count=%u\n",
-              kbase_bo->gpu_va,
-              kbase_bo->cpu_ptr,
-              kbase_bo->base.size,
-              kbase_dev->debug_bo_count);
+      (void)0;
    }
 
    return &kbase_bo->base;
@@ -2087,9 +1963,7 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 
          kbase_dev->userbuf_count--;
 
-         if (0) fprintf(stderr, "PANVKDBG USERBUF UNREGISTER gpu=%016" PRIx64
-                 " count=%u\n",
-                 kbase_bo->gpu_va, kbase_dev->userbuf_count);
+         (void)0;
          break;
       }
    }
@@ -2232,9 +2106,8 @@ kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
                     ? BASE_SYNCSET_OP_MSYNC
                     : BASE_SYNCSET_OP_CSYNC,
       };
-      if (0) fprintf(stderr, "PANVKDBG mem_sync: type=%d va=%llx start=%llx size=%llu\n",
-              (int)req.type, (unsigned long long)req.handle,
-              (unsigned long long)sync->start, (unsigned long long)sync->size);
+      if (unlikely(getenv("PANVK_VERBOSE")))
+         (void)0;
 
       if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &req)) {
          mesa_loge("kbase: KBASE_IOCTL_MEM_SYNC failed: %s", strerror(errno));

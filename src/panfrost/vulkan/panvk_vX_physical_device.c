@@ -94,7 +94,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_pipeline_library = true,
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
-      .KHR_robustness2 = PAN_ARCH >= 10,
+      .KHR_robustness2 = PAN_ARCH >= 9,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
@@ -203,7 +203,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_queue_family_foreign = true,
       .EXT_rasterization_order_attachment_access = PAN_ARCH >= 10,
       .EXT_rgba10x6_formats = PAN_ARCH >= 11,
-      .EXT_robustness2 = PAN_ARCH >= 10,
+      .EXT_robustness2 = PAN_ARCH >= 9,
       .EXT_sampler_filter_minmax = PAN_ARCH >= 10,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
@@ -637,7 +637,7 @@ panvk_per_arch(get_physical_device_features)(
       /* VK_KHR_robustness2 */
       .robustBufferAccess2 = PAN_ARCH >= 11,
       .robustImageAccess2 = false,
-      .nullDescriptor = PAN_ARCH >= 10,
+      .nullDescriptor = PAN_ARCH >= 9,
 
       /* VK_EXT_shader_tile_image */
       .shaderTileImageColorReadAccess = PAN_ARCH >= 9,
@@ -775,7 +775,14 @@ panvk_per_arch(get_physical_device_features)(
 #endif
 
       /* VK_EXT_multisampled_render_to_single_sampled */
+#if PAN_ARCH >= 10
       .multisampledRenderToSingleSampled = true,
+#else
+      /* Valhall JM resolve-on-store for MSRS outputs black; force clients
+       * onto the explicit-resolve path until the tilebuffer MSAA handling
+       * is fixed. */
+      .multisampledRenderToSingleSampled = false,
+#endif
 
 #ifdef PANVK_USE_WSI_PLATFORM
       /* VK_EXT_present_timing */
@@ -1080,7 +1087,7 @@ panvk_per_arch(get_physical_device_properties)(
       .independentResolveNone = true,
       .independentResolve = true,
       /* VK_KHR_driver_properties */
-      .driverID = VK_DRIVER_ID_MESA_PANVK,
+      .driverID = ((VkDriverId)0x0000CAFE),
       .conformanceVersion = get_conformance_version(),
       .denormBehaviorIndependence =
          PAN_ARCH >= 9 ? VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE
@@ -1364,7 +1371,7 @@ panvk_per_arch(get_physical_device_properties)(
    STATIC_ASSERT(sizeof(instance->driver_build_sha) >= VK_UUID_SIZE);
    memcpy(properties->driverUUID, instance->driver_build_sha, VK_UUID_SIZE);
 
-   snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "panvk");
+   snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "panvcake");
    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
 
