@@ -10,7 +10,7 @@ on:
         description: "Build type"
         type: choice
         required: true
-        default: release
+        default: both
         options:
           - both
           - debugoptimized
@@ -288,16 +288,20 @@ jobs:
               pkg update -y || true
 
               pkg install -y \
-                git clang lld ninja python python-pip pkg-config \
-                bison flex cmake glslang shaderc vulkan-headers \
-                vulkan-loader-generic libandroid-shmem libdrm libxcb \
-                xorgproto libx11 libxshmfence zlib zstd libexpat \
-                libclc spirv-llvm-translator libxrandr libxrandr-static file \
-                libxext libxfixes libxdamage libxcb-keysyms libxcb-render \
-                libxcb-render-util libxcb-shape libxcb-shm libxcb-sync \
-                libxcb-xfixes libxcb-image libxcb-icccm libxcb-util
+                git clang lld binutils cmake autoconf automake libtool make python python-pip ninja llvm bison flex pkg-config \
+                fontconfig freetype gnutls libgnutls libgmp \
+                libandroid-shmem libandroid-shmem-static libandroid-spawn \
+                libx11 xorgproto libdrm libpixman libjpeg-turbo xtrans libxxf86vm xorg-xrandr \
+                xorg-font-util xorg-util-macros libxfont2 libxkbfile libpciaccess \
+                xcb-util-renderutil xcb-util-image xcb-util-keysyms xcb-util-wm \
+                xorg-xkbcomp xkeyboard-config libxdamage libxinerama libxshmfence \
+                libxcb libxcomposite libxcursor libxfixes libxrender \
+                glslang shaderc vulkan-headers vulkan-loader-generic vulkan-tools \
+                libclc spirv-llvm-translator zlib zstd libexpat \
+                libxrandr libxrandr-static mesa-demos osmesa \
+                pulseaudio termux-x11-nightly patch file perl mesa-dev libglvnd-dev libglvnd
 
-              pip install --break-system-packages meson mako pyyaml packaging
+              pip install --break-system-packages meson mako pyyaml packaging setuptools
 
               mkdir -p "$TMPDIR"
               cd "$TMPDIR"
@@ -555,9 +559,6 @@ jobs:
             - `panvk-patcher-diff.patch` — source diff (pristine → patched)
 
             ### Install (Termux)
-
-            Download the release tarball directly into `$PREFIX`, using the
-            URL of this release:
 
             ```bash
             # Pin to this exact release. Replace release/debugoptimized to
