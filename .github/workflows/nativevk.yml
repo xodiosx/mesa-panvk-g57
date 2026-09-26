@@ -1,4 +1,4 @@
-name: release PanVK for Termux (aarch64, native)
+name: release PanVK + Zink for Termux (aarch64, native)
 
 on:
   push:
@@ -101,22 +101,15 @@ jobs:
               "kbase_kmod_debug_dump_user_buffers",
           )
 
-          # Undo any previous `if (0) fprintf(stderr, "PANVKDBG` wrapping, so
-          # the delete logic has a single shape to handle. The fork has an
-          # earlier commit that wrapped some sites this way.
           REWRAP_RE = re.compile(
               r'if\s*\(\s*0\s*\)\s*(?=fprintf\s*\(\s*stderr\s*,\s*"PANVKDBG)'
           )
 
-          # Start of a PANVKDBG fprintf statement.
           START_RE = re.compile(
               r'fprintf\s*\(\s*stderr\s*,\s*(?="PANVKDBG)'
           )
 
           def _find_statement_end(src, open_paren_idx):
-              """Given the index of the '(' after `fprintf`, return the index
-              just past the matching ')' plus an optional trailing ';' and
-              newline. Respects string and character literals."""
               depth = 0
               i = open_paren_idx
               in_str = False
@@ -158,8 +151,6 @@ jobs:
               return i
 
           def silence_fprintf(src):
-              """Delete every fprintf(stderr, "PANVKDBG ...)" statement.
-              Returns (new_src, count)."""
               src = REWRAP_RE.sub("", src)
               out = []
               i = 0
@@ -264,7 +255,7 @@ jobs:
           echo "--- wrote ci-scripts/patch_panvkdbg.py ---"
           wc -l "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
 
-      - name: Build PanVK (${{ matrix.build-type }}) inside Termux container
+      - name: Build PanVK + Zink (${{ matrix.build-type }}) inside Termux container
         run: |
           set -euo pipefail
 
@@ -304,7 +295,10 @@ jobs:
                 bison flex cmake glslang shaderc vulkan-headers \
                 vulkan-loader-generic libandroid-shmem libdrm libxcb \
                 xorgproto libx11 libxshmfence zlib zstd libexpat \
-                libclc spirv-llvm-translator libxrandr libxrandr-static file
+                libclc spirv-llvm-translator libxrandr libxrandr-static file \
+                libxext libxfixes libxdamage libxcb-keysyms libxcb-render \
+                libxcb-render-util libxcb-shape libxcb-shm libxcb-sync \
+                libxcb-xfixes libxcb-image libxcb-icccm libxcb-util
 
               pip install --break-system-packages meson mako pyyaml packaging
 
@@ -329,42 +323,99 @@ jobs:
               RESIDUAL=$(grep -r "\"PANVKDBG" src/panfrost/ | wc -l || true)
               echo "Residual \"PANVKDBG literals in source tree: $RESIDUAL"
 
+              # ──────────────────────────────────────────────────────────
+              # Meson setup — base options from the local build script,
+              # extended to enable Zink (Gallium-on-Vulkan).
+              #
+              # Zink requires:
+              #   -Dgallium-drivers=zink      (Zink is a Gallium driver)
+              #   -Dopengl=true               (build the GL frontend)
+              #   -Dgles2=enabled             (GLES 2/3 frontend)
+              #   -Degl=enabled               (EGL surface + context API)
+              # ──────────────────────────────────────────────────────────
               meson setup build-bionic \
                 -Dbuildtype="$BUILD_TYPE" \
+                -Dpanvk-use-kbase=true \
                 -Dvulkan-drivers=panfrost \
-                -Dgallium-drivers= \
-                -Dpanfrost-kmds=kbase,panthor \
+                -Dgallium-drivers=zink \
                 -Dplatforms=x11 \
-                -Dglx=disabled \
-                -Degl=disabled \
-                -Dopengl=false \
-                -Dgles1=disabled \
-                -Dgles2=disabled \
+                -Ddebug=false \
+                -Dstrip=true \
                 -Dbuild-tests=false \
+                -Dc_link_args=-landroid-shmem \
+                -Dcpp_link_args=-landroid-shmem \
+                -Dpanfrost-kmds=kbase,panthor \
+                -Dopengl=true \
+                -Dgles2=enabled \
+                -Degl=enabled \
+                -Dglx=disabled \
+                -Dgbm=disabled \
+                -Dshared-glapi=enabled \
                 -Dlibunwind=disabled \
                 -Dvalgrind=disabled \
                 -Dperfetto=false \
-                -Dpanvk-use-kbase=true \
-                -Dprefix="$PREFIX" \
-                -Dc_link_args=-landroid-shmem \
-                -Dcpp_link_args=-landroid-shmem
-
-              ninja -C build-bionic -j$(nproc) \
-                src/panfrost/vulkan/libvulkan_panfrost.so
+                -Dprefix="$PREFIX"
 
               echo "=============================================="
-              echo "Informational: PANVKDBG strings in built .so ..."
+              echo "Building entire tree (panvk + zink + GL/EGL) ..."
+              echo "=============================================="
+              # Build everything. This produces, among other things:
+              #   src/panfrost/vulkan/libvulkan_panfrost.so    (PanVK)
+              #   src/gallium/targets/dri/libgallium_dri.so    (contains zink)
+              #   src/egl/libEGL.so.*                          (EGL loader)
+              #   src/mapi/shared-glapi/libglapi.so.*          (GL API dispatch)
+              ninja -C build-bionic -j$(nproc)
+
+              echo "=============================================="
+              echo "Informational: PANVKDBG strings in built panvk .so ..."
               echo "=============================================="
               SO_STRINGS=$(strings build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
                              | grep -c "^PANVKDBG" || true)
-              echo "PANVKDBG strings in freshly built .so: $SO_STRINGS"
+              echo "PANVKDBG strings in freshly built panvk .so: $SO_STRINGS"
 
+              echo "=============================================="
+              echo "Listing all built .so files ..."
+              echo "=============================================="
+              find build-bionic -name "*.so" -o -name "*.so.*" -type f | sort
+
+              # ──────────────────────────────────────────────────────────
+              # Package output tree.
+              # ──────────────────────────────────────────────────────────
               mkdir -p /termux-out/lib
               mkdir -p /termux-out/share/vulkan/icd.d
 
-              cp build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
-                 /termux-out/lib/libvulkan_panfrost.so
+              # Copy every .so produced by the build, preserving symlinks.
+              # This picks up panvk, zink (in libgallium_dri.so), libEGL,
+              # libglapi, and any other shared objects Mesa emitted.
+              while IFS= read -r so; do
+                cp -a "$so" /termux-out/lib/
+              done < <(find build-bionic \( -name "*.so" -o -name "*.so.*" \) -type f)
 
+              # Also copy any .so that were emitted as symlinks only
+              while IFS= read -r so; do
+                target=$(readlink "$so" || true)
+                if [[ -n "$target" ]]; then
+                  cp -a "$so" /termux-out/lib/ 2>/dev/null || true
+                fi
+              done < <(find build-bionic \( -name "*.so" -o -name "*.so.*" \) -type l)
+
+              # Belt-and-braces: explicitly grab the primary artifacts if
+              # they exist at their canonical paths.
+              for f in \
+                build-bionic/src/panfrost/vulkan/libvulkan_panfrost.so \
+                build-bionic/src/gallium/targets/dri/libgallium_dri.so \
+                build-bionic/src/egl/libEGL.so \
+                build-bionic/src/gallium/targets/egl/libEGL_mesa.so \
+                build-bionic/src/mapi/shared-glapi/libglapi.so \
+                build-bionic/src/glx/libGLX_mesa.so
+              do
+                [[ -e "$f" ]] && cp -a "$f" /termux-out/lib/ || true
+              done
+
+              # ──────────────────────────────────────────────────────────
+              # ICD manifest for PanVK. Zink will pick this up through the
+              # Vulkan loader when it needs a physical device.
+              # ──────────────────────────────────────────────────────────
               cat > /termux-out/share/vulkan/icd.d/panfrost_icd.aarch64.json <<JSON
               {
                   "ICD": {
@@ -378,8 +429,8 @@ jobs:
 
               echo "=== ICD ==="
               cat /termux-out/share/vulkan/icd.d/panfrost_icd.aarch64.json
-              echo "=== /termux-out ==="
-              find /termux-out -type f
+              echo "=== /termux-out tree ==="
+              find /termux-out -type f -o -type l | sort
               echo "=== sizes ==="
               ls -lh /termux-out/lib/
             '
@@ -388,17 +439,17 @@ jobs:
         run: |
           set -euo pipefail
           cd "termux-out-${{ matrix.build-type }}"
-          TARBALL="panvk-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz"
+          TARBALL="panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz"
           tar -czvf "../${TARBALL}" .
           ls -lh "../${TARBALL}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: panvk-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}
+          name: panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}
           path: |
             termux-out-${{ matrix.build-type }}/
-            panvk-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz
+            panvk-zink-termux-aarch64-${{ matrix.build-type }}-${{ needs.prepare.outputs.stamp }}.tar.gz
           if-no-files-found: error
 
   release:
@@ -418,9 +469,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          name: "${{ needs.prepare.outputs.tag }} — PanVK build ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
+          name: "${{ needs.prepare.outputs.tag }} — PanVK + Zink for Termux ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
           body: |
-            ## PanVK for Termux (aarch64, native build)
+            ## PanVK + Zink for Termux (aarch64, native build)
 
             Built natively inside Termux (`termux/termux-docker:aarch64`)
             on `ubuntu-24.04-arm` — same toolchain class as an on-device
@@ -432,30 +483,78 @@ jobs:
             **Commit:** `${{ github.sha }}`
             **Build types:** `${{ needs.prepare.outputs.types }}`
 
-            ### Build customizations
-            - PANVKDBG debug statements are deleted from the source tree by
-              the CI before compilation. Unlike `if (0)` wrapping, this does
-              not depend on the compiler's dead-code elimination — the call
-              sites and their argument evaluation are physically gone from
-              the translation units, and the format strings do not appear in
+            ### What is included
+            - **PanVK** — Vulkan driver for Mali-G57 (Valhall JM) via kbase
+            - **Zink** — Gallium driver that provides OpenGL/GLES on top of
+              Vulkan. Because Zink translates GL calls to Vulkan and PanVK
+              is the Vulkan backend, OpenGL applications running under
+              Zink will use PanVK.
+
+            ### Build options
+            Meson setup matches the local `build-bionic` script, extended
+            with the flags required for Zink:
+
+            ```
+            -Dbuildtype=<release|debugoptimized>
+            -Dpanvk-use-kbase=true
+            -Dvulkan-drivers=panfrost
+            -Dgallium-drivers=zink
+            -Dplatforms=x11
+            -Ddebug=false
+            -Dstrip=true
+            -Dbuild-tests=false
+            -Dc_link_args=-landroid-shmem
+            -Dcpp_link_args=-landroid-shmem
+            -Dpanfrost-kmds=kbase,panthor
+            -Dopengl=true
+            -Dgles2=enabled
+            -Degl=enabled
+            -Dglx=disabled
+            -Dgbm=disabled
+            -Dshared-glapi=enabled
+            -Dlibunwind=disabled
+            -Dvalgrind=disabled
+            -Dperfetto=false
+            -Dprefix=$PREFIX
+            ```
+
+            ### Customizations
+            - PANVKDBG debug statements are deleted from the source tree
+              before compilation, so no format strings or call sites reach
               the binary.
             - Early returns added to the two BO/SHM dump helpers in
               `kbase_kmod.c`.
 
             ### Files
-            - `panvk-termux-aarch64-debugoptimized-*.tar.gz`
-            - `panvk-termux-aarch64-release-*.tar.gz`
-            - `libvulkan_panfrost.so`
-            - `panfrost_icd.aarch64.json`
+            - `panvk-zink-termux-aarch64-debugoptimized-*.tar.gz`
+            - `panvk-zink-termux-aarch64-release-*.tar.gz`
+            - `libvulkan_panfrost.so` — PanVK Vulkan driver
+            - `libgallium_dri.so` — contains the Zink Gallium driver
+            - `libEGL.so.*`, `libglapi.so.*` — GL/EGL loaders
+            - `panfrost_icd.aarch64.json` — ICD manifest for the loader
 
             ### Install (Termux)
             ```bash
-            tar -xzf panvk-termux-aarch64-release-*.tar.gz -C $PREFIX
+            tar -xzf panvk-zink-termux-aarch64-release-*.tar.gz -C $PREFIX
+
+            # Vulkan: point the loader at PanVK
             export VK_ICD_FILENAMES=$PREFIX/share/vulkan/icd.d/panfrost_icd.aarch64.json
+
+            # Zink: force Mesa to use Zink for OpenGL
+            export MESA_LOADER_DRIVER_OVERRIDE=zink
+            export GALLIUM_DRIVER=zink
+            ```
+
+            ### Verify
+            ```bash
+            vulkaninfo | grep -i panvk
+            glxinfo | grep -i "OpenGL renderer"
+            # expect renderer to be "zink (Mali-G57 …)" or similar
             ```
           files: |
             artifacts/*.tar.gz
             artifacts/**/libvulkan_panfrost.so
+            artifacts/**/libgallium_dri.so
             artifacts/**/panfrost_icd.aarch64.json
           overwrite_files: true
           generate_release_notes: true
