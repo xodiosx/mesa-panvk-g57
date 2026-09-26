@@ -260,9 +260,13 @@ jobs:
           mkdir -p "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
           chmod 777 "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
 
+          # Fall back to the workflow's own GITHUB_TOKEN when no explicit
+          # GH_PUSH_TOKEN secret has been set. This lets the push work in
+          # the same repo without any extra setup.
           docker run --rm \
-            -e GH_PUSH_TOKEN="${{ secrets.GH_PUSH_TOKEN }}" \
+            -e PUSH_TOKEN="${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}" \
             -e PUSH_ENABLED="${{ github.event.inputs.push_to_source_repo || 'false' }}" \
+            -e PUSH_TARGET="${{ github.repository }}" \
             -v "${{ github.workspace }}/termux-out-${{ matrix.build-type }}:/termux-out" \
             -v "${{ github.workspace }}/ci-scripts:/ci-scripts:ro" \
             termux/termux-docker:aarch64 \
@@ -304,7 +308,7 @@ jobs:
                 libxrandr libxrandr-static mesa-demos osmesa \
                 pulseaudio termux-x11-nightly patch file perl mesa-dev libglvnd-dev libglvnd
 
-              pip install --break-system-packages meson mako mako pyyaml packaging setuptools
+              pip install --break-system-packages meson mako pyyaml packaging setuptools
 
               mkdir -p "$TMPDIR"
               cd "$TMPDIR"
@@ -334,8 +338,6 @@ jobs:
               echo "=============================================="
               cd "$TMPDIR"
 
-              # Explicit --exclude=<name> for each entry; diff does not
-              # support tar-style --exclude-vcs.
               set +e
               diff -ruN \
                 --exclude=.git \
@@ -371,31 +373,39 @@ jobs:
               cd mesa-panvk
 
               # ──────────────────────────────────────────────────────
-              # Optional: force-push the patched tree back to the source
-              # repo. Requires a PAT with repo scope in the GH_PUSH_TOKEN
-              # secret. Skipped unless push_to_source_repo is true.
+              # Force-push the patched tree back to the source repo.
+              # Mirrors the old "Sync Mesa Repo" workflow: commit the
+              # in-container tree, set the remote URL with the token,
+              # push --force.
+              #
+              # Uses the standard GITHUB_TOKEN by default (no setup
+              # needed); falls back to GH_PUSH_TOKEN if you set one.
+              # Only runs when push_to_source_repo is true.
               # ──────────────────────────────────────────────────────
-              if [[ "${PUSH_ENABLED}" = "true" && -n "${GH_PUSH_TOKEN:-}" ]]; then
+              if [[ "${PUSH_ENABLED}" = "true" && -n "${PUSH_TOKEN:-}" ]]; then
                 echo "=============================================="
                 echo "Force-pushing patched tree to source repo ..."
                 echo "=============================================="
-                git config user.email "ci@users.noreply.github.com"
-                git config user.name "CI"
+                git config user.email "github-actions@users.noreply.github.com"
+                git config user.name  "github-actions"
                 git add -A
                 if git diff --cached --quiet; then
                   echo ">>> No staged changes; nothing to push."
                 else
                   git commit -m "CI: neutralize PANVKDBG + rename driver to panvcake ($(date -u +%Y%m%d-%H%M%S))"
-                  git remote set-url origin \
-                    "https://x-access-token:${GH_PUSH_TOKEN}@github.com/xodiosx/mesa-panvk-mali-g57.git"
                   BRANCH=$(git rev-parse --abbrev-ref HEAD)
-                  echo ">>> pushing HEAD -> origin/${BRANCH} (force)"
+                  # Set the remote URL with the token baked in.
+                  git remote set-url origin \
+                    "https://x-access-token:${PUSH_TOKEN}@github.com/${PUSH_TARGET}.git"
+                  echo ">>> pushing HEAD -> ${PUSH_TARGET}:${BRANCH} (force)"
                   git push --force origin "HEAD:refs/heads/${BRANCH}"
                   echo ">>> push succeeded"
                 fi
               else
                 echo "=============================================="
-                echo "Force-push skipped (PUSH_ENABLED=${PUSH_ENABLED}, token present: $([[ -n "${GH_PUSH_TOKEN:-}" ]] && echo yes || echo no))"
+                echo "Force-push skipped"
+                echo "  PUSH_ENABLED = ${PUSH_ENABLED}"
+                echo "  token present = $([[ -n "${PUSH_TOKEN:-}" ]] && echo yes || echo no)"
                 echo "=============================================="
               fi
 
@@ -547,9 +557,7 @@ jobs:
             ## PanVK + Zink for Termux (aarch64, native build)
 
             Built natively inside Termux (`termux/termux-docker:aarch64`)
-            on `ubuntu-24.04-arm` — same toolchain class as an on-device
-            native Termux build (Termux Clang/LLD, target
-            `aarch64-linux-android35`).
+            on `ubuntu-24.04-arm`.
 
             **Build date (UTC):** `${{ needs.prepare.outputs.date }}`
             **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
