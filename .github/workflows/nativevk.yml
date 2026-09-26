@@ -535,14 +535,25 @@ jobs:
 
             ### Install (Termux)
             ```bash
+            
+            curl -LO panvk-zink-termux-aarch64-release-*.tar.gz
             tar -xzf panvk-zink-termux-aarch64-release-*.tar.gz -C $PREFIX
-
+            export DISPLAY=:0
+            
+            
             # Vulkan: point the loader at PanVK
             export VK_ICD_FILENAMES=$PREFIX/share/vulkan/icd.d/panfrost_icd.aarch64.json
-
+            vkmark 
+            
             # Zink: force Mesa to use Zink for OpenGL
             export MESA_LOADER_DRIVER_OVERRIDE=zink
             export GALLIUM_DRIVER=zink
+            export WSI_X11_TERMUX=1
+            export PANVK_NO_AFBC=1
+            export PANVK_SPLIT_SUBMIT=1
+            
+            # Run glmark2 benchmark test
+            glmark2
             ```
 
             ### Verify
