@@ -94,7 +94,7 @@ jobs:
              VK_DRIVER_ID_MESA_PANVK to a custom value.
 
           4. Teach Zink's zink_set_driver_strings() to display "panvcake"
-             for that custom ID (otherwise GL_RENDERER shows "Driver Unknown").
+             for that custom ID.
           """
           import re
           import sys
@@ -198,20 +198,6 @@ jobs:
 
 
           def patch_zink(src):
-              """
-              zink_set_driver_strings() calls vk_DriverId_to_str() and only
-              uses the result if the string contains "VK_DRIVER_ID_". Our
-              custom ID isn't in the generated table, so the string is
-              "UNKNOWN_<value>" and Zink prints "Driver Unknown" in
-              GL_RENDERER.
-
-              Add a special case so when the driver ID equals our custom
-              value the display name is "panvcake".
-
-              Returns (src, 0)  if already patched,
-                      (src, 1)  on success,
-                      (src, -1) if the expected pattern was not found.
-              """
               if 'zink_driverid(screen)) == 0x0000CAFE' in src:
                   return src, 0
 
@@ -227,7 +213,6 @@ jobs:
 
               new = (
                   '   const char *driver_name = vk_DriverId_to_str(zink_driverid(screen)) + strlen("VK_DRIVER_ID_");\n'
-                  '   /* Downstream: report a friendly name for our non-standard driver ID. */\n'
                   '   const char *name_part;\n'
                   '   if ((unsigned)zink_driverid(screen) == 0x0000CAFE)\n'
                   '      name_part = "panvcake";\n'
@@ -294,8 +279,7 @@ jobs:
                   src = ZINK_SCREEN.read_text()
                   src2, n = patch_zink(src)
                   if n == -1:
-                      print(f"WARNING: {ZINK_SCREEN}: expected pattern not "
-                            f"found; check the file manually.")
+                      print(f"WARNING: {ZINK_SCREEN}: expected pattern not found")
                   elif n == 0:
                       print(f"{ZINK_SCREEN}: zink already patched (skipped)")
                   else:
@@ -323,10 +307,6 @@ jobs:
           echo "--- wrote ci-scripts/patch_panvkdbg.py ---"
           wc -l "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
 
-      # ─────────────────────────────────────────────────────────────
-      # Clone the source repo, apply our patcher, and sync into the
-      # current repo. Runs entirely on the runner (simple permissions).
-      # ─────────────────────────────────────────────────────────────
       - name: Clone source repo and apply patcher
         run: |
           set -euo pipefail
@@ -353,12 +333,11 @@ jobs:
           SRC="${{ github.workspace }}/_src"
           DST="${{ github.workspace }}"
 
-          echo "--- syncing $SRC -> $DST (excluding VCS + markdown + docs + binaries) ---"
+          echo "--- syncing $SRC -> $DST (excluding VCS + markdown + binaries) ---"
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='.github/' \
             --exclude='*.md' \
-            --exclude='docs/' \
             --exclude='*.tar.gz' \
             --exclude='*.tar.xz' \
             --exclude='*.zip' \
@@ -405,9 +384,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
-      # ─────────────────────────────────────────────────────────────
-      # Build inside the Termux container.
-      # ─────────────────────────────────────────────────────────────
       - name: Build PanVK + Zink (${{ matrix.build-type }}) inside Termux container
         run: |
           set -euo pipefail
