@@ -164,6 +164,29 @@ jobs:
           #endif
           EOF
 
+      - name: Fix buffer_handle_t typedef conflict
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          FILE="include/vulkan/vk_android_native_buffer.h"
+          [ -f "$FILE" ] || { echo "❌ $FILE not found"; exit 1; }
+
+          echo "==== relevant lines before ===="
+          grep -n -B2 -A6 'buffer_handle_t' "$FILE" | head -40
+
+          sed -i -E \
+            's|^#if[[:space:]]*\(defined\(__ANDROID__\)[[:space:]]*\|\|[[:space:]]*defined\(ANDROID\)\)[[:space:]]*&&[[:space:]]*0.*$|#if defined(__ANDROID__) \|\| defined(ANDROID)|' \
+            "$FILE"
+
+          echo "==== relevant lines after ===="
+          grep -n -B2 -A6 'buffer_handle_t' "$FILE" | head -40
+
+          if grep -qE 'defined\(__ANDROID__\).*&&[[:space:]]*0' "$FILE"; then
+            echo "❌ substitution failed — pattern not found"
+            exit 1
+          fi
+          echo "✔ $FILE patched"
+
       - name: Override Vulkan API version (optional)
         if: github.event.inputs.api_override != ''
         working-directory: mesa
@@ -173,9 +196,6 @@ jobs:
           [ -f "$DEVFILE" ] || { echo "❌ $DEVFILE not found"; exit 1; }
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
 
-      # ─────────────────────────────────────────────────────────────
-      # PASS 1 — Host tools (native x86_64, LLVM 19)
-      # ─────────────────────────────────────────────────────────────
       - name: Configure host tools (native)
         working-directory: mesa
         env:
@@ -226,9 +246,6 @@ jobs:
           ls -la "$GITHUB_WORKSPACE/host-bin/"
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
-      # ─────────────────────────────────────────────────────────────
-      # PASS 2 — Cross build for aarch64-linux-android
-      # ─────────────────────────────────────────────────────────────
       - name: Create Meson cross file
         run: |
           TARGET="aarch64-linux-android"
