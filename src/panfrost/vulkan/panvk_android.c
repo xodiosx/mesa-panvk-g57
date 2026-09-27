@@ -251,24 +251,29 @@ panvk_android_ahb_trace_dump(const char *tag, struct AHardwareBuffer *ahb,
    AHardwareBuffer_describe(ahb, &desc);
    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
 
+   /* AHardwareBuffer_Desc has no public allocation size and there is no public
+    * AHardwareBuffer_getSize(), so estimate it from the described geometry.
+    * The authoritative size is the subresource layout dumped below.
+    */
+   uint64_t est_size = (uint64_t)desc.stride * desc.height * desc.layers;
+
    fprintf(stderr,
            "PANVKDBG AHB %s ahb=%p handle=%s fd=%d width=%u height=%u "
-           "layers=%u format=%d usage=0x%llx stride=%u alloc=%u size=%llu\n",
+           "layers=%u format=%d usage=0x%llx stride=%u est_size=%llu\n",
            tag, (void *)ahb,
            handle ? "yes" : "no", handle ? handle->data[0] : -1, desc.width,
            desc.height, desc.layers, (int)desc.format,
-           (unsigned long long)desc.usage, desc.stride, desc.allocationSize,
-           (unsigned long long)AHardwareBuffer_getSize(ahb));
+           (unsigned long long)desc.usage, desc.stride,
+           (unsigned long long)est_size);
 
    if (img)
       fprintf(stderr,
               "PANVKDBG AHB %s img=%p type=%d fmt=%d extent=%ux%u mips=%u "
               "layers=%u samples=%d tiling=%d usage=0x%llx ext_types=0x%x\n",
-              tag, (void *)img->vk.base.handle, (int)img->vk.image_type,
-              (int)img->vk.format, img->vk.extent.width, img->vk.extent.height,
-              img->vk.mip_levels, img->vk.array_layers, (int)img->vk.samples,
-              (int)img->vk.tiling, (unsigned long long)img->vk.usage,
-              img->vk.external_handle_types);
+              tag, (void *)img, (int)img->vk.image_type, (int)img->vk.format,
+              img->vk.extent.width, img->vk.extent.height, img->vk.mip_levels,
+              img->vk.array_layers, (int)img->vk.samples, (int)img->vk.tiling,
+              (unsigned long long)img->vk.usage, img->vk.external_handle_types);
 
    if (layout)
       fprintf(stderr,

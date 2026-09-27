@@ -10,14 +10,18 @@
  * public ANativeWindow interface instead of ported from upstream.  The
  * presentation model is the classic lock/unlockAndPost one:
  *
- *   - the swapchain asks the window for buffers of the swapchain geometry with
- *     ANativeWindow_setBuffersGeometry();
- *   - every swapchain image owns one buffer locked through
- *     ANativeWindow_lock(), taken in image order, which is the order a
- *     BufferQueue wants them back in;
- *   - the WSI renders into a host-visible buffer (the same buffer-blit path the
- *     X11 SHM path uses) and the present copies that into the compositor buffer
- *     before ANativeWindow_unlockAndPost() queues the frame.
+ *   - the WSI renders into a host-visible buffer, through the same buffer-blit
+ *     path the X11 SHM path uses;
+ *   - the present locks a compositor buffer with ANativeWindow_lock(), copies the
+ *     rendered frame into it and hands it over with
+ *     ANativeWindow_unlockAndPost().
+ *
+ * The lock is deliberately taken and dropped inside the present rather than held
+ * for the lifetime of the image: ANativeWindow only ever has one buffer locked
+ * at a time, and the number of buffers it owns is not knowable through the
+ * public interface, so holding N of them at swapchain creation would either fail
+ * or block forever.  Blocking in the present instead is what the compositor is
+ * for, and it is also what throttles the swapchain.
  *
  * No dma-buf is exchanged with the compositor, so this works on a kbase device
  * that can neither import host pointers nor share dma-bufs with the window
@@ -63,13 +67,6 @@ struct wsi_android_surface {
 
 struct wsi_android_image {
    struct wsi_image base;
-
-   struct ANativeWindow *window;
-   /* Buffer the compositor handed us through ANativeWindow_lock().  It stays
-    * locked until the image is presented. */
-   uint8_t *buffer_ptr;
-   uint32_t buffer_stride;
-   bool locked;
 };
 
 struct wsi_android_swapchain {
@@ -143,17 +140,17 @@ wsi_android_surface_get_capabilities2(
           wsi_android_surface_get_window(icd_surface), &width, &height))
       return VK_ERROR_SURFACE_LOST_KHR;
 
-   pSurfaceCapabilities->minImageCount = WSI_ANDROID_MIN_IMAGES;
-   pSurfaceCapabilities->maxImageCount = WSI_ANDROID_MAX_IMAGES;
-   pSurfaceCapabilities->currentExtent = (VkExtent2D){width, height};
-   pSurfaceCapabilities->minImageExtent = (VkExtent2D){1, 1};
-   pSurfaceCapabilities->maxImageExtent = (VkExtent2D){width, height};
-   pSurfaceCapabilities->maxImageArrayLayers = 1;
-   pSurfaceCapabilities->supportedTransforms =
+   pSurfaceCapabilities->surfaceCapabilities.minImageCount = WSI_ANDROID_MIN_IMAGES;
+   pSurfaceCapabilities->surfaceCapabilities.maxImageCount = WSI_ANDROID_MAX_IMAGES;
+   pSurfaceCapabilities->surfaceCapabilities.currentExtent = (VkExtent2D){width, height};
+   pSurfaceCapabilities->surfaceCapabilities.minImageExtent = (VkExtent2D){1, 1};
+   pSurfaceCapabilities->surfaceCapabilities.maxImageExtent = (VkExtent2D){width, height};
+   pSurfaceCapabilities->surfaceCapabilities.maxImageArrayLayers = 1;
+   pSurfaceCapabilities->surfaceCapabilities.supportedTransforms =
       VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-   pSurfaceCapabilities->currentTransform =
+   pSurfaceCapabilities->surfaceCapabilities.currentTransform =
       VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-   pSurfaceCapabilities->supportedCompositeAlpha =
+   pSurfaceCapabilities->surfaceCapabilities.supportedCompositeAlpha =
       VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 
    vk_foreach_struct(ext, pSurfaceCapabilities->pNext) {
@@ -171,9 +168,9 @@ wsi_android_surface_get_capabilities2(
          scaling->supportedPresentGravityX = 0;
          scaling->supportedPresentGravityY = 0;
          scaling->minScaledImageExtent =
-            pSurfaceCapabilities->minImageExtent;
+            pSurfaceCapabilities->surfaceCapabilities.minImageExtent;
          scaling->maxScaledImageExtent =
-            pSurfaceCapabilities->maxImageExtent;
+            pSurfaceCapabilities->surfaceCapabilities.maxImageExtent;
          break;
       }
 
@@ -348,72 +345,76 @@ wsi_android_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
    vk_free2(&instance->alloc, pAllocator, surface);
 }
 
+static VkResult
+wsi_android_swapchain_result(struct wsi_android_swapchain *chain,
+                             VkResult result);
+
 /*
- * Takes one buffer from the window for the given image.  The buffer stays
- * locked until the image is presented, which is the only way to hand it back.
+ * Locks a compositor buffer, copies the finished frame into it and posts it.
+ * This is the only place that talks to the window, so exactly one buffer is ever
+ * locked at a time.
  */
-static bool
-wsi_android_lock_image(struct wsi_android_image *image, unsigned size)
+static VkResult
+wsi_android_post_frame(struct wsi_android_swapchain *chain, uint32_t image_index)
 {
-   struct ANativeWindow *window = image->window;
-   int32_t width, height;
-   ARect in_rect, out_rect;
-   uint8_t *ptr;
+   struct wsi_image *image = &chain->images[image_index].base;
+   const uint32_t blit_stride = image->row_pitches[0];
+   const uint8_t *src = image->cpu_map;
+   ANativeWindow_Buffer buffer;
+   VkResult status = VK_SUCCESS;
 
-   if (!window || image->locked)
-      return false;
-
-   width = ANativeWindow_getWidth(window);
-   height = ANativeWindow_getHeight(window);
-   if (width <= 0 || height <= 0)
-      return false;
-
-   /* Ask for the whole buffer so the compositor never does a partial update. */
-   in_rect.left = 0;
-   in_rect.top = 0;
-   in_rect.right = width;
-   in_rect.bottom = height;
-   memset(&out_rect, 0, sizeof(out_rect));
-
-   ptr = ANativeWindow_lock(window, &in_rect, &out_rect);
-   if (!ptr)
-      return false;
-
-   if (out_rect.width <= 0 || out_rect.height <= 0) {
-      /* No buffer was available.  ANativeWindow_lock() still has to be paired
-       * with an unlock. */
-      ANativeWindow_unlockAndPost(window);
-      return false;
+   if (!src || !blit_stride) {
+      status = wsi_android_swapchain_result(chain, VK_ERROR_INITIALIZATION_FAILED);
+      return status;
    }
 
-   image->buffer_ptr = ptr;
-   image->buffer_stride = (uint32_t)out_rect.stride * 4;
-   image->locked = true;
+   memset(&buffer, 0, sizeof(buffer));
+   if (ANativeWindow_lock(chain->window, &buffer, NULL) != 0) {
+      status = wsi_android_swapchain_result(chain, VK_ERROR_OUT_OF_DATE_KHR);
+      return status;
+   }
 
    if (wsi_panvk_trace())
       fprintf(stderr,
-              "PANVKDBG ANDROID_LOCK image=%p ptr=%p stride=%u out=%dx%d "
-              "want=%u\n",
-              (void *)image, (void *)ptr, image->buffer_stride, out_rect.width,
-              out_rect.height, size);
+              "PANVKDBG ANDROID_LOCK window=%p bits=%p %ux%u stride=%d "
+              "format=%d image=%u blit_stride=%u\n",
+              (void *)chain->window, buffer.bits, buffer.width, buffer.height,
+              buffer.stride, buffer.format, image_index, blit_stride);
 
-   return true;
-}
+   if (buffer.bits) {
+      /* The blit target and the compositor buffer both hold tightly packed
+       * rows of the swapchain format, but the window stride is chosen by the
+       * compositor and the geometry may not match the swapchain extent, so copy
+       * row by row over the common area. */
+      const uint32_t bytes_per_pixel = 4;
+      const uint32_t dst_stride = (uint32_t)buffer.stride * bytes_per_pixel;
+      const uint32_t row_bytes = chain->extent.width * bytes_per_pixel;
+      const uint32_t height = MIN2(chain->extent.height, (uint32_t)buffer.height);
+      const uint32_t pitch = MIN2(row_bytes, MIN2(blit_stride, dst_stride));
+      uint8_t *dst = (uint8_t *)buffer.bits;
 
-/*
- * Called by the generic buffer-blit context to obtain the compositor buffer the
- * finished frame is copied into.  Images are initialized in index order, which
- * is the order a BufferQueue expects buffers to be queued back in.
- */
-static uint8_t *
-wsi_android_alloc_buffer(struct wsi_image *imagew, unsigned size)
-{
-   struct wsi_android_image *image = (struct wsi_android_image *)imagew;
+      for (uint32_t y = 0; y < height; y++) {
+         memcpy(dst + (size_t)y * dst_stride,
+                src + (size_t)y * blit_stride, pitch);
+      }
 
-   if (!wsi_android_lock_image(image, size))
-      return NULL;
+      if (wsi_panvk_trace())
+         fprintf(stderr,
+                 "PANVKDBG ANDROID_COPY image=%u rows=%u pitch=%u extent=%ux%u\n",
+                 image_index, height, pitch, chain->extent.width,
+                 chain->extent.height);
+   } else {
+      status = wsi_android_swapchain_result(chain, VK_ERROR_OUT_OF_DATE_KHR);
+   }
 
-   return image->buffer_ptr;
+   if (ANativeWindow_unlockAndPost(chain->window) != 0 && status >= 0)
+      status = wsi_android_swapchain_result(chain, VK_ERROR_OUT_OF_DATE_KHR);
+
+   if (wsi_panvk_trace())
+      fprintf(stderr, "PANVKDBG ANDROID_POST image=%u result=%d\n", image_index,
+              status);
+
+   return status;
 }
 
 static VkResult
@@ -421,19 +422,12 @@ wsi_android_image_init(struct wsi_android_swapchain *chain,
                        const struct wsi_image_info *info,
                        struct wsi_android_image *image)
 {
-   image->window = chain->window;
-
    return wsi_create_image(&chain->base, info, &image->base);
 }
 
 static void
 wsi_android_image_finish(struct wsi_android_image *image)
 {
-   if (image->locked) {
-      ANativeWindow_unlockAndPost(image->window);
-      image->locked = false;
-      image->buffer_ptr = NULL;
-   }
 }
 
 static struct wsi_image *
@@ -451,7 +445,6 @@ static VkResult
 wsi_android_swapchain_result(struct wsi_android_swapchain *chain,
                              VkResult result)
 {
-   /* Prioritise returning existing errors for consistency. */
    if (chain->status < 0)
       return chain->status;
 
@@ -507,52 +500,7 @@ wsi_android_acquire_next_image(struct wsi_swapchain *wsi_chain,
 
    assert(*image_index < chain->base.image_count);
 
-   /* A buffer only stays locked for one frame, so every acquire after the first
-    * one has to take a fresh buffer from the window.  This is what throttles
-    * the swapchain to what the compositor can actually consume. */
-   mtx_lock(&chain->lock);
-   if (!chain->images[*image_index].locked &&
-       !wsi_android_lock_image(
-          &chain->images[*image_index],
-          (unsigned)chain->base.image_info.linear_size)) {
-      /* Give the image back so it is not lost, and let the caller rebuild. */
-      wsi_queue_push(&chain->acquire_queue, *image_index);
-      result = wsi_android_swapchain_result(chain, VK_ERROR_OUT_OF_DATE_KHR);
-      mtx_unlock(&chain->lock);
-      return result;
-   }
-   mtx_unlock(&chain->lock);
-
    return chain->status < 0 ? chain->status : VK_SUCCESS;
-}
-
-static void
-wsi_android_copy_blit_to_buffer(struct wsi_android_swapchain *chain,
-                                uint32_t image_index)
-{
-   struct wsi_android_image *image = &chain->images[image_index];
-   const uint32_t blit_stride = image->base.row_pitches[0];
-   const uint8_t *src = image->base.cpu_map;
-
-   if (!image->locked || !image->buffer_ptr || !src || !blit_stride)
-      return;
-
-   /* The blit target and the compositor buffer have the same layout by
-    * construction, so this is one straight copy of the frame. */
-   assert(blit_stride * chain->extent.height <= image->base.sizes[0]);
-
-   for (uint32_t y = 0; y < chain->extent.height; y++) {
-      memcpy(image->buffer_ptr + (size_t)y * image->buffer_stride,
-             src + (size_t)y * blit_stride,
-             MIN2(blit_stride, image->buffer_stride));
-   }
-
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-              "PANVKDBG ANDROID_COPY image=%u blit_stride=%u "
-              "buffer_stride=%u height=%u\n",
-              image_index, blit_stride, image->buffer_stride,
-              chain->extent.height);
 }
 
 static VkResult
@@ -562,7 +510,6 @@ wsi_android_queue_present(struct wsi_swapchain *wsi_chain,
 {
    struct wsi_android_swapchain *chain =
       (struct wsi_android_swapchain *)wsi_chain;
-   VkResult result;
 
    if (wsi_panvk_trace())
       fprintf(stderr,
@@ -575,35 +522,11 @@ wsi_android_queue_present(struct wsi_swapchain *wsi_chain,
 
    assert(image_index < chain->base.image_count);
 
-   /* The generic queue-present path already waited on the present fence for a
-    * software device, so the blit result in cpu_map is complete here. */
-   wsi_android_copy_blit_to_buffer(chain, image_index);
-
    mtx_lock(&chain->lock);
-
-   if (chain->images[image_index].locked) {
-      /* unlockAndPost is the only way to hand a locked buffer back, and it is
-       * also what queues the frame for the compositor. */
-      if (ANativeWindow_unlockAndPost(chain->window) != 0) {
-         result =
-            wsi_android_swapchain_result(chain, VK_ERROR_SURFACE_LOST_KHR);
-      } else {
-         chain->images[image_index].locked = false;
-         chain->images[image_index].buffer_ptr = NULL;
-         wsi_queue_push(&chain->acquire_queue, image_index);
-         result = chain->status;
-      }
-   } else {
-      result = wsi_android_swapchain_result(chain, VK_ERROR_SURFACE_LOST_KHR);
-   }
-
+   VkResult result = wsi_android_post_frame(chain, image_index);
+   if (result >= 0)
+      wsi_queue_push(&chain->acquire_queue, image_index);
    mtx_unlock(&chain->lock);
-
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-              "PANVKDBG ANDROID_POST image=%u result=%d present_id=%" PRIu64
-              "\n",
-              image_index, result, present_id);
 
    return result;
 }
@@ -670,7 +593,7 @@ wsi_android_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_android_swapchain *chain;
    struct wsi_cpu_image_params cpu_image_params = {
       .base.image_type = WSI_IMAGE_TYPE_CPU,
-      .alloc_shm = wsi_android_alloc_buffer,
+      .alloc_shm = NULL,
    };
    VkPresentModeKHR present_mode =
       wsi_swapchain_get_present_mode(wsi_device, pCreateInfo);
@@ -696,7 +619,7 @@ wsi_android_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    int32_t window_format = WINDOW_FORMAT_RGBA_8888;
    if (pCreateInfo->imageFormat == VK_FORMAT_B8G8R8A8_UNORM ||
        pCreateInfo->imageFormat == VK_FORMAT_B8G8R8A8_SRGB)
-      window_format = WINDOW_FORMAT_BGRA_8888;
+      window_format = WINDOW_FORMAT_RGBA_8888;
 
    /* A zero extent means "whatever the surface currently is". */
    VkExtent2D extent = pCreateInfo->imageExtent;
@@ -733,18 +656,7 @@ wsi_android_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       result = VK_ERROR_SURFACE_LOST_KHR;
       goto fail_mutex;
    }
-   ANativeWindow_setBuffersTransform(window, NATIVE_WINDOW_TRANSFORM_IDENTITY);
-   /* One extra buffer so the compositor always has a front buffer while the
-    * swapchain holds the rest locked. */
-   ANativeWindow_setBufferCount(window, (int32_t)num_images + 1);
-
-   /* ANativeWindow_lock() blocks until the compositor frees a buffer, so the
-    * number of images has to fit the number of buffers the window really gave
-    * us, otherwise creating the swapchain would hang. */
-   int32_t buffer_count = ANativeWindow_getBuffersCount(window);
-   if (buffer_count > 0 && (unsigned)buffer_count < num_images)
-      num_images = (unsigned)buffer_count;
-
+   ANativeWindow_setBuffersTransform(window, ANATIVEWINDOW_TRANSFORM_IDENTITY);
    result = wsi_swapchain_init(wsi_device, &chain->base, device, pCreateInfo,
                                &cpu_image_params.base, pAllocator);
    if (result != VK_SUCCESS)
@@ -793,8 +705,7 @@ fail_init_present_queue:
    wsi_queue_destroy(&chain->present_queue);
 fail_init_images:
    /* wsi_create_image() tears down the image it failed on, so only the images
-    * before it still need wsi_destroy_image(); every buffer that did get locked
-    * does have to be handed back to the compositor either way. */
+    * created before it still need wsi_destroy_image(). */
    for (unsigned j = 0; j <= i && j < chain->base.image_count; j++) {
       wsi_android_image_finish(&chain->images[j]);
       if (j < i)

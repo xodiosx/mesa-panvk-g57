@@ -29,9 +29,11 @@ endif
 
 # VK_KHR_android_surface.  ANativeWindow_lock() needs libnativewindow, which
 # only exists from API level 26 on.
-if with_platform_android and not with_android_stub and get_option('platform-sdk-version') >= 26
+if with_platform_android and get_option('platform-sdk-version') >= 26
   files_vulkan_wsi += files('wsi_common_android.c')
-  platform_deps += dep_android
+  if not with_android_stub
+    platform_deps += dep_android
+  endif
 endif
 
 if with_platform_windows
