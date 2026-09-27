@@ -123,8 +123,6 @@ jobs:
 
       # ──────────────────────────────────────────────────────────
       # Patch 3: build wsi_common_android.c under android-stub.
-      # The reference's meson condition has `not with_android_stub`,
-      # which excludes the file while wsi_common.c still calls it.
       # ──────────────────────────────────────────────────────────
       - name: Patch wsi/meson.build (build wsi_common_android.c)
         run: |
@@ -141,66 +139,37 @@ jobs:
           echo "OK: $FILE patched"
 
       # ──────────────────────────────────────────────────────────
-      # Patch 4: fix wsi_common_android.c so it compiles against
-      # the android-stub headers. Three problems:
-      #   - missing util/os_time.h include (timespec_from_nsec)
-      #   - VkSurfaceCapabilities2KHR accesses need .surfaceCapabilities
-      #   - ANativeWindow_lock signature differs from the stub
+      # Patch 4: fix wsi_common_android.c against the stub.
+      #  - VkSurfaceCapabilities2KHR needs .surfaceCapabilities. prefix
+      #  - ANativeWindow_lock has a different signature in the stub
       # ──────────────────────────────────────────────────────────
-      - name: Patch wsi_common_android.c for stub compatibility
+      - name: Patch wsi_common_android.c (stub type fixes)
         run: |
           set -euo pipefail
           FILE="src/vulkan/wsi/wsi_common_android.c"
           [[ -f "$FILE" ]] || { echo "ERROR: $FILE not found"; exit 1; }
 
-          # ---- fix 1: add util/os_time.h include before wsi_common_queue.h ----
-          if ! grep -q '#include "util/os_time.h"' "$FILE"; then
-            python3 - "$FILE" <<'PY'
-          import sys
-          p = sys.argv[1]
-          src = open(p, encoding="utf-8").read()
-          needle = '#include "wsi_common_queue.h"'
-          if needle not in src:
-              print("WARN: wsi_common_queue.h include not found; skipping include fix")
-              sys.exit(0)
-          src = src.replace(needle,
-                            '#include "util/os_time.h"\n' + needle, 1)
-          open(p, "w", encoding="utf-8").write(src)
-          print("Inserted util/os_time.h include")
-          PY
-          fi
-
-          # ---- fix 2: VkSurfaceCapabilities2KHR member accesses ----
+          # VkSurfaceCapabilities2KHR accesses — prefix with .surfaceCapabilities
           for m in minImageCount maxImageCount currentExtent \
                    minImageExtent maxImageExtent maxImageArrayLayers \
                    supportedTransforms currentTransform supportedCompositeAlpha; do
             sed -i "s|pSurfaceCapabilities->${m}\\b|pSurfaceCapabilities->surfaceCapabilities.${m}|g" "$FILE"
           done
 
-          echo "---- remaining direct pSurfaceCapabilities-> accesses ----"
-          grep -n 'pSurfaceCapabilities->' "$FILE" || true
-
-          # ---- fix 3: rewrite wsi_android_lock_image to match the stub ----
+          # Rewrite wsi_android_lock_image for the stub's ANativeWindow_lock API
           python3 - "$FILE" <<'PY'
           import sys
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
 
           if "/* CI: lock_image rewritten for android-stub" in src:
-              print("lock_image already rewritten — skipping")
-              sys.exit(0)
+              print("lock_image already rewritten — skipping"); sys.exit(0)
 
-          marker = "wsi_android_lock_image"
-          start = src.find(marker)
+          start = src.find("wsi_android_lock_image")
           if start == -1:
-              print(f"WARNING: {marker} not found")
-              sys.exit(0)
+              print("WARNING: wsi_android_lock_image not found"); sys.exit(0)
 
           brace = src.find("{", start)
-          if brace == -1:
-              print("WARNING: opening brace not found")
-              sys.exit(0)
-
           depth = 0; i = brace
           in_str = in_chr = False
           in_line = in_block = False
@@ -237,8 +206,7 @@ jobs:
               * The stub's ANativeWindow_lock signature is
               *   int32_t(ANativeWindow*, ANativeWindow_Buffer*, ARect*)
               * while the reference was written against a different shape.
-              * This version matches the stub headers, which in turn match
-              * the real Android API. */
+              * This version matches the stub headers. */
              struct ANativeWindow *window = image->window;
              int32_t width, height;
              ARect in_rect;
@@ -286,11 +254,93 @@ jobs:
 
           new_src = src[:brace] + replacement + src[i+1:]
           open(p, "w", encoding="utf-8").write(new_src)
-          print(f"Rewrote {marker} body in {p}.")
+          print(f"Rewrote wsi_android_lock_image body.")
           PY
 
-          echo "---- verification: lock_image head ----"
-          grep -n -A8 'wsi_android_lock_image' "$FILE" | head -20
+      # ──────────────────────────────────────────────────────────
+      # Patch 5: fix wsi_common_queue.h — declare timespec_from_nsec
+      # in the header itself so every includer gets it regardless of
+      # include order. Also fix three stub-vs-NDK name mismatches in
+      # wsi_common_android.c and drop two API calls the stub lacks.
+      # ──────────────────────────────────────────────────────────
+      - name: Patch wsi_common_queue.h and remaining wsi_common_android.c mismatches
+        run: |
+          set -euo pipefail
+
+          # ── 5a: wsi_common_queue.h — add util/os_time.h include ──
+          QH="src/vulkan/wsi/wsi_common_queue.h"
+          [[ -f "$QH" ]] || { echo "ERROR: $QH not found"; exit 1; }
+          python3 - "$QH" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          if '#include "util/os_time.h"' in src:
+              print("os_time.h already included — skipping")
+              sys.exit(0)
+          m = re.search(r'^#include', src, re.MULTILINE)
+          if not m:
+              print("ERROR: no #include line to anchor to", file=sys.stderr)
+              sys.exit(1)
+          src = src[:m.start()] + '#include "util/os_time.h"\n' + src[m.start():]
+          open(p, "w", encoding="utf-8").write(src)
+          print("Inserted util/os_time.h into wsi_common_queue.h")
+          PY
+
+          # ── 5b: wsi_common_android.c name/API mismatches ──
+          AC="src/vulkan/wsi/wsi_common_android.c"
+          [[ -f "$AC" ]] || { echo "ERROR: $AC not found"; exit 1; }
+
+          python3 - "$AC" <<'PY'
+          import sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          changed = []
+
+          # 1) WINDOW_FORMAT_BGRA_8888 -> WINDOW_FORMAT_RGBA_8888
+          if "WINDOW_FORMAT_BGRA_8888" in src:
+              src = src.replace("WINDOW_FORMAT_BGRA_8888",
+                                "WINDOW_FORMAT_RGBA_8888")
+              changed.append("BGRA -> RGBA")
+
+          # 2) NATIVE_WINDOW_TRANSFORM_IDENTITY -> ANATIVEWINDOW_TRANSFORM_IDENTITY
+          if "NATIVE_WINDOW_TRANSFORM_IDENTITY" in src:
+              src = src.replace("NATIVE_WINDOW_TRANSFORM_IDENTITY",
+                                "ANATIVEWINDOW_TRANSFORM_IDENTITY")
+              changed.append("transform const")
+
+          # 3) ANativeWindow_setBufferCount — not in stub
+          old = ("   ANativeWindow_setBufferCount(window, "
+                 "(int32_t)num_images + 1);")
+          if old in src:
+              src = src.replace(
+                  old,
+                  "   /* CI: ANativeWindow_setBufferCount not in stub */")
+              changed.append("setBufferCount")
+
+          # 4) ANativeWindow_getBuffersCount block — not in stub
+          old_block = (
+              "   int32_t buffer_count = ANativeWindow_getBuffersCount(window);\n"
+              "   if (buffer_count > 0 && (unsigned)buffer_count < num_images)\n"
+              "      num_images = (unsigned)buffer_count;"
+          )
+          if old_block in src:
+              src = src.replace(
+                  old_block,
+                  "   /* CI: ANativeWindow_getBuffersCount not in stub */")
+              changed.append("getBuffersCount block")
+
+          open(p, "w", encoding="utf-8").write(src)
+          if changed:
+              print("Applied:", ", ".join(changed))
+          else:
+              print("No changes needed (already patched or patterns missing).")
+          PY
+
+          echo "==== verify: grepping for the fixups ===="
+          echo "--- wsi_common_queue.h head ---"
+          head -20 "$QH"
+          echo "--- wsi_common_android.c suspicious names ---"
+          grep -n 'WINDOW_FORMAT_BGRA_8888\|NATIVE_WINDOW_TRANSFORM_IDENTITY\|ANativeWindow_setBufferCount\|ANativeWindow_getBuffersCount' "$AC" || echo "  (all clear)"
 
       - name: Build host tools and Android driver
         run: bash .github/winlatormali/build.sh
