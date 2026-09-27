@@ -10,17 +10,14 @@ permissions:
 
 jobs:
   sync:
-    name: Sync base with winlatormali reference
+    name: Mirror reference tree onto winlator-pan
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # Base — the branch we sync INTO and push back to.
       BASE_REPO:   "${{ github.repository }}"
       BASE_BRANCH: "winlator-pan"
-
-      # Reference — the winlatormali source we pull FROM.
-      REF_REPO:   "mexicanbr0auth/mesa-panvk-g57"
-      REF_BRANCH: "winlatormali-ci"
+      REF_REPO:    "mexicanbr0auth/mesa-panvk-g57"
+      REF_BRANCH:  "winlatormali-ci"
     steps:
       # ──────────────────────────────────────────────────────────
       # 1) Checkout the base branch with push credentials.
@@ -88,7 +85,7 @@ jobs:
           echo "REF_COMMIT=$REF_COMMIT" >> "$GITHUB_ENV"
           echo "reference commit: $REF_COMMIT"
 
-          # Strip .git so diff / copy never walk into it.
+          # Strip .git so rsync / diff never walk into it.
           rm -rf "$REF_DIR/.git"
 
           echo
@@ -96,13 +93,11 @@ jobs:
           ls -A "$REF_DIR" | head -60
 
       # ──────────────────────────────────────────────────────────
-      # 3) Diff BEFORE we copy anything. This is what gets
-      #    uploaded as the artifact — it shows exactly what the
-      #    reference has that the base does not (and vice versa).
-      #    Excludes match what the sync will skip:
+      # 3) Generate a diff BEFORE mirroring, as a diagnostic
+      #    artifact. Excludes match the mirror step:
       #      .git   .github   *.md
       # ──────────────────────────────────────────────────────────
-      - name: Generate diff (base vs reference, pre-copy)
+      - name: Generate diff (base vs reference, pre-mirror)
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/diff-out"
@@ -151,69 +146,96 @@ jobs:
             echo "\`- \` lines: present in base, absent in reference"
             echo "\`+ \` lines: present in reference, absent in base"
             echo
-            echo "### Excludes"
-            echo "\`.git\`  \`.github\`  \`*.md\`"
+            echo "### Note"
+            echo "This diff shows the state BEFORE mirroring. The mirror"
+            echo "step that follows overwrites every non-excluded file in"
+            echo "the base with the reference version, so after the push"
+            echo "the only differences that remain are \`.github/\` and"
+            echo "\`*.md\` files, which are excluded."
           } > "$GITHUB_WORKSPACE/diff-out/README.md"
 
           cat "$GITHUB_WORKSPACE/diff-out/README.md"
 
       # ──────────────────────────────────────────────────────────
-      # 4) Copy every file/folder present in the reference that
-      #    doesn't exist in the base yet. Files that already exist
-      #    are left alone (the diff above shows their content
-      #    differences but we don't touch them).
-      #
-      #    Excluded paths: .git, .github, *.md
+      # 4) Mirror the reference tree onto the base.
+      #    - `--delete` removes files present in base but not in ref,
+      #      so the branch becomes a true mirror.
+      #    - Excludes protect .github/, *.md, .git/.
+      #    - backup-dir lets us list what was deleted for the log.
       # ──────────────────────────────────────────────────────────
-      - name: Copy missing files/folders from reference into base
+      - name: Mirror reference tree onto base
         run: |
           set -euo pipefail
-
-          is_excluded() {
-            local rel="$1"
-            case "$rel" in
-              .git|.git/*)             return 0 ;;
-              .github|.github/*)       return 0 ;;
-              *.md)                    return 0 ;;
-            esac
-            return 1
-          }
-
-          cd /tmp/ref
-
-          COUNT=0
-          SKIPPED=0
+          cd "$GITHUB_WORKSPACE"
 
           echo "=============================================="
-          echo "Copying files present only in $REF_BRANCH_USED:"
+          echo "Mirroring /tmp/ref -> $GITHUB_WORKSPACE"
+          echo "Excludes: .git  .github  *.md"
           echo "=============================================="
-          while IFS= read -r rel; do
-            rel="${rel#./}"
-            [[ -z "$rel" ]] && continue
 
-            if is_excluded "$rel"; then
-              SKIPPED=$((SKIPPED + 1))
-              continue
-            fi
-
-            dest="$GITHUB_WORKSPACE/$rel"
-            if [[ -e "$dest" ]]; then
-              continue
-            fi
-
-            mkdir -p "$(dirname "$dest")"
-            cp -a "/tmp/ref/$rel" "$dest"
-            echo "  + $rel"
-            COUNT=$((COUNT + 1))
-          done < <(find . -type f -print | sort)
+          # Dry-run first, so the log shows exactly what will be
+          # deleted before it happens.
+          echo
+          echo "==== dry run: files that would be deleted ===="
+          rsync -a --delete --dry-run --itemize-changes \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='*.md' \
+            /tmp/ref/ "$GITHUB_WORKSPACE/" \
+            | grep '^\*deleting' || echo "  (none)"
 
           echo
-          echo "Total new files copied: $COUNT"
-          echo "Total files skipped (excluded): $SKIPPED"
+          echo "==== dry run: files that would be updated ===="
+          rsync -a --delete --dry-run --itemize-changes \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='*.md' \
+            /tmp/ref/ "$GITHUB_WORKSPACE/" \
+            | grep -v '^\*deleting' | head -40 || true
+
+          echo
+          echo "==== performing mirror ===="
+          # Real run. --delete makes destination match source exactly
+          # for non-excluded paths.
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='*.md' \
+            /tmp/ref/ "$GITHUB_WORKSPACE/"
+
+          echo
+          echo "==== workspace top-level after mirror ===="
+          ls -A "$GITHUB_WORKSPACE" | head -60
+
+          echo
+          echo "==== sanity: critical files present? ===="
+          MISSING=0
+          for f in \
+            src/vulkan/wsi/wsi_common_android.c \
+            src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h \
+            src/util/u_gralloc/u_gralloc_panvk_test.h \
+            .github/winlatormali/build.sh \
+            .github/winlatormali/package.py \
+            .github/workflows/winpan.yml \
+            .github/workflows/clwinpan.yml
+          do
+            if [[ -f "$GITHUB_WORKSPACE/$f" ]]; then
+              echo "  OK  $f"
+            else
+              echo "  MISSING  $f"
+              MISSING=1
+            fi
+          done
+          if [[ "$MISSING" -eq 1 ]]; then
+            echo
+            echo "WARNING: some critical files are missing after the mirror."
+            echo "Source files should have come from the reference, and"
+            echo ".github/ files should have been preserved by the excludes."
+          fi
 
       # ──────────────────────────────────────────────────────────
-      # 5) Upload the diff artifact. Runs regardless of whether
-      #    the push later succeeds or fails.
+      # 5) Upload the diff artifact. Runs regardless of whether the
+      #    push later succeeds or fails.
       # ──────────────────────────────────────────────────────────
       - name: Upload diff patch (always)
         if: always()
@@ -227,15 +249,16 @@ jobs:
           if-no-files-found: warn
 
       # ──────────────────────────────────────────────────────────
-      # 6) Commit and force-push to the base branch.
-      #    Only pushes if something changed.
+      # 6) Commit and force-push. Only pushes if something changed.
+      #    .github/ is never staged so workflow files on the target
+      #    branch are never modified by this job.
       # ──────────────────────────────────────────────────────────
       - name: Commit and force-push to ${{ env.BASE_BRANCH }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
 
-          # Never stage CI-only scaffolding.
+          # Never stage CI-only scaffolding or generated artifacts.
           git add -A -- \
             ':(exclude).github' \
             ':(exclude)diff-out' \
@@ -247,10 +270,10 @@ jobs:
           fi
 
           echo "---- staged summary ----"
-          git diff --cached --stat | tail -40
+          git diff --cached --stat | tail -60
           echo "------------------------"
 
-          git commit -q -m "sync: import winlatormali source from $REF_REPO@$REF_BRANCH_USED"
+          git commit -q -m "sync: mirror $REF_REPO@$REF_BRANCH_USED onto $BASE_BRANCH ($(date -u +%Y%m%d-%H%M%S))"
           git --no-pager log -1 --oneline
 
           echo
