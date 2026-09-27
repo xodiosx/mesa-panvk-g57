@@ -23,6 +23,24 @@
 #include "vk_debug_utils.h"
 #include "vk_log.h"
 
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_GetMemoryHostPointerPropertiesEXT(
+   VkDevice _device, VkExternalMemoryHandleTypeFlagBits handleType,
+   const void *pHostPointer, VkMemoryHostPointerPropertiesEXT *pProperties)
+{
+   VK_FROM_HANDLE(panvk_device, device, _device);
+   const struct panvk_physical_device *physical =
+      to_panvk_physical_device(device->vk.physical);
+   pProperties->memoryTypeBits = 0;
+   if (!panvk_host_import_enabled(physical) ||
+       handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+       !pHostPointer || ((uintptr_t)pHostPointer & 4095))
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   pProperties->memoryTypeBits = panvk_host_import_memory_types(physical);
+   return VK_SUCCESS;
+}
+
 static void
 panvk_memory_emit_report(struct panvk_device *device,
                          const struct panvk_device_memory *mem,
@@ -88,7 +106,6 @@ panvk_AllocateMemory(VkDevice _device,
       vk_find_struct_const(pAllocateInfo->pNext,
                            IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
 
-   (void)0;
 
    const VkMemoryType *type =
       &physical_device->memory.types[pAllocateInfo->memoryTypeIndex];
@@ -129,7 +146,16 @@ panvk_AllocateMemory(VkDevice _device,
          goto err_destroy_mem;
       }
 
-      (void)0;
+      if (!host_ptr_info->pHostPointer ||
+          ((uintptr_t)host_ptr_info->pHostPointer & 4095) ||
+          !pAllocateInfo->allocationSize ||
+          (pAllocateInfo->allocationSize & 4095) ||
+          !(panvk_host_import_memory_types(physical_device) &
+            (1u << pAllocateInfo->memoryTypeIndex))) {
+         result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+         goto err_destroy_mem;
+      }
+
 
       mem->bo = kbase_kmod_import_user_buffer(
          device->kmod.dev,

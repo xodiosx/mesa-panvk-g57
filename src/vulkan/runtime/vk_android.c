@@ -1,3 +1,4 @@
+#include <errno.h>
 /*
  * Copyright © 2022 Intel Corporation
  *
@@ -22,6 +23,8 @@
  */
 
 #include "vk_android.h"
+#include "util/u_gralloc/u_gralloc_panvk_test.h"
+
 
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
@@ -197,7 +200,9 @@ vk_android_import_anb_memory(struct vk_device *device,
 {
    assert(anb && anb->handle && anb->handle->numFds > 0);
 
-   int dma_buf_fd = anb->handle->data[0];
+   int dma_buf_fd = u_gralloc_panvk_test_fd(anb->handle, "anb-import");
+   if (dma_buf_fd < 0)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
    /* Query image memory requirements for size and supported memory types */
    VkMemoryRequirements mem_reqs;
@@ -1088,13 +1093,35 @@ vk_common_GetAndroidHardwareBufferPropertiesANDROID(
 
    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(buffer);
    assert(handle && handle->numFds > 0);
-   pProperties->allocationSize = lseek(handle->data[0], 0, SEEK_END);
+   /* PANVK_AHB_FD_DIAG: inspect handles without changing selection.  This runs
+    * once per AHB memory query, which is once per swapchain image, so keep it
+    * out of the log unless it is asked for. */
+   static int ahb_fd_diag = -1;
+   if (ahb_fd_diag < 0)
+      ahb_fd_diag = getenv("PANVK_AHB_FD_DIAG") != NULL;
+   if (ahb_fd_diag) {
+      const int saved_errno = errno;
+      mesa_logi("AHBCHK numFds=%d numInts=%d",
+                handle->numFds, handle->numInts);
+      for (int i = 0; i < handle->numFds; i++) {
+         errno = 0;
+         off_t fd_size = lseek(handle->data[i], 0, SEEK_END);
+         const int seek_errno = fd_size < 0 ? errno : 0;
+         mesa_logi("AHBCHK index=%d fd=%d size=%lld errno=%d",
+                   i, handle->data[i], (long long)fd_size, seek_errno);
+      }
+      errno = saved_errno;
+   }
+   int dma_buf_fd = u_gralloc_panvk_test_fd(handle, "ahb-properties");
+   if (dma_buf_fd < 0)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   pProperties->allocationSize = lseek(dma_buf_fd, 0, SEEK_END);
 
    VkMemoryFdPropertiesKHR fd_props = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
    };
    result = device->dispatch_table.GetMemoryFdPropertiesKHR(
-      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, handle->data[0],
+      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dma_buf_fd,
       &fd_props);
    if (result != VK_SUCCESS)
       return result;

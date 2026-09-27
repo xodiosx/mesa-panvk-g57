@@ -65,10 +65,12 @@ panvk_per_arch(get_physical_device_extensions)(
       /* ADHOC-DBG: hide external memory group to avoid Wine win32 ext mismatch */
       .KHR_external_fence = false,
       .KHR_external_fence_fd = false,
-      .KHR_external_memory = false,
+      .KHR_external_memory = panvk_host_import_enabled(device),
+      .EXT_external_memory_host = panvk_host_import_enabled(device),
       .KHR_external_memory_fd = false,
-      .KHR_external_semaphore = false,
-      .KHR_external_semaphore_fd = false,
+      /* kbase now implements binary SYNC_FD import and export. */
+      .KHR_external_semaphore = true,
+      .KHR_external_semaphore_fd = true,
       .KHR_format_feature_flags2 = true,
       .KHR_get_memory_requirements2 = true,
       .KHR_global_priority = true,
@@ -1080,7 +1082,7 @@ panvk_per_arch(get_physical_device_properties)(
       .independentResolveNone = true,
       .independentResolve = true,
       /* VK_KHR_driver_properties */
-      .driverID = ((VkDriverId)0x0000CAFE),
+      .driverID = VK_DRIVER_ID_MESA_PANVK,
       .conformanceVersion = get_conformance_version(),
       .denormBehaviorIndependence =
          PAN_ARCH >= 9 ? VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE
@@ -1297,6 +1299,9 @@ panvk_per_arch(get_physical_device_properties)(
       /* VK_EXT_nested_command_buffer */
       .maxCommandBufferNestingLevel = 5,
 
+      /* USER_BUFFER imports require page-aligned host allocations. */
+      .minImportedHostPointerAlignment = 4096,
+
       /* VK_EXT_map_memory_placed */
       .minPlacedMemoryMapAlignment = os_page_size,
 
@@ -1364,7 +1369,7 @@ panvk_per_arch(get_physical_device_properties)(
    STATIC_ASSERT(sizeof(instance->driver_build_sha) >= VK_UUID_SIZE);
    memcpy(properties->driverUUID, instance->driver_build_sha, VK_UUID_SIZE);
 
-   snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "panvcake");
+   snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "panvk");
    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
 

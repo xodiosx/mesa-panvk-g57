@@ -362,7 +362,15 @@ wsi_x11_connection_create(struct wsi_device *wsi_dev,
 
    wsi_conn->has_mit_shm = false;
 #if defined(HAVE_X11_DRM) && defined(HAVE_SYS_SHM_H)
-   (void)0;
+   fprintf(stderr,
+
+           "PANVKDBG XSHM_GATE dri3=%d present=%d wants_shm=%d\\n",
+
+           wsi_conn->has_dri3,
+
+           wsi_conn->has_present,
+
+           wants_shm);
 
    if (wsi_conn->has_dri3 && wsi_conn->has_present && wants_shm) {
       wsi_conn->has_mit_shm = x11_xcb_display_supports_xshm(conn, NULL);
@@ -1161,6 +1169,14 @@ wsi_CreateXcbSurfaceKHR(VkInstance _instance,
    surface->has_alpha = visual_has_alpha(visual, visual_depth);
 
    *pSurface = VkIcdSurfaceBase_to_handle(&surface->xcb.base);
+
+   if (wsi_panvk_trace())
+      fprintf(stderr,
+              "PANVKDBG SURFACE create_xcb window=0x%x depth=%u alpha=%d "
+              "surface=%p\n",
+              pCreateInfo->window, visual_depth, surface->has_alpha,
+              (void *)*pSurface);
+
    return VK_SUCCESS;
 }
 
@@ -1193,6 +1209,14 @@ wsi_CreateXlibSurfaceKHR(VkInstance _instance,
    surface->has_alpha = visual_has_alpha(visual, visual_depth);
 
    *pSurface = VkIcdSurfaceBase_to_handle(&surface->xlib.base);
+
+   if (wsi_panvk_trace())
+      fprintf(stderr,
+              "PANVKDBG SURFACE create_xlib window=0x%lx depth=%u alpha=%d "
+              "surface=%p\n",
+              pCreateInfo->window, visual_depth, surface->has_alpha,
+              (void *)*pSurface);
+
    return VK_SUCCESS;
 }
 
@@ -2070,11 +2094,34 @@ x11_requires_mailbox_image_count(const struct wsi_device *device,
 /**
  * Send image to the X server for presentation at target_msc.
  */
+static void
+x11_copy_blit_to_shm(struct x11_swapchain *chain, uint32_t image_index)
+{
+   struct x11_image *image = &chain->images[image_index];
+   const size_t stride = image->base.row_pitches[0];
+
+   if (!image->shmaddr || !image->base.cpu_map || stride == 0)
+      return;
+
+   /* The blit target and the SHM segment have the same layout by
+    * construction, so this is one straight copy of the frame. */
+   assert(stride * chain->extent.height <= image->base.sizes[0]);
+   memcpy(image->shmaddr, image->base.cpu_map, stride * chain->extent.height);
+}
+
 static VkResult
 x11_present_to_x11(struct x11_swapchain *chain, uint32_t image_index,
                    uint64_t target_msc, VkPresentModeKHR present_mode)
 {
    x11_capture_trace(chain);
+
+   /* Normally the blit job writes into the SHM segment itself, which the
+    * driver gets to address by importing it as host memory.  When it cannot,
+    * the blit lands in a host-visible buffer of its own and the pixels have to
+    * be moved across here.  The caller waits for the blit fence first. */
+   if (chain->base.wsi->blit_no_shm_import &&
+       chain->base.blit.type != WSI_SWAPCHAIN_NO_BLIT)
+      x11_copy_blit_to_shm(chain, image_index);
 
    VkResult result;
    if (chain->base.wsi->sw && !chain->has_mit_shm)
@@ -2160,7 +2207,10 @@ x11_acquire_next_image(struct wsi_swapchain *wsi_chain,
    struct x11_swapchain *chain = (struct x11_swapchain *)wsi_chain;
    uint64_t timeout = info->timeout;
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_ACQUIRE_ENTER chain=%p timeout=%" PRIu64
+           " images=%u\\n",
+           (void *)chain, timeout, chain->base.image_count);
 
    /* If the swapchain is in an error state, don't go any further. */
    VkResult result = x11_swapchain_read_status_atomic(chain);
@@ -2221,7 +2271,12 @@ x11_queue_present(struct wsi_swapchain *wsi_chain,
    struct x11_swapchain *chain = (struct x11_swapchain *)wsi_chain;
    xcb_xfixes_region_t update_area = 0;
 
-   (void)0;
+   if (wsi_panvk_trace())
+      fprintf(stderr,
+              "PANVKDBG PRESENT X11_QUEUE_ENTER chain=%p image=%u "
+              "present_id=%" PRIu64 " sw=%d blit=%d\n",
+              (void *)chain, image_index, present_id,
+              chain->base.wsi->sw, chain->base.blit.type);
 
    /* If the swapchain is in an error state, don't go any further. */
    VkResult status = x11_swapchain_read_status_atomic(chain);
@@ -2530,9 +2585,12 @@ x11_manage_present_queue(void *state)
 
       VkPresentModeKHR present_mode = chain->images[image_index].present_mode;
 
-      /* Not necessary to block when we have explicit sync */
+      /* Not necessary to block when we have explicit sync, except when the
+       * present itself has to copy the blit result into the SHM segment. */
       bool need_fence_wait =
-            x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode) &&
+            ((chain->base.wsi->blit_no_shm_import &&
+              chain->base.blit.type != WSI_SWAPCHAIN_NO_BLIT) ||
+             x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode)) &&
             !chain->base.image_info.explicit_sync;
 
       bool need_timing_fence_wait = x11_swapchain_present_timing_is_out_of_order_completion(
@@ -3154,7 +3212,15 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    VkResult result;
    VkPresentModeKHR present_mode = wsi_swapchain_get_present_mode(wsi_device, pCreateInfo);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_CREATE_ENTER sw=%d format=%d "
+           "extent=%ux%u minImages=%u mode=%d\\n",
+           wsi_device->sw,
+           pCreateInfo->imageFormat,
+           pCreateInfo->imageExtent.width,
+           pCreateInfo->imageExtent.height,
+           pCreateInfo->minImageCount,
+           present_mode);
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
 
@@ -3260,9 +3326,16 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_cpu_image_params cpu_image_params;
    uint64_t *modifiers[2] = {NULL, NULL};
    if (wsi_device->sw) {
-            (void)0;
+      /* The SHM segment is what the presented pixmap is built from, so keep
+       * asking for it.  blit_no_shm_import only stops the driver from
+       * importing it as host memory; the present path copies the blit result
+       * into it instead. */
+      if (wsi_panvk_trace())
+         fprintf(stderr,
+                 "PANVKDBG X11_MITSHM has_mit_shm=%d no_shm_import=%d\n",
+                 wsi_conn->has_mit_shm, wsi_device->blit_no_shm_import);
 
-cpu_image_params = (struct wsi_cpu_image_params) {
+      cpu_image_params = (struct wsi_cpu_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_CPU,
          .alloc_shm = wsi_conn->has_mit_shm ? &alloc_shm : NULL,
       };
@@ -3298,12 +3371,21 @@ cpu_image_params = (struct wsi_cpu_image_params) {
 #endif
    }
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_BEFORE_INIT sw=%d image_type=%d "
+           "image_params=%p\\n",
+           wsi_device->sw,
+           image_params ? image_params->image_type : -1,
+           (void *)image_params);
 
    result = wsi_swapchain_init(wsi_device, &chain->base, device, pCreateInfo,
                                image_params, pAllocator);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_AFTER_INIT result=%d blit=%d image_count=%u\\n",
+           result,
+           result == VK_SUCCESS ? chain->base.blit.type : -1,
+           result == VK_SUCCESS ? chain->base.image_count : 0);
 
    for (int i = 0; i < ARRAY_SIZE(modifiers); i++)
       vk_free(pAllocator, modifiers[i]);

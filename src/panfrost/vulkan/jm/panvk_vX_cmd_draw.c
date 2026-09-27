@@ -41,6 +41,8 @@
 #include "vk_meta.h"
 #include "vk_pipeline_layout.h"
 
+#define PANVK_PERF_NOLOG(...) ((void)0)
+
 static bool
 has_depth_att(struct panvk_cmd_buffer *cmdbuf)
 {
@@ -1450,7 +1452,8 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
    VkResult result;
 
-   (void)0;
+   PANVK_PERF_NOLOG( "PANVKDBG panvk_cmd_draw: vs=%p cur_batch=%p\n",
+           (void *)vs, (void *)cmdbuf->cur_batch);
    /* If there's no vertex shader, we can skip the draw. */
    if (!panvk_priv_mem_check_alloc(vs->rsd))
       return;
@@ -2216,6 +2219,19 @@ panvk_v9_build_dcd_flags(struct panvk_cmd_buffer *cmdbuf,
       cfg.cull_back_face =
          !non_polygon && (rs->cull_mode & VK_CULL_MODE_BACK_BIT) != 0;
 
+      /* Diagnostic only: preserve normal state unless explicitly requested.
+       * 1 disables culling; 2 reverses winding while keeping the cull mode.
+       * Never enable these modes as a permanent rendering workaround. */
+      const char *face_test = getenv("PANVK_TEST_FACE_MODE");
+      if (!non_polygon && face_test && face_test[0] && face_test[1] == '\0') {
+         if (face_test[0] == '1') {
+            cfg.cull_front_face = false;
+            cfg.cull_back_face = false;
+         } else if (face_test[0] == '2') {
+            cfg.front_face_ccw = !cfg.front_face_ccw;
+         }
+      }
+
       cfg.multisample_enable = msaa;
       cfg.occlusion_query = cmdbuf->state.gfx.occlusion_query.mode;
       cfg.alpha_to_coverage = alpha_to_coverage;
@@ -2513,13 +2529,37 @@ panvk_v9_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *info)
 
        {
           const uint32_t *jw = (const uint32_t *)job.cpu;
-          (void)0;
-          (void)0;
-          (void)0;
+          PANVK_PERF_NOLOG(
+                  "PANVKDBG malloc l=%u w0=%08x w1=%08x w2=%08x w3=%08x "
+                  "w4=%08x w5=%08x w6=%08x w7=%08x\n",
+                  layer, jw[0], jw[1], jw[2], jw[3], jw[4], jw[5], jw[6], jw[7]);
+          PANVK_PERF_NOLOG(
+                  "PANVKDBG malloc prim=%08x inst=%08x alloc=%08x tiler=%08x%08x\n",
+                  jw[8], jw[12], jw[13], jw[15], jw[14]);
+          PANVK_PERF_NOLOG(
+                  "PANVKDBG malloc scis=%08x%08x%08x indx=%08x%08x\n",
+                  jw[26], jw[27], jw[28], jw[31], jw[30]);
           const struct mali_draw_packed *dp = draw_packed;
-          (void)0;
-          (void)0;
-          (void)0;
+          PANVK_PERF_NOLOG(
+                  "PANVKDBG malloc draw flags0=%08x flags1=%08x va=%08x%08x%08x "
+                  "minz=%08x maxz=%08x zs=%08x%08x blend=%08x%08x\n",
+                  dp->opaque[0], dp->opaque[1], dp->opaque[2], dp->opaque[3],
+                  dp->opaque[4], dp->opaque[6], dp->opaque[7],
+                  dp->opaque[10], dp->opaque[11], dp->opaque[13], dp->opaque[12]);
+          PANVK_PERF_NOLOG(
+                  "PANVKDBG malloc fs sh=%llx res=%llx tls=%016llx fau=%016llx cnt=%u\n",
+                  (unsigned long long)(fs ? panvk_priv_mem_dev_addr(fs->spd) : 0),
+                  (unsigned long long)cmdbuf->state.gfx.fs.desc.res_table,
+                  (unsigned long long)batch->tls.gpu,
+                  (unsigned long long)cmdbuf->state.gfx.fs.push_uniforms,
+                  fs ? fs->fau.total_count : 0);
+          PANVK_PERF_NOLOG(
+                  "PANVKDBG malloc vs pos=%016llx res=%016llx tls=%016llx fau=%016llx cnt=%u\n",
+                  (unsigned long long)pos_spd,
+                  (unsigned long long)cmdbuf->state.gfx.vs.desc.res_table,
+                  (unsigned long long)batch->tls.gpu,
+                  (unsigned long long)cmdbuf->state.gfx.vs.push_uniforms,
+                  vs->fau.total_count);
        }
    }
 

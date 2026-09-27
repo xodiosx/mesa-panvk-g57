@@ -66,7 +66,8 @@ const struct pan_kmod_ops kbase_kmod_ops;
  * Internal device / BO / VM objects
  * ---------------------------------------------------------------------- */
 
-#define KBASE_KMOD_MAX_USER_BUFFERS 16
+#define KBASE_KMOD_MAX_USER_BUFFERS 10
+static simple_mtx_t userbuf_lock = SIMPLE_MTX_INITIALIZER;
 #define KBASE_KMOD_MAX_DEBUG_BOS 64
 
 struct kbase_kmod_dev {
@@ -78,6 +79,13 @@ struct kbase_kmod_dev {
    void *userbuf_gpu_ptrs[KBASE_KMOD_MAX_USER_BUFFERS];
    uint64_t userbuf_sizes[KBASE_KMOD_MAX_USER_BUFFERS];
    uint32_t userbuf_count;
+   /* PANVK_TEST_USERBUF_EXTRES=mmap names the mmap() address in the job
+    * descriptor instead of the host address (the behaviour that faulted). */
+   bool userbuf_mmap_va;
+   /* PANVK_TEST_USERBUF_SHARED=1 restores BASE_MEM_IMPORT_SHARED, which puts
+    * the region in kbase's "pin the pages only around the jobs that name it"
+    * mode and so forces an external resource onto every atom. */
+   bool userbuf_shared;
 
    /* PANVKDBG: BOs nativos grandes para inspeção de render target. */
    uint64_t debug_bo_vas[KBASE_KMOD_MAX_DEBUG_BOS];
@@ -165,6 +173,12 @@ struct kbase_kmod_bo {
 
    /* Imported through BASE_MEM_IMPORT_TYPE_USER_BUFFER. */
    bool user_buffer;
+
+   /* Cookie/handle returned by MEM_IMPORT for a user buffer.  MEM_FREE wants
+    * this back to release the pinned region; the address a job descriptor
+    * uses is the host pointer instead (see kbase_import_user_buffer_locked).
+    */
+   uint64_t import_cookie;
 };
 
 bool
@@ -325,7 +339,11 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
          buf, buf_size, KBASE_GPUPROP_COHERENCY_NUM_CORE_GROUPS, 0);
       uint32_t cg0 = (uint32_t)kbase_gpuprop_get(
          buf, buf_size, KBASE_GPUPROP_COHERENCY_GROUP_0, 0);
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG kbase props: js_present=0x%x jsf=%x,%x,%x num_cg=%u cg0=0x%x tiler_features=0x%x shader_present=0x%llx\n",
+              js_present, jsf0, jsf1, jsf2, ncg, cg0,
+              props->tiler_features,
+              (unsigned long long)props->shader_present);
    }
 
    /* TEXTURE_FEATURES_0..2 are consecutive keys, but TEXTURE_FEATURES_3
@@ -1178,7 +1196,11 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    mesa_logd("kbase: %s driver, uAPI version %d.%d",
              is_csf ? "CSF" : "JM", ver.major, ver.minor);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG kbase uAPI: %s %u.%u\\n",
+           is_csf ? "CSF" : "JM",
+           (unsigned)ver.major,
+           (unsigned)ver.minor);
 
    /* Set context creation flags.  Zero for maximum compatibility; this also
     * creates the kernel-side context. */
@@ -1226,7 +1248,8 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
        mesa_logw("kbase: KBASE_IOCTL_MEM_EXEC_INIT failed: %s "
                  "(executable BO allocation will not work)", strerror(errno));
     }
-    (void)0;
+    fprintf(stderr, "PANVKDBG kbase MEM_EXEC_INIT %s\n",
+            exec_init_failed ? "FAILED (shaders -> rw)" : "ok (shaders -> exec)");
 
     /* Initialise the JIT allocator.  This must happen before any allocation
      * is made: besides setting up JIT, on 64-bit clients this is what carves
@@ -1271,6 +1294,10 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
     kbase_dev->is_csf = is_csf;
     kbase_dev->tracking_page = tracking_page;
    kbase_dev->next_handle = 1;
+   const char *userbuf_va = getenv("PANVK_TEST_USERBUF_EXTRES");
+   kbase_dev->userbuf_mmap_va = userbuf_va && !strcmp(userbuf_va, "mmap");
+   const char *userbuf_shared = getenv("PANVK_TEST_USERBUF_SHARED");
+   kbase_dev->userbuf_shared = userbuf_shared && !strcmp(userbuf_shared, "1");
    kbase_dev->dma_heap_fd = -1;
    kbase_dev->kcpu.fence_fd = -1;
    simple_mtx_init(&kbase_dev->kcpu.lock, mtx_plain);
@@ -1456,13 +1483,21 @@ to_kbase_mem_flags(struct kbase_kmod_dev *kbase_dev, uint32_t kmod_flags)
 }
 
 
-struct pan_kmod_bo *
-kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
+static struct pan_kmod_bo *
+kbase_import_user_buffer_locked(struct pan_kmod_dev *dev, void *ptr,
                               uint64_t size)
 {
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
    const uint64_t page_size = 4096;
+
+   if (kbase_dev->is_csf ||
+       (kbase_dev->userbuf_shared &&
+        kbase_dev->userbuf_count >= KBASE_KMOD_MAX_USER_BUFFERS)) {
+      mesa_loge("kbase: USER_BUFFER import exceeds JM external-resource capacity");
+      errno = ENOSPC;
+      return NULL;
+   }
 
    /*
     * PANVKDBG: USER_BUFFER kernel-size test.
@@ -1476,7 +1511,21 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
       return NULL;
    }
 
-   (void)0;
+   /* The job descriptor names the region by its host address, so a guest
+    * allocation that does not fit the JM address field can never be reached
+    * by a job: reject it here instead of faulting the GPU later. */
+   if (!kbase_dev->userbuf_mmap_va && (uintptr_t)ptr > 0xffffffffULL) {
+      mesa_loge("kbase: USER_BUFFER ptr %p is above the 4GiB JM address "
+                "window; a 32-bit guest allocation is required",
+                ptr);
+      errno = EINVAL;
+      return NULL;
+   }
+
+   fprintf(stderr,
+           "PANVKDBG USERBUF_SIZE_TEST exact=%" PRIu64
+           " mod4096=%" PRIu64 "\n",
+           size, size & (page_size - 1));
 
    struct kbase_kmod_bo *kbase_bo =
       pan_kmod_dev_alloc(dev, sizeof(*kbase_bo));
@@ -1499,8 +1548,17 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
       BASE_MEM_PROT_GPU_RD |
       BASE_MEM_PROT_GPU_WR |
       BASE_MEM_CACHED_CPU |
-      BASE_MEM_IMPORT_SHARED |
       BASE_MEM_COHERENT_SYSTEM;
+
+   /* Without BASE_MEM_IMPORT_SHARED, kbase faults the user pages in while it
+    * handles MEM_IMPORT and leaves the region mapped for the lifetime of the
+    * allocation, so a job reaches it through an ordinary address.  With the
+    * flag set, kbase defers the pinning to the jobs that declare the region
+    * as an external resource instead: every atom then has to carry the buffer
+    * in its extres list, the list is capped at BASE_EXT_RES_COUNT_MAX (10),
+    * and the descriptor has to name the region exactly. */
+   if (kbase_dev->userbuf_shared)
+      import_flags |= BASE_MEM_IMPORT_SHARED;
 
    union kbase_ioctl_mem_import req = {
       .in = {
@@ -1510,7 +1568,10 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
       },
    };
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG USERBUF import ptr=%p size=%" PRIu64
+           " flags=%016" PRIx64 "\n",
+           ptr, size, import_flags);
 
    if (ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req)) {
       mesa_loge("kbase: USER_BUFFER KBASE_IOCTL_MEM_IMPORT failed: %s",
@@ -1523,7 +1584,14 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
    const bool need_mmap =
       (req.out.flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) != 0;
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG USERBUF ioctl gpu_va=%016" PRIx64
+           " pages=%" PRIu64 " out_flags=%016" PRIx64
+           " need_mmap=%d\n",
+           (uint64_t)req.out.gpu_va,
+           (uint64_t)req.out.va_pages,
+           (uint64_t)req.out.flags,
+           need_mmap);
 
    if (!bo_size) {
       mesa_loge("kbase: USER_BUFFER returned zero-sized allocation");
@@ -1536,6 +1604,7 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
    }
 
    kbase_bo->same_va = need_mmap;
+   kbase_bo->import_cookie = req.out.gpu_va;
 
    if (need_mmap) {
       kbase_bo->gpu_mapping =
@@ -1569,22 +1638,64 @@ kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr,
 
    kbase_bo->user_buffer = true;
 
-   if (kbase_dev->userbuf_count < KBASE_KMOD_MAX_USER_BUFFERS) {
-      unsigned idx = kbase_dev->userbuf_count++;
-
-      kbase_dev->userbuf_vas[idx] = kbase_bo->gpu_va;
-      kbase_dev->userbuf_cpu_ptrs[idx] = kbase_bo->cpu_ptr;
-      kbase_dev->userbuf_gpu_ptrs[idx] = kbase_bo->gpu_mapping;
-      kbase_dev->userbuf_sizes[idx] = bo_size;
-
-      (void)0;
+   /* The address a JM job must name for this allocation is the *host*
+    * address, not the mmap() result.  A user-buffer import is registered in
+    * the context address space at the address the application handed us
+    * (kbase keeps it as alloc->imported.user_buf.address and looks the
+    * region up with it), and it comes back from MEM_IMPORT as a cookie
+    * (BASE_MEM_COOKIE_BASE + slot, which is why several live imports report
+    * the same out.gpu_va) rather than as a GPU VA.  The mmap() we take above
+    * is only a CPU mapping: its address is whatever the kernel's mmap
+    * allocator picked, and feeding it to the job descriptor made the GPU
+    * fault (atom JD event 0x04, i.e. device lost) as soon as a job touched
+    * guest memory. */
+   if (kbase_dev->userbuf_mmap_va) {
+      kbase_bo->gpu_va = (uint64_t)(uintptr_t)kbase_bo->gpu_mapping;
    } else {
-      mesa_loge("kbase: USER_BUFFER diagnostic registry full");
+      kbase_bo->gpu_va = (uint64_t)(uintptr_t)kbase_bo->cpu_ptr;
    }
 
-   (void)0;
+   /* The registry only feeds the extres list and the debug dump.  When the
+    * pages are mapped up front it is only a log window, so do not let it
+    * start rejecting allocations. */
+   if (kbase_dev->userbuf_shared ||
+       kbase_dev->userbuf_count < KBASE_KMOD_MAX_USER_BUFFERS) {
+      if (kbase_dev->userbuf_count < KBASE_KMOD_MAX_USER_BUFFERS) {
+         unsigned idx = kbase_dev->userbuf_count++;
+
+         kbase_dev->userbuf_vas[idx] = kbase_bo->gpu_va;
+         kbase_dev->userbuf_cpu_ptrs[idx] = kbase_bo->cpu_ptr;
+         kbase_dev->userbuf_gpu_ptrs[idx] = kbase_bo->gpu_mapping;
+         kbase_dev->userbuf_sizes[idx] = bo_size;
+      }
+
+      fprintf(stderr,
+              "PANVKDBG USERBUF REGISTER gpu=%016" PRIx64
+              " cpu=%p gpumap=%p size=%" PRIu64
+              " count=%u\n",
+              kbase_bo->gpu_va,
+              kbase_bo->cpu_ptr,
+              kbase_bo->gpu_mapping,
+              bo_size,
+              kbase_dev->userbuf_count);
+   }
+
+   fprintf(stderr,
+           "PANVKDBG USERBUF READY cpu=%p gpu=%016" PRIx64
+           " gpu_map=%p size=%" PRIu64 "\n",
+           kbase_bo->cpu_ptr, kbase_bo->gpu_va,
+           kbase_bo->gpu_mapping, bo_size);
 
    return &kbase_bo->base;
+}
+
+struct pan_kmod_bo *
+kbase_kmod_import_user_buffer(struct pan_kmod_dev *dev, void *ptr, uint64_t size)
+{
+   simple_mtx_lock(&userbuf_lock);
+   struct pan_kmod_bo *bo = kbase_import_user_buffer_locked(dev, ptr, size);
+   simple_mtx_unlock(&userbuf_lock);
+   return bo;
 }
 
 void
@@ -1621,19 +1732,46 @@ kbase_kmod_debug_dump_native_bos(struct pan_kmod_dev *dev)
       int sync_ret =
          pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &sync_req);
 
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG NATIVEBO CSYNC gpu=%016" PRIx64
+              " cpu=%p size=%" PRIu64 " ret=%d errno=%d\\n",
+              kbase_dev->debug_bo_vas[i], p, size,
+              sync_ret, sync_ret ? errno : 0);
 
       if (sync_ret)
          continue;
 
       uint64_t center = ((240ull * 640ull) + 320ull) * 4ull;
 
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG NATIVEBO[%u] gpu=%016" PRIx64
+              " size=%" PRIu64
+              " P0=%02x %02x %02x %02x "
+              "%02x %02x %02x %02x "
+              "%02x %02x %02x %02x "
+              "%02x %02x %02x %02x\n",
+              i,
+              kbase_dev->debug_bo_vas[i],
+              size,
+              p[0], p[1], p[2], p[3],
+              p[4], p[5], p[6], p[7],
+              p[8], p[9], p[10], p[11],
+              p[12], p[13], p[14], p[15]);
 
       if (center + 16 <= size) {
          const uint8_t *c = p + center;
 
-         (void)0;
+         fprintf(stderr,
+                 "PANVKDBG NATIVEBO[%u] CENTER="
+                 "%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x\n",
+                 i,
+                 c[0], c[1], c[2], c[3],
+                 c[4], c[5], c[6], c[7],
+                 c[8], c[9], c[10], c[11],
+                 c[12], c[13], c[14], c[15]);
       }
    }
 }
@@ -1656,17 +1794,57 @@ kbase_kmod_debug_dump_user_buffers(struct pan_kmod_dev *dev)
       if (size >= 640ull * 480ull * 4ull)
          center = ((240ull * 640ull) + 320ull) * 4ull;
 
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG SHM[%u] CPU0 "
+              "%02x %02x %02x %02x "
+              "%02x %02x %02x %02x "
+              "%02x %02x %02x %02x "
+              "%02x %02x %02x %02x\n",
+              i,
+              cpu[0], cpu[1], cpu[2], cpu[3],
+              cpu[4], cpu[5], cpu[6], cpu[7],
+              cpu[8], cpu[9], cpu[10], cpu[11],
+              cpu[12], cpu[13], cpu[14], cpu[15]);
 
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG SHM[%u] GPU0 "
+              "%02x %02x %02x %02x "
+              "%02x %02x %02x %02x "
+              "%02x %02x %02x %02x "
+              "%02x %02x %02x %02x\n",
+              i,
+              gpu[0], gpu[1], gpu[2], gpu[3],
+              gpu[4], gpu[5], gpu[6], gpu[7],
+              gpu[8], gpu[9], gpu[10], gpu[11],
+              gpu[12], gpu[13], gpu[14], gpu[15]);
 
       if (center + 16 <= size) {
          cpu += center;
          gpu += center;
 
-         (void)0;
+         fprintf(stderr,
+                 "PANVKDBG SHM[%u] CPUC "
+                 "%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x\n",
+                 i,
+                 cpu[0], cpu[1], cpu[2], cpu[3],
+                 cpu[4], cpu[5], cpu[6], cpu[7],
+                 cpu[8], cpu[9], cpu[10], cpu[11],
+                 cpu[12], cpu[13], cpu[14], cpu[15]);
 
-         (void)0;
+         fprintf(stderr,
+                 "PANVKDBG SHM[%u] GPUC "
+                 "%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x\n",
+                 i,
+                 gpu[0], gpu[1], gpu[2], gpu[3],
+                 gpu[4], gpu[5], gpu[6], gpu[7],
+                 gpu[8], gpu[9], gpu[10], gpu[11],
+                 gpu[12], gpu[13], gpu[14], gpu[15]);
       }
    }
 }
@@ -1678,11 +1856,18 @@ kbase_kmod_get_user_buffer_vas(struct pan_kmod_dev *dev,
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
 
+   if (!kbase_dev->userbuf_shared) {
+      /* The region is mapped for good, so a job needs no external resource. */
+      return 0;
+   }
+
+   simple_mtx_lock(&userbuf_lock);
    unsigned count = MIN2(kbase_dev->userbuf_count, max_vas);
 
-   for (unsigned i = 0; i < count; i++)
+   for (unsigned i = 0; vas && i < count; i++)
       vas[i] = kbase_dev->userbuf_vas[i];
 
+   simple_mtx_unlock(&userbuf_lock);
    return count;
 }
 
@@ -1937,7 +2122,13 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
       kbase_dev->debug_bo_ptrs[idx] = kbase_bo->cpu_ptr;
       kbase_dev->debug_bo_sizes[idx] = kbase_bo->base.size;
 
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG NATIVEBO REGISTER gpu=%016" PRIx64
+              " cpu=%p size=%" PRIu64 " count=%u\n",
+              kbase_bo->gpu_va,
+              kbase_bo->cpu_ptr,
+              kbase_bo->base.size,
+              kbase_dev->debug_bo_count);
    }
 
    return &kbase_bo->base;
@@ -1971,6 +2162,7 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
    }
 
    if (kbase_bo->user_buffer) {
+      simple_mtx_lock(&userbuf_lock);
       struct kbase_kmod_dev *kbase_dev =
          container_of(bo->dev, struct kbase_kmod_dev, base);
 
@@ -1991,10 +2183,16 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 
          kbase_dev->userbuf_count--;
 
-         (void)0;
+         fprintf(stderr,
+                 "PANVKDBG USERBUF UNREGISTER gpu=%016" PRIx64
+                 " count=%u\n",
+                 kbase_bo->gpu_va, kbase_dev->userbuf_count);
          break;
       }
    }
+
+   if (kbase_bo->user_buffer)
+      simple_mtx_unlock(&userbuf_lock);
 
    pan_kmod_bo_cleanup(bo);
 
@@ -2009,7 +2207,16 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
    if (kbase_bo->gpu_mapping)
       munmap(kbase_bo->gpu_mapping, bo->size);
 
-   if (!kbase_bo->same_va) {
+   /* A user-buffer import owns a kernel region that nothing else releases:
+    * the pages stay pinned until the region goes away, so hand the import
+    * cookie back.  MEM_FREE understands the cookie, not the address the job
+    * descriptor uses, and if the munmap() above already tore the region down
+    * the kernel just rejects this, which is harmless. */
+   if (kbase_bo->user_buffer && kbase_bo->import_cookie) {
+      struct kbase_ioctl_mem_free req = { .gpu_addr = kbase_bo->import_cookie };
+      if (ioctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &req))
+         mesa_loge("kbase: USER_BUFFER MEM_FREE failed: %s", strerror(errno));
+   } else if (!kbase_bo->same_va) {
       struct kbase_ioctl_mem_free req = { .gpu_addr = kbase_bo->gpu_va };
       if (ioctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &req))
          mesa_loge("kbase: KBASE_IOCTL_MEM_FREE failed: %s", strerror(errno));
@@ -2134,7 +2341,6 @@ kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
                     ? BASE_SYNCSET_OP_MSYNC
                     : BASE_SYNCSET_OP_CSYNC,
       };
-      (void)0;
 
       if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &req)) {
          mesa_loge("kbase: KBASE_IOCTL_MEM_SYNC failed: %s", strerror(errno));

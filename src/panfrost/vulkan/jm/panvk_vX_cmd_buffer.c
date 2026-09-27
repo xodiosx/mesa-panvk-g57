@@ -34,6 +34,20 @@
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 
+/* The per-batch/per-draw descriptor dumps used to live here.  They cost one
+ * stderr write per draw, and the Winlator setup duplicates stderr to a log
+ * file, so they showed up as frame time.  Keep the macro available for a
+ * one-off debug build instead. */
+#define PANVK_PERF_NOLOG(...) ((void)0)
+
+#if defined(HAVE_PAN_KMOD_KBASE) && defined(PANVK_USE_KBASE)
+/* panvk_per_arch(kbase_jm_drain) is declared in panvk_vX_gpu_queue_kbase.h.
+ * Resetting or destroying a command buffer recycles the pools and the job
+ * chains the GPU may still be reading, so the JM jobs in flight must drain
+ * first. */
+#include "panvk_vX_gpu_queue_kbase.h"
+#endif
+
 static VkResult
 panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
 {
@@ -75,7 +89,6 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
    assert(batch);
 
-   (void)0;
    if (!batch->fb.desc.gpu && !batch->vtc_jc.first_job) {
       if (util_dynarray_num_elements(&batch->event_ops,
                                      struct panvk_cmd_event_op) == 0) {
@@ -206,23 +219,7 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
          };
 tagged_fbd_ptr |= GENX(pan_emit_fb_desc)(&fbd_info, &fb_descs);
 
-          {
-const uint32_t *w = (const uint32_t *)fbd.cpu;
-              (void)0;
-              (void)0;
-              (void)0;
-              (void)0;
-              (void)0;
-              const uint32_t *rtw = (const uint32_t *)fb_descs.rts;
-              (void)0;
-              (void)0;
-              const struct pan_fb_load *ld = fbd_info.load;
-             for (unsigned rt = 0; rt < render->fb.layout.rt_count; rt++) {
-                (void)0;
-             }
-          }
-
-          result = panvk_cmd_prepare_fragment_job(cmdbuf, tagged_fbd_ptr);
+         result = panvk_cmd_prepare_fragment_job(cmdbuf, tagged_fbd_ptr);
          if (result != VK_SUCCESS)
             break;
       }
@@ -401,6 +398,10 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
    struct panvk_cmd_buffer *cmdbuf =
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
 
+#if defined(HAVE_PAN_KMOD_KBASE) && defined(PANVK_USE_KBASE)
+   panvk_per_arch(kbase_jm_drain)(to_panvk_device(cmdbuf->vk.base.device));
+#endif
+
    vk_command_buffer_reset(&cmdbuf->vk);
 
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
@@ -425,6 +426,10 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
    struct panvk_cmd_buffer *cmdbuf =
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+
+#if defined(HAVE_PAN_KMOD_KBASE) && defined(PANVK_USE_KBASE)
+   panvk_per_arch(kbase_jm_drain)(dev);
+#endif
 
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
       list_del(&batch->node);

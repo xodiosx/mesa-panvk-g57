@@ -477,7 +477,10 @@ vk_common_GetDeviceProcAddr(VkDevice _device,
         !strcmp(pName, "vkAcquireNextImageKHR") ||
         !strcmp(pName, "vkAcquireNextImage2KHR") ||
         !strcmp(pName, "vkQueuePresentKHR"))) {
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG GDPA name=%s fn=%p device=%p swapchain_ext=%d\\n",
+              pName, (void *)fn, (void *)device,
+              device->enabled_extensions.KHR_swapchain);
       fflush(stderr);
    }
 
@@ -535,7 +538,9 @@ vk_common_GetDeviceQueue2(VkDevice _device,
    }
 
    *pQueue = queue ? vk_queue_to_handle(queue) : VK_NULL_HANDLE;
-   (void)0;
+   fprintf(stderr, "PANVKDBG GetDeviceQueue2 family=%u idx=%u -> queue=%p (flags=0x%x, found=%d)\n",
+           pQueueInfo->queueFamilyIndex, pQueueInfo->queueIndex,
+           (void *)*pQueue, pQueueInfo->flags, queue != NULL);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

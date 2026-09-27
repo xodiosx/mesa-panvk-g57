@@ -27,6 +27,13 @@ if with_platform_wayland
   files_vulkan_wsi += wp_files['color-management-v1']
 endif
 
+# VK_KHR_android_surface.  ANativeWindow_lock() needs libnativewindow, which
+# only exists from API level 26 on.
+if with_platform_android and not with_android_stub and get_option('platform-sdk-version') >= 26
+  files_vulkan_wsi += files('wsi_common_android.c')
+  platform_deps += dep_android
+endif
+
 if with_platform_windows
   files_vulkan_wsi += files('wsi_common_win32.cpp')
   platform_deps += dep_dxheaders
