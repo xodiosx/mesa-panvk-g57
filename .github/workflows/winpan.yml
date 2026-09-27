@@ -43,8 +43,7 @@ jobs:
           echo "PANVK_NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       # ──────────────────────────────────────────────────────────
-      # Patch 1 — drop the sha256 manifest check from build.sh.
-      # The manifest is not checked in on this branch.
+      # Patch 1: disable local-sources sha256 check in build.sh.
       # ──────────────────────────────────────────────────────────
       - name: Patch build.sh (disable sha256 check)
         run: |
@@ -58,10 +57,7 @@ jobs:
           grep -n 'sha256sum' "$BUILD" || echo "  (none remaining)"
 
       # ──────────────────────────────────────────────────────────
-      # Patch 2 — NDK 28 compat: panvk_android.c's trace dump helper
-      # uses APIs that don't exist in NDK 28's headers. Debug-only,
-      # gated on PANVK_AHB_TRACE=1, so replacing the body with a
-      # no-op stub is safe.
+      # Patch 2: NDK 28 compat for panvk_android.c.
       # ──────────────────────────────────────────────────────────
       - name: Patch panvk_android.c (NDK 28 compat)
         run: |
@@ -82,8 +78,128 @@ jobs:
               print("WARNING: helper not found; nothing to do."); sys.exit(0)
 
           brace = src.find("{", start)
+          depth = 0; i = brace
+          in_str = in_chr = False
+          in_line = in_block = False
+          while i < len(src):
+              c = src[i]; nxt = src[i+1] if i+1 < len(src) else ""
+              if in_line:
+                  if c == "\n": in_line = False
+              elif in_block:
+                  if c == "*" and nxt == "/": in_block = False; i += 1
+              elif in_str:
+                  if c == "\\": i += 1
+                  elif c == '"': in_str = False
+              elif in_chr:
+                  if c == "\\": i += 1
+                  elif c == "'": in_chr = False
+              else:
+                  if c == "/" and nxt == "/": in_line = True; i += 1
+                  elif c == "/" and nxt == "*": in_block = True; i += 1
+                  elif c == '"': in_str = True
+                  elif c == "'": in_chr = True
+                  elif c == "{": depth += 1
+                  elif c == "}":
+                      depth -= 1
+                      if depth == 0: break
+              i += 1
+
+          if depth != 0:
+              print("ERROR: brace match failed.", file=sys.stderr); sys.exit(1)
+
+          replacement = (
+              "{\n"
+              "   /* CI: trace dump disabled for NDK 28 — uses APIs not in\n"
+              "    * android/hardware_buffer.h. Debug-only, gated on\n"
+              "    * PANVK_AHB_TRACE=1, so this stub is a no-op. */\n"
+              "   (void)tag; (void)ahb; (void)img; (void)layout;\n"
+              "   return;\n"
+              "}"
+          )
+          new_src = src[:brace] + replacement + src[i+1:]
+          open(path, "w", encoding="utf-8").write(new_src)
+          print(f"Patched {path}.")
+          PY
+
+      # ──────────────────────────────────────────────────────────
+      # Patch 3: build wsi_common_android.c under android-stub.
+      # The reference's meson condition has `not with_android_stub`,
+      # which excludes the file while wsi_common.c still calls it.
+      # ──────────────────────────────────────────────────────────
+      - name: Patch wsi/meson.build (build wsi_common_android.c)
+        run: |
+          set -euo pipefail
+          FILE="src/vulkan/wsi/meson.build"
+          [[ -f "$FILE" ]] || { echo "ERROR: $FILE not found"; exit 1; }
+          sed -i -E \
+            's|if with_platform_android and not with_android_stub and get_option|if with_platform_android and get_option|' \
+            "$FILE"
+          if grep -qE 'not with_android_stub' "$FILE"; then
+            echo "ERROR: substitution failed"; exit 1
+          fi
+          grep -n 'wsi_common_android.c' "$FILE" || { echo "ERROR: android WSI missing"; exit 1; }
+          echo "OK: $FILE patched"
+
+      # ──────────────────────────────────────────────────────────
+      # Patch 4: fix wsi_common_android.c so it compiles against
+      # the android-stub headers. Three problems:
+      #   - missing util/os_time.h include (timespec_from_nsec)
+      #   - VkSurfaceCapabilities2KHR accesses need .surfaceCapabilities
+      #   - ANativeWindow_lock signature differs from the stub
+      # ──────────────────────────────────────────────────────────
+      - name: Patch wsi_common_android.c for stub compatibility
+        run: |
+          set -euo pipefail
+          FILE="src/vulkan/wsi/wsi_common_android.c"
+          [[ -f "$FILE" ]] || { echo "ERROR: $FILE not found"; exit 1; }
+
+          # ---- fix 1: add util/os_time.h include before wsi_common_queue.h ----
+          if ! grep -q '#include "util/os_time.h"' "$FILE"; then
+            python3 - "$FILE" <<'PY'
+          import sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          needle = '#include "wsi_common_queue.h"'
+          if needle not in src:
+              print("WARN: wsi_common_queue.h include not found; skipping include fix")
+              sys.exit(0)
+          src = src.replace(needle,
+                            '#include "util/os_time.h"\n' + needle, 1)
+          open(p, "w", encoding="utf-8").write(src)
+          print("Inserted util/os_time.h include")
+          PY
+          fi
+
+          # ---- fix 2: VkSurfaceCapabilities2KHR member accesses ----
+          for m in minImageCount maxImageCount currentExtent \
+                   minImageExtent maxImageExtent maxImageArrayLayers \
+                   supportedTransforms currentTransform supportedCompositeAlpha; do
+            sed -i "s|pSurfaceCapabilities->${m}\\b|pSurfaceCapabilities->surfaceCapabilities.${m}|g" "$FILE"
+          done
+
+          echo "---- remaining direct pSurfaceCapabilities-> accesses ----"
+          grep -n 'pSurfaceCapabilities->' "$FILE" || true
+
+          # ---- fix 3: rewrite wsi_android_lock_image to match the stub ----
+          python3 - "$FILE" <<'PY'
+          import sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+
+          if "/* CI: lock_image rewritten for android-stub" in src:
+              print("lock_image already rewritten — skipping")
+              sys.exit(0)
+
+          marker = "wsi_android_lock_image"
+          start = src.find(marker)
+          if start == -1:
+              print(f"WARNING: {marker} not found")
+              sys.exit(0)
+
+          brace = src.find("{", start)
           if brace == -1:
-              print("WARNING: opening brace not found."); sys.exit(0)
+              print("WARNING: opening brace not found")
+              sys.exit(0)
 
           depth = 0; i = brace
           in_str = in_chr = False
@@ -112,41 +228,69 @@ jobs:
               i += 1
 
           if depth != 0:
-              print("ERROR: could not match closing brace.", file=sys.stderr); sys.exit(1)
+              print("ERROR: brace match failed in lock_image", file=sys.stderr)
+              sys.exit(1)
 
-          replacement = (
-              "{\n"
-              "   /* CI: trace dump disabled for NDK 28 — uses APIs not in\n"
-              "    * android/hardware_buffer.h. Debug-only, gated on\n"
-              "    * PANVK_AHB_TRACE=1, so this stub is a no-op. */\n"
-              "   (void)tag; (void)ahb; (void)img; (void)layout;\n"
-              "   return;\n"
-              "}"
-          )
+          replacement = """{
+             /* CI: lock_image rewritten for android-stub.
+              *
+              * The stub's ANativeWindow_lock signature is
+              *   int32_t(ANativeWindow*, ANativeWindow_Buffer*, ARect*)
+              * while the reference was written against a different shape.
+              * This version matches the stub headers, which in turn match
+              * the real Android API. */
+             struct ANativeWindow *window = image->window;
+             int32_t width, height;
+             ARect in_rect;
+             ANativeWindow_Buffer out_buffer;
+             uint8_t *ptr;
+             int32_t lock_rc;
+
+             if (!window || image->locked)
+                return false;
+
+             width = ANativeWindow_getWidth(window);
+             height = ANativeWindow_getHeight(window);
+             if (width <= 0 || height <= 0)
+                return false;
+
+             in_rect.left = 0;
+             in_rect.top = 0;
+             in_rect.right = width;
+             in_rect.bottom = height;
+             memset(&out_buffer, 0, sizeof(out_buffer));
+
+             lock_rc = ANativeWindow_lock(window, &out_buffer, &in_rect);
+             if (lock_rc != 0)
+                return false;
+
+             ptr = (uint8_t *)out_buffer.bits;
+             if (!ptr || out_buffer.width <= 0 || out_buffer.height <= 0) {
+                ANativeWindow_unlockAndPost(window);
+                return false;
+             }
+
+             image->buffer_ptr = ptr;
+             image->buffer_stride = (uint32_t)out_buffer.stride * 4;
+             image->locked = true;
+
+             if (wsi_panvk_trace())
+                fprintf(stderr,
+                        "PANVKDBG ANDROID_LOCK image=%p ptr=%p stride=%u "
+                        "out=%dx%d want=%u\\n",
+                        (void *)image, (void *)ptr, image->buffer_stride,
+                        out_buffer.width, out_buffer.height, size);
+
+             return true;
+          }"""
+
           new_src = src[:brace] + replacement + src[i+1:]
-          open(path, "w", encoding="utf-8").write(new_src)
-          print(f"Patched {path}.")
+          open(p, "w", encoding="utf-8").write(new_src)
+          print(f"Rewrote {marker} body in {p}.")
           PY
 
-      # ──────────────────────────────────────────────────────────
-      # Patch 3 — build wsi_common_android.c under android-stub too.
-      # The reference condition has `not with_android_stub`, which
-      # excludes the file while wsi_common.c still calls its
-      # symbols → `undefined symbol: wsi_android_init_wsi`.
-      # ──────────────────────────────────────────────────────────
-      - name: Patch wsi/meson.build (build wsi_common_android.c)
-        run: |
-          set -euo pipefail
-          FILE="src/vulkan/wsi/meson.build"
-          [[ -f "$FILE" ]] || { echo "ERROR: $FILE not found"; exit 1; }
-          sed -i -E \
-            's|if with_platform_android and not with_android_stub and get_option|if with_platform_android and get_option|' \
-            "$FILE"
-          if grep -qE 'not with_android_stub' "$FILE"; then
-            echo "ERROR: substitution failed"; exit 1
-          fi
-          grep -n 'wsi_common_android.c' "$FILE" || { echo "ERROR: android WSI still missing"; exit 1; }
-          echo "OK: $FILE patched"
+          echo "---- verification: lock_image head ----"
+          grep -n -A8 'wsi_android_lock_image' "$FILE" | head -20
 
       - name: Build host tools and Android driver
         run: bash .github/winlatormali/build.sh
