@@ -1,0 +1,298 @@
+name: Build PanVK G57 for Android (AHB + kbase)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create or update'
+        required: true
+        default: 'panvk-test'
+      mesa_branch:
+        description: 'Branch of the current repo to build'
+        required: true
+        default: 'main'
+      api_override:
+        description: 'Vulkan API override (leave empty to keep as-is)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Install host build tools (pip meson 1.4.0)
+        run: |
+          sudo apt update
+          sudo apt install -y ninja-build pkg-config python3-mako python3-pip \
+            glslang-tools flex bison curl ca-certificates cmake
+          pip install --user meson==1.4.0
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Download and setup Android NDK (r27c)
+        run: |
+          NDK_VERSION="r27c"
+          NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+          wget -q "https://dl.google.com/android/repository/${NDK_ZIP}"
+          unzip -q ${NDK_ZIP} -d /opt
+          echo "ANDROID_NDK_HOME=/opt/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=/opt/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+          chmod +x /opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/*
+
+      - name: Setup Termux sysroot (provides X11 + spirv-tools + real Android headers)
+        run: |
+          mkdir termux && cd termux
+          wget -q https://github.com/xodiosx/Wine-arm64ce/releases/download/wine-14/termux-rootfs.tar
+          tar xf termux-rootfs.tar
+          sudo mv data /data
+          sudo chown -R $(whoami):$(whoami) /data
+          mkdir -p /data/data/com.termux/files/usr/tmp
+          sudo chmod -R a+rX /data/data/com.termux/files/usr
+
+      - name: Provide android_lf.h to Termux sysroot
+        run: |
+          NDK_HEADER=$(find /opt/android-ndk-r27c -name android_lf.h -print -quit)
+          if [ -n "$NDK_HEADER" ]; then
+            sudo cp "$NDK_HEADER" /data/data/com.termux/files/usr/include/
+            echo "Copied $NDK_HEADER"
+          else
+            echo "WARNING: android_lf.h not found in NDK"
+            sudo touch /data/data/com.termux/files/usr/include/android_lf.h
+          fi
+
+      - name: Install X11 + SPIRV-Tools + AHB headers into Termux sysroot
+        run: |
+          mkdir -p /tmp/debs && cd /tmp/debs
+
+          fetch_deb() {
+            local pkg=$1
+            local url=$2
+            local file=$(curl -sL "$url" | grep -oE "${pkg}_[^\"<>]+_aarch64\.deb" | head -n 1)
+            if [ -z "$file" ]; then
+              echo "❌ Failed to find $pkg at $url"
+              return 1
+            fi
+            echo "⬇️ Downloading $file..."
+            wget -q "${url}${file}"
+          }
+
+          fetch_deb "libxkbcommon" "https://packages.termux.dev/apt/termux-x11/pool/main/libx/libxkbcommon/" || true
+          fetch_deb "spirv-tools"  "https://packages.termux.dev/apt/termux-main/pool/main/s/spirv-tools/" || true
+          fetch_deb "libxcb"       "https://packages.termux.dev/apt/termux-main/pool/main/libx/libxcb/" || true
+
+          for deb in *.deb; do
+            echo "📦 Extracting $deb..."
+            dpkg-deb -x "$deb" /tmp/debs/extracted/
+          done
+
+          sudo cp -r /tmp/debs/extracted/data/data/com.termux/files/usr/* \
+                     /data/data/com.termux/files/usr/ 2>/dev/null || true
+          sudo chmod -R 755 /data/data/com.termux/files/usr/lib 2>/dev/null || true
+          sudo chmod -R 755 /data/data/com.termux/files/usr/include 2>/dev/null || true
+
+      - name: Setup pkg-config wrapper (avoids host header conflicts)
+        run: |
+          sudo tee /usr/local/bin/termux-pkg-config > /dev/null << 'SCRIPT'
+          #!/bin/bash
+          export PKG_CONFIG_PATH=/data/data/com.termux/files/usr/lib/pkgconfig
+          /usr/bin/pkg-config "$@" | \
+            sed 's|-I/data/data/com.termux/files/usr/include|-idirafter /data/data/com.termux/files/usr/include|g'
+          SCRIPT
+          sudo chmod +x /usr/local/bin/termux-pkg-config
+
+      # ----------------------------------------------------------------------
+      # Checkout our repo (this repo, at the branch the user asked for)
+      # ----------------------------------------------------------------------
+      - name: Checkout PanVK source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.mesa_branch }}
+          path: mesa
+          fetch-depth: 1
+
+      - name: Report checked-out commit
+        working-directory: mesa
+        run: |
+          git --no-pager log -1 --oneline
+          echo "---- top-level ----"
+          ls -A | head -60
+
+      # ----------------------------------------------------------------------
+      # Apply essential Termux Bionic patches (same set as the Turnip build)
+      # ----------------------------------------------------------------------
+      - name: Apply essential Termux Bionic patches
+        working-directory: mesa
+        run: |
+          sed -i "s/dependency('libudev',/dependency('libudev', required : false, disabler : true, /g" meson.build
+          sed -i "s/has_header('libudev.h')/false/g" meson.build
+
+          apply_termux_patch() {
+            local patchfile="$1"
+            echo "Applying $patchfile..."
+            curl -sSfL "https://raw.githubusercontent.com/termux/termux-packages/master/packages/mesa/$patchfile" | patch -N -p1 || true
+          }
+          apply_termux_patch "0015-define-reallocarray.patch"
+          echo "✔ Termux patches applied"
+
+      - name: Inject mock libudev header
+        run: |
+          sudo tee /data/data/com.termux/files/usr/include/libudev.h > /dev/null << 'EOF'
+          #ifndef MOCK_LIBUDEV_H
+          #define MOCK_LIBUDEV_H
+          #include <pthread.h>
+          #ifndef PTHREAD_CANCEL_ASYNCHRONOUS
+          #define PTHREAD_CANCEL_ASYNCHRONOUS 0
+          #endif
+          #ifndef PTHREAD_CANCEL_ENABLE
+          #define PTHREAD_CANCEL_ENABLE 1
+          #endif
+          static inline int pthread_setcanceltype(int type, int *oldtype) { return 0; }
+          static inline int pthread_setcancelstate(int state, int *oldstate) { return 0; }
+          static inline int pthread_cancel(pthread_t thread) { return 0; }
+          static inline void pthread_testcancel(void) {}
+          struct udev;
+          struct udev_device;
+          struct udev_monitor;
+          struct udev_enumerate;
+          static inline struct udev *udev_new(void) { return 0; }
+          static inline struct udev *udev_ref(struct udev *u) { return u; }
+          static inline void udev_unref(struct udev *u) {}
+          static inline struct udev_device *udev_device_new_from_syspath(struct udev *u, const char *p) { return 0; }
+          static inline struct udev_device *udev_device_ref(struct udev_device *d) { return d; }
+          static inline void udev_device_unref(struct udev_device *d) {}
+          static inline const char *udev_device_get_devnode(struct udev_device *d) { return 0; }
+          static inline const char *udev_device_get_property_value(struct udev_device *d, const char *p) { return 0; }
+          #endif
+          EOF
+          echo "✔ Mock libudev.h installed"
+
+      # ----------------------------------------------------------------------
+      # Optional API version override, same trick as the Turnip build but
+      # pointed at the PanVK device file
+      # ----------------------------------------------------------------------
+      - name: Override Vulkan API version (optional)
+        if: github.event.inputs.api_override != ''
+        working-directory: mesa
+        run: |
+          VER="${{ github.event.inputs.api_override }}"
+          DEVFILE=$(find src/panfrost/vulkan -maxdepth 1 -name 'panvk_physical_device.c' -print -quit)
+          if [ -z "$DEVFILE" ]; then
+            echo "❌ Could not find panvk_physical_device.c"
+            exit 1
+          fi
+          echo "Forcing Vulkan API version to $VER in $DEVFILE"
+          sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
+
+      # ----------------------------------------------------------------------
+      # Cross file, same shape as the Turnip one
+      # ----------------------------------------------------------------------
+      - name: Create Meson cross file for aarch64
+        run: |
+          CPU_FAMILY="aarch64"
+          CPU="aarch64"
+          TARGET="aarch64-linux-android"
+          API=29
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > ~/cross_file.txt << EOF
+          [host_machine]
+          system = 'linux'
+          cpu_family = '${CPU_FAMILY}'
+          cpu = '${CPU}'
+          endian = 'little'
+
+          [binaries]
+          c = '${NDK_BIN}/${TARGET}${API}-clang'
+          cpp = '${NDK_BIN}/${TARGET}${API}-clang++'
+          ar = '${NDK_BIN}/llvm-ar'
+          strip = '${NDK_BIN}/llvm-strip'
+          pkg-config = 'termux-pkg-config'
+          EOF
+          cat ~/cross_file.txt
+
+      # ----------------------------------------------------------------------
+      # Configure PanVK (kbase + panthor, android platform, AHB support)
+      # ----------------------------------------------------------------------
+      - name: Configure Mesa (PanVK + Android + kbase)
+        run: |
+          meson setup build mesa \
+            --cross-file ~/cross_file.txt \
+            -Dvulkan-drivers=panfrost \
+            -Dgallium-drivers= \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=29 \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Dllvm=disabled \
+            -Dbuildtype=release \
+            -Dprefix=/usr \
+            -Dstrip=true \
+            -Dglx=disabled \
+            -Dgbm=disabled \
+            -Dopengl=false \
+            -Degl=disabled \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dpanfrost-kmds=kbase,panthor \
+            -Dpanvk-use-kbase=true \
+            -Dxmlconfig=disabled \
+            -Dvalgrind=disabled
+
+      - name: Build PanVK ICD
+        run: ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
+
+      # ----------------------------------------------------------------------
+      # Package: ICD .so + AHB-capable manifest
+      # ----------------------------------------------------------------------
+      - name: Package PanVK artifact
+        run: |
+          mkdir -p panvk_out/lib
+          mkdir -p panvk_out/share/vulkan/icd.d
+
+          SO=$(find build/src/panfrost/vulkan -maxdepth 1 -name 'libvulkan_panfrost.so' -print -quit)
+          if [ -z "$SO" ]; then
+            echo "❌ libvulkan_panfrost.so not found"
+            find build/src/panfrost/vulkan -maxdepth 1 -type f
+            exit 1
+          fi
+
+          ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
+            --strip-unneeded -o panvk_out/lib/libvulkan_panfrost.so "$SO"
+
+          cat > panvk_out/share/vulkan/icd.d/panfrost_icd.aarch64.json <<'JSON'
+          {
+              "file_format_version": "1.0.1",
+              "ICD": {
+                  "library_path": "libvulkan_panfrost.so",
+                  "api_version": "1.3.0",
+                  "library_arch": "64"
+              }
+          }
+          JSON
+
+          ls -lh panvk_out/lib/
+          cat panvk_out/share/vulkan/icd.d/panfrost_icd.aarch64.json
+
+          tar -cJf panvk-${{ github.event.inputs.mesa_branch }}-aarch64.tar.xz -C panvk_out .
+          ls -lh panvk-*.tar.xz
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-build-logs
+          path: build/meson-logs/
+          if-no-files-found: ignore
+
+      - name: Upload release assets
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          files: |
+            panvk-*.tar.xz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
