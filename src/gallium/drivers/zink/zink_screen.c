@@ -189,7 +189,6 @@ zink_set_driver_strings(struct zink_screen *screen)
 {
    char buf[1000];
    const char *driver_name = vk_DriverId_to_str(zink_driverid(screen)) + strlen("VK_DRIVER_ID_");
-   /* Downstream: report a friendly name for our non-standard driver ID. */
    const char *name_part;
    if ((unsigned)zink_driverid(screen) == 0x0000CAFE)
       name_part = "panvcake";
