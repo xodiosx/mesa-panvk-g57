@@ -35,8 +35,6 @@ extern "C" {
 struct wsi_image;
 struct wsi_swapchain;
 
-bool wsi_panvk_trace(void);
-
 #define WSI_DEBUG_BUFFER      (1ull << 0)
 #define WSI_DEBUG_SW          (1ull << 1)
 #define WSI_DEBUG_NOSHM       (1ull << 2)
@@ -355,10 +353,6 @@ wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
                        const VkAllocationCallbacks *pAllocator);
 
 void
-wsi_android_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
-                            const VkAllocationCallbacks *pAllocator);
-
-void
 wsi_win32_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
                           const VkAllocationCallbacks *pAllocator);
 
@@ -556,11 +550,6 @@ VkResult wsi_wl_init_wsi(struct wsi_device *wsi_device,
                          VkPhysicalDevice physical_device);
 void wsi_wl_finish_wsi(struct wsi_device *wsi_device,
                        const VkAllocationCallbacks *alloc);
-VkResult wsi_android_init_wsi(struct wsi_device *wsi_device,
-                              const VkAllocationCallbacks *alloc,
-                              VkPhysicalDevice physical_device);
-void wsi_android_finish_wsi(struct wsi_device *wsi_device,
-                            const VkAllocationCallbacks *alloc);
 VkResult wsi_win32_init_wsi(struct wsi_device *wsi_device,
                          const VkAllocationCallbacks *alloc,
                          VkPhysicalDevice physical_device);

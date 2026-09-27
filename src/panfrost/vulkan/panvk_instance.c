@@ -14,7 +14,6 @@
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
 #include "util/u_call_once.h"
-#include "util/u_math.h"
 
 #if defined(HAVE_PAN_KMOD_KBASE)
 #include <limits.h>
@@ -118,9 +117,6 @@ static const struct vk_instance_extension_table panvk_instance_extensions = {
 #endif
 #ifdef VK_USE_PLATFORM_WAYLAND_KHR
    .KHR_wayland_surface = true,
-#endif
-#ifdef VK_USE_PLATFORM_ANDROID_KHR
-   .KHR_android_surface = true,
 #endif
 #ifdef VK_USE_PLATFORM_XCB_KHR
    .KHR_xcb_surface = true,
@@ -321,39 +317,6 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    panvk_init_dri_options(instance);
 
-   {
-      const char *t = getenv("PANVK_WSI_TRACE");
-      if (t && t[0] && strcmp(t, "0") != 0) {
-         fprintf(stderr,
-                 "PANVKDBG INSTANCE EXT_ENABLED count=%u "
-                 "surface=%d xcb=%d xlib=%d wayland=%d display=%d "
-                 "android=%d\n",
-                 pCreateInfo->enabledExtensionCount,
-                 !!panvk_instance_extensions.KHR_surface,
-                 !!panvk_instance_extensions.KHR_xcb_surface,
-                 !!panvk_instance_extensions.KHR_xlib_surface,
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
-                 !!panvk_instance_extensions.KHR_wayland_surface,
-#else
-                 0,
-#endif
-#ifdef VK_USE_PLATFORM_DISPLAY_KHR
-                 !!panvk_instance_extensions.KHR_display,
-#else
-                 0,
-#endif
-#ifdef VK_USE_PLATFORM_ANDROID_KHR
-                 !!panvk_instance_extensions.KHR_android_surface);
-#else
-                 0);
-#endif
-         for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++)
-            fprintf(stderr, "PANVKDBG INSTANCE EXT[%u]=%s\n", i,
-                    pCreateInfo->ppEnabledExtensionNames[i]);
-         fprintf(stderr, "PANVKDBG INSTANCE result=%d\n", result);
-      }
-   }
-
    instance->kmod.allocator = (struct pan_kmod_allocator){
       .zalloc = panvk_kmod_zalloc,
       .free = panvk_kmod_free,
@@ -417,41 +380,8 @@ PFN_vkVoidFunction
 panvk_GetInstanceProcAddr(VkInstance _instance, const char *pName)
 {
    VK_FROM_HANDLE(panvk_instance, instance, _instance);
-   PFN_vkVoidFunction fn = vk_instance_get_proc_addr(&instance->vk,
-                                                     &panvk_instance_entrypoints,
-                                                     pName);
-
-   /* The window-system entry points decide whether the application can reach
-    * the WSI at all, so log what the loader is asking for and what we answer.
-    */
-   if (pName) {
-      static const char *const wsi_names[] = {
-         "vkDestroySurfaceKHR",
-         "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
-         "vkGetPhysicalDeviceSurfaceFormatsKHR",
-         "vkGetPhysicalDeviceSurfacePresentModesKHR",
-         "vkGetPhysicalDeviceSurfaceSupportKHR",
-         "vkCreateXcbSurfaceKHR",
-         "vkCreateXlibSurfaceKHR",
-         "vkCreateWaylandSurfaceKHR",
-         "vkCreateAndroidSurfaceKHR",
-         "vkCreateDisplayPlaneSurfaceKHR",
-         "vkCreateHeadlessSurfaceEXT",
-      };
-      const char *t = getenv("PANVK_WSI_TRACE");
-      if (t && t[0] && strcmp(t, "0") != 0) {
-         for (unsigned i = 0; i < ARRAY_SIZE(wsi_names); i++) {
-            if (!strcmp(pName, wsi_names[i])) {
-               fprintf(stderr,
-                       "PANVKDBG GIPA name=%s fn=%p\n", pName, (void *)fn);
-               fflush(stderr);
-               break;
-            }
-         }
-      }
-   }
-
-   return fn;
+   return vk_instance_get_proc_addr(&instance->vk, &panvk_instance_entrypoints,
+                                    pName);
 }
 
 /* The loader wants us to expose a second GetInstanceProcAddr function

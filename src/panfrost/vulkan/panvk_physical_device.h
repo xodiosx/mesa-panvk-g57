@@ -122,24 +122,13 @@ void panvk_kbase_sync_set_pending(
 #endif
 
 /* JM USER_BUFFER imports provide host-addressable memory for WoW64.
- * Keep an explicit opt-out for regression comparisons.
- *
- * PANVK_TEST_HOST_IMPORT=force drops the architecture gate.  The gate exists
- * because the 32-bit path was only validated on Bifrost, but the kbase import
- * itself is the same uAPI call on every architecture, so "force" is the way to
- * test a newer one without rebuilding. */
+ * Keep an explicit opt-out for regression comparisons. */
 static inline bool
 panvk_host_import_enabled(const struct panvk_physical_device *device)
 {
    const char *value = getenv("PANVK_TEST_HOST_IMPORT");
-
-   if (!device->kbase_node_path[0])
-      return false;
-
-   if (value && strcmp(value, "force") == 0)
-      return true;
-
-   return pan_arch(device->kmod.dev->props.gpu_id) < 10 &&
+   return device->kbase_node_path[0] &&
+          pan_arch(device->kmod.dev->props.gpu_id) < 10 &&
           (!value || strcmp(value, "0") != 0);
 }
 

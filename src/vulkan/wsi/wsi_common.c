@@ -41,7 +41,6 @@
 #include "vk_util.h"
 
 #include <assert.h>
-#include <string.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -64,26 +63,6 @@ static const struct debug_control debug_control[] = {
 
 static bool present_false(VkPhysicalDevice pdevice, int fd) {
    return false;
-}
-
-/* The WSI trace points below run once per acquired image, per present and per
- * CPU blit, so they are on the per-frame path.  On the WinlatorMali setup
- * stderr is duplicated to a log file, which turns each of these into a write
- * in the middle of the frame.  Keep them available, but only when
- * PANVK_WSI_TRACE asks for them.
- */
-bool
-wsi_panvk_trace(void)
-{
-   static int enabled = -1;
-
-   if (enabled < 0) {
-      const char *value = getenv("PANVK_WSI_TRACE");
-
-      enabled = (value && value[0] && strcmp(value, "0") != 0) ? 1 : 0;
-   }
-
-   return enabled == 1;
 }
 
 VkResult
@@ -276,12 +255,6 @@ wsi_device_init(struct wsi_device *wsi,
       goto fail;
 #endif
 
-#ifdef VK_USE_PLATFORM_ANDROID_KHR
-   result = wsi_android_init_wsi(wsi, alloc, pdevice);
-   if (result != VK_SUCCESS)
-      goto fail;
-#endif
-
 #ifdef VK_USE_PLATFORM_WIN32_KHR
    result = wsi_win32_init_wsi(wsi, alloc, pdevice);
    if (result != VK_SUCCESS)
@@ -380,9 +353,6 @@ wsi_device_finish(struct wsi_device *wsi,
 #ifdef VK_USE_PLATFORM_WAYLAND_KHR
    wsi_wl_finish_wsi(wsi, alloc);
 #endif
-#ifdef VK_USE_PLATFORM_ANDROID_KHR
-   wsi_android_finish_wsi(wsi, alloc);
-#endif
 #ifdef VK_USE_PLATFORM_WIN32_KHR
    wsi_win32_finish_wsi(wsi, alloc);
 #endif
@@ -414,12 +384,6 @@ wsi_DestroySurfaceKHR(VkInstance _instance,
 #ifdef VK_USE_PLATFORM_WIN32_KHR
    if (surface->platform == VK_ICD_WSI_PLATFORM_WIN32) {
       wsi_win32_surface_destroy(surface, _instance, pAllocator);
-      return;
-   }
-#endif
-#ifdef VK_USE_PLATFORM_ANDROID_KHR
-   if (surface->platform == VK_ICD_WSI_PLATFORM_ANDROID) {
-      wsi_android_surface_destroy(surface, _instance, pAllocator);
       return;
    }
 #endif
@@ -1128,14 +1092,6 @@ wsi_GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physicalDevice,
       *pSupported = (bool)*pSupported && blit;
    }
 
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-              "PANVKDBG SURFACE support platform=%u family=%u supported=%d "
-              "blit_mask=0x%llx result=%d\n",
-              surface->platform, queueFamilyIndex,
-              res == VK_SUCCESS ? (int)*pSupported : -1,
-              (unsigned long long)wsi_device->queue_supports_blit, res);
-
    return res;
 }
 
@@ -1158,15 +1114,6 @@ wsi_GetPhysicalDeviceSurfaceCapabilitiesKHR(
 
    if (result == VK_SUCCESS)
       *pSurfaceCapabilities = caps2.surfaceCapabilities;
-
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-              "PANVKDBG SURFACE caps platform=%u extent=%ux%u minImage=%u "
-              "maxImage=%u result=%d\n",
-              surface->platform, caps2.surfaceCapabilities.currentExtent.width,
-              caps2.surfaceCapabilities.currentExtent.height,
-              caps2.surfaceCapabilities.minImageCount,
-              caps2.surfaceCapabilities.maxImageCount, result);
 
    return result;
 }
@@ -1293,11 +1240,6 @@ wsi_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalDevice,
    struct wsi_device *wsi_device = device->wsi_device;
    struct wsi_interface *iface = wsi_device->wsi[surface->platform];
 
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-              "PANVKDBG SURFACE formats platform=%u count=%u\n",
-              surface->platform, *pSurfaceFormatCount);
-
    return iface->get_formats(surface, wsi_device,
                              pSurfaceFormatCount, pSurfaceFormats);
 }
@@ -1363,11 +1305,6 @@ wsi_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physicalDevice,
    ICD_FROM_HANDLE(VkIcdSurfaceBase, surface, _surface);
    struct wsi_device *wsi_device = device->wsi_device;
    struct wsi_interface *iface = wsi_device->wsi[surface->platform];
-
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-              "PANVKDBG SURFACE present_modes platform=%u count=%u\n",
-              surface->platform, *pPresentModeCount);
 
    return iface->get_present_modes(surface, wsi_device, pPresentModeCount,
                                    pPresentModes);
@@ -1495,12 +1432,10 @@ wsi_CreateSwapchainKHR(VkDevice _device,
    ICD_FROM_HANDLE(VkIcdSurfaceBase, surface, pCreateInfo->surface);
    struct wsi_device *wsi_device = device->physical->wsi_device;
 
-   if (wsi_panvk_trace())
    fprintf(stderr,
-           "PANVKDBG PRESENT CREATE_ENTER surface=%p platform=%d format=%d "
-           "extent=%ux%u minImages=%u mode=%d sw=%d\n",
+           "PANVKDBG PRESENT CREATE_ENTER surface=%p format=%d "
+           "extent=%ux%u minImages=%u mode=%d sw=%d\\n",
            (void *)(uintptr_t)pCreateInfo->surface,
-           surface->platform,
            pCreateInfo->imageFormat,
            pCreateInfo->imageExtent.width,
            pCreateInfo->imageExtent.height,
@@ -1634,13 +1569,6 @@ wsi_CreateSwapchainKHR(VkDevice _device,
          swapchain->present_timing.google_timing_mode = true;
       }
    }
-
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-              "PANVKDBG PRESENT CREATE_OK swapchain=%p images=%u blit=%d "
-              "no_shm_import=%d\n",
-              (void *)swapchain, swapchain->image_count, swapchain->blit.type,
-              wsi_device->blit_no_shm_import);
 
    return VK_SUCCESS;
 }
@@ -2362,17 +2290,15 @@ wsi_common_acquire_next_image2(const struct wsi_device *wsi,
    VK_FROM_HANDLE(wsi_swapchain, swapchain, pAcquireInfo->swapchain);
    VK_FROM_HANDLE(vk_device, device, _device);
 
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-           "PANVKDBG PRESENT ACQUIRE_ENTER swapchain=%p timeout=%" PRIu64 "\n",
+   fprintf(stderr,
+           "PANVKDBG PRESENT ACQUIRE_ENTER swapchain=%p timeout=%" PRIu64 "\\n",
            (void *)swapchain, pAcquireInfo->timeout);
 
    VkResult result = swapchain->acquire_next_image(swapchain, pAcquireInfo,
                                                    pImageIndex);
 
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-           "PANVKDBG PRESENT ACQUIRE_RET swapchain=%p result=%d index=%u\n",
+   fprintf(stderr,
+           "PANVKDBG PRESENT ACQUIRE_RET swapchain=%p result=%d index=%u\\n",
            (void *)swapchain, result,
            (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) ?
               *pImageIndex : UINT32_MAX);
@@ -2536,9 +2462,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 {
    struct vk_device *dev = queue->base.device;
 
-   if (wsi_panvk_trace())
-      fprintf(stderr,
-           "PANVKDBG PRESENT QUEUE_ENTER queue=%p swapchainCount=%u waitCount=%u\n",
+   fprintf(stderr,
+           "PANVKDBG PRESENT QUEUE_ENTER queue=%p swapchainCount=%u waitCount=%u\\n",
            (void *)queue,
            pPresentInfo->swapchainCount,
            pPresentInfo->waitSemaphoreCount);
@@ -2999,10 +2924,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       if (regions && regions->pRegions)
          region = &regions->pRegions[i];
 
-      if (wsi_panvk_trace())
-         fprintf(stderr,
+      fprintf(stderr,
               "PANVKDBG PRESENT BACKEND_ENTER i=%u swapchain=%p "
-              "image=%u present_id=%" PRIu64 "\n",
+              "image=%u present_id=%" PRIu64 "\\n",
               i, (void *)swapchain, image_index,
               image_signal_infos[i].present_id);
 
@@ -3010,9 +2934,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
                                             image_signal_infos[i].present_id,
                                             region);
 
-      if (wsi_panvk_trace())
-         fprintf(stderr,
-              "PANVKDBG PRESENT BACKEND_RET i=%u image=%u result=%d\n",
+      fprintf(stderr,
+              "PANVKDBG PRESENT BACKEND_RET i=%u image=%u result=%d\\n",
               i, image_index, results[i]);
 
       if (results[i] != VK_SUCCESS && results[i] != VK_SUBOPTIMAL_KHR)
@@ -3268,7 +3191,6 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
    if (info->alloc_shm)
       sw_host_ptr = info->alloc_shm(image, info->linear_size);
 
-   if (wsi_panvk_trace())
    fprintf(stderr,
            "PANVKDBG WSI_BLIT_SHM alloc_shm=%p sw_host_ptr=%p "
            "size=%llu\n",
@@ -3278,15 +3200,7 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
 
    VkExportMemoryAllocateInfo memory_export_info;
    VkImportMemoryHostPointerInfoEXT host_ptr_info;
-   if (sw_host_ptr != NULL && wsi->blit_no_shm_import) {
-      /* The blit destination has to be memory a job can actually write, so
-       * leave the SHM to the window system and take a plain host-visible
-       * allocation.  The present path copies the result into the SHM. */
-      if (wsi_panvk_trace())
-         fprintf(stderr,
-                 "PANVKDBG WSI_BLIT_NO_IMPORT sw_host_ptr=%p size=%llu\n",
-                 sw_host_ptr, (unsigned long long)info->linear_size);
-   } else if (sw_host_ptr != NULL) {
+   if (sw_host_ptr != NULL) {
       image->blit.to_foreign_queue = true;
       host_ptr_info = (VkImportMemoryHostPointerInfoEXT) {
          .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
@@ -3750,7 +3664,6 @@ wsi_configure_cpu_image(const struct wsi_swapchain *chain,
    assert(chain->blit.type == WSI_SWAPCHAIN_NO_BLIT ||
           chain->blit.type == WSI_SWAPCHAIN_BUFFER_BLIT);
 
-   if (wsi_panvk_trace())
    fprintf(stderr,
            "PANVKDBG WSI_CPU_CONFIG blit=%d alloc_shm=%p "
            "has_import_host=%d wants_linear=%d\n",

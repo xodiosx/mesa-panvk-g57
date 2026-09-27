@@ -79,13 +79,6 @@ struct kbase_kmod_dev {
    void *userbuf_gpu_ptrs[KBASE_KMOD_MAX_USER_BUFFERS];
    uint64_t userbuf_sizes[KBASE_KMOD_MAX_USER_BUFFERS];
    uint32_t userbuf_count;
-   /* PANVK_TEST_USERBUF_EXTRES=mmap names the mmap() address in the job
-    * descriptor instead of the host address (the behaviour that faulted). */
-   bool userbuf_mmap_va;
-   /* PANVK_TEST_USERBUF_SHARED=1 restores BASE_MEM_IMPORT_SHARED, which puts
-    * the region in kbase's "pin the pages only around the jobs that name it"
-    * mode and so forces an external resource onto every atom. */
-   bool userbuf_shared;
 
    /* PANVKDBG: BOs nativos grandes para inspeção de render target. */
    uint64_t debug_bo_vas[KBASE_KMOD_MAX_DEBUG_BOS];
@@ -173,12 +166,6 @@ struct kbase_kmod_bo {
 
    /* Imported through BASE_MEM_IMPORT_TYPE_USER_BUFFER. */
    bool user_buffer;
-
-   /* Cookie/handle returned by MEM_IMPORT for a user buffer.  MEM_FREE wants
-    * this back to release the pinned region; the address a job descriptor
-    * uses is the host pointer instead (see kbase_import_user_buffer_locked).
-    */
-   uint64_t import_cookie;
 };
 
 bool
@@ -1294,10 +1281,6 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
     kbase_dev->is_csf = is_csf;
     kbase_dev->tracking_page = tracking_page;
    kbase_dev->next_handle = 1;
-   const char *userbuf_va = getenv("PANVK_TEST_USERBUF_EXTRES");
-   kbase_dev->userbuf_mmap_va = userbuf_va && !strcmp(userbuf_va, "mmap");
-   const char *userbuf_shared = getenv("PANVK_TEST_USERBUF_SHARED");
-   kbase_dev->userbuf_shared = userbuf_shared && !strcmp(userbuf_shared, "1");
    kbase_dev->dma_heap_fd = -1;
    kbase_dev->kcpu.fence_fd = -1;
    simple_mtx_init(&kbase_dev->kcpu.lock, mtx_plain);
@@ -1492,8 +1475,7 @@ kbase_import_user_buffer_locked(struct pan_kmod_dev *dev, void *ptr,
    const uint64_t page_size = 4096;
 
    if (kbase_dev->is_csf ||
-       (kbase_dev->userbuf_shared &&
-        kbase_dev->userbuf_count >= KBASE_KMOD_MAX_USER_BUFFERS)) {
+       kbase_dev->userbuf_count >= KBASE_KMOD_MAX_USER_BUFFERS) {
       mesa_loge("kbase: USER_BUFFER import exceeds JM external-resource capacity");
       errno = ENOSPC;
       return NULL;
@@ -1507,17 +1489,6 @@ kbase_import_user_buffer_locked(struct pan_kmod_dev *dev, void *ptr,
    if (!ptr || !size || ((uintptr_t)ptr & (page_size - 1))) {
       mesa_loge("kbase: USER_BUFFER requires page-aligned ptr "
                 "(ptr=%p size=%" PRIu64 ")", ptr, size);
-      errno = EINVAL;
-      return NULL;
-   }
-
-   /* The job descriptor names the region by its host address, so a guest
-    * allocation that does not fit the JM address field can never be reached
-    * by a job: reject it here instead of faulting the GPU later. */
-   if (!kbase_dev->userbuf_mmap_va && (uintptr_t)ptr > 0xffffffffULL) {
-      mesa_loge("kbase: USER_BUFFER ptr %p is above the 4GiB JM address "
-                "window; a 32-bit guest allocation is required",
-                ptr);
       errno = EINVAL;
       return NULL;
    }
@@ -1548,17 +1519,8 @@ kbase_import_user_buffer_locked(struct pan_kmod_dev *dev, void *ptr,
       BASE_MEM_PROT_GPU_RD |
       BASE_MEM_PROT_GPU_WR |
       BASE_MEM_CACHED_CPU |
+      BASE_MEM_IMPORT_SHARED |
       BASE_MEM_COHERENT_SYSTEM;
-
-   /* Without BASE_MEM_IMPORT_SHARED, kbase faults the user pages in while it
-    * handles MEM_IMPORT and leaves the region mapped for the lifetime of the
-    * allocation, so a job reaches it through an ordinary address.  With the
-    * flag set, kbase defers the pinning to the jobs that declare the region
-    * as an external resource instead: every atom then has to carry the buffer
-    * in its extres list, the list is capped at BASE_EXT_RES_COUNT_MAX (10),
-    * and the descriptor has to name the region exactly. */
-   if (kbase_dev->userbuf_shared)
-      import_flags |= BASE_MEM_IMPORT_SHARED;
 
    union kbase_ioctl_mem_import req = {
       .in = {
@@ -1604,7 +1566,6 @@ kbase_import_user_buffer_locked(struct pan_kmod_dev *dev, void *ptr,
    }
 
    kbase_bo->same_va = need_mmap;
-   kbase_bo->import_cookie = req.out.gpu_va;
 
    if (need_mmap) {
       kbase_bo->gpu_mapping =
@@ -1638,36 +1599,13 @@ kbase_import_user_buffer_locked(struct pan_kmod_dev *dev, void *ptr,
 
    kbase_bo->user_buffer = true;
 
-   /* The address a JM job must name for this allocation is the *host*
-    * address, not the mmap() result.  A user-buffer import is registered in
-    * the context address space at the address the application handed us
-    * (kbase keeps it as alloc->imported.user_buf.address and looks the
-    * region up with it), and it comes back from MEM_IMPORT as a cookie
-    * (BASE_MEM_COOKIE_BASE + slot, which is why several live imports report
-    * the same out.gpu_va) rather than as a GPU VA.  The mmap() we take above
-    * is only a CPU mapping: its address is whatever the kernel's mmap
-    * allocator picked, and feeding it to the job descriptor made the GPU
-    * fault (atom JD event 0x04, i.e. device lost) as soon as a job touched
-    * guest memory. */
-   if (kbase_dev->userbuf_mmap_va) {
-      kbase_bo->gpu_va = (uint64_t)(uintptr_t)kbase_bo->gpu_mapping;
-   } else {
-      kbase_bo->gpu_va = (uint64_t)(uintptr_t)kbase_bo->cpu_ptr;
-   }
+   if (kbase_dev->userbuf_count < KBASE_KMOD_MAX_USER_BUFFERS) {
+      unsigned idx = kbase_dev->userbuf_count++;
 
-   /* The registry only feeds the extres list and the debug dump.  When the
-    * pages are mapped up front it is only a log window, so do not let it
-    * start rejecting allocations. */
-   if (kbase_dev->userbuf_shared ||
-       kbase_dev->userbuf_count < KBASE_KMOD_MAX_USER_BUFFERS) {
-      if (kbase_dev->userbuf_count < KBASE_KMOD_MAX_USER_BUFFERS) {
-         unsigned idx = kbase_dev->userbuf_count++;
-
-         kbase_dev->userbuf_vas[idx] = kbase_bo->gpu_va;
-         kbase_dev->userbuf_cpu_ptrs[idx] = kbase_bo->cpu_ptr;
-         kbase_dev->userbuf_gpu_ptrs[idx] = kbase_bo->gpu_mapping;
-         kbase_dev->userbuf_sizes[idx] = bo_size;
-      }
+      kbase_dev->userbuf_vas[idx] = kbase_bo->gpu_va;
+      kbase_dev->userbuf_cpu_ptrs[idx] = kbase_bo->cpu_ptr;
+      kbase_dev->userbuf_gpu_ptrs[idx] = kbase_bo->gpu_mapping;
+      kbase_dev->userbuf_sizes[idx] = bo_size;
 
       fprintf(stderr,
               "PANVKDBG USERBUF REGISTER gpu=%016" PRIx64
@@ -1678,6 +1616,8 @@ kbase_import_user_buffer_locked(struct pan_kmod_dev *dev, void *ptr,
               kbase_bo->gpu_mapping,
               bo_size,
               kbase_dev->userbuf_count);
+   } else {
+      mesa_loge("kbase: USER_BUFFER diagnostic registry full");
    }
 
    fprintf(stderr,
@@ -1855,11 +1795,6 @@ kbase_kmod_get_user_buffer_vas(struct pan_kmod_dev *dev,
 {
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
-
-   if (!kbase_dev->userbuf_shared) {
-      /* The region is mapped for good, so a job needs no external resource. */
-      return 0;
-   }
 
    simple_mtx_lock(&userbuf_lock);
    unsigned count = MIN2(kbase_dev->userbuf_count, max_vas);
@@ -2207,16 +2142,7 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
    if (kbase_bo->gpu_mapping)
       munmap(kbase_bo->gpu_mapping, bo->size);
 
-   /* A user-buffer import owns a kernel region that nothing else releases:
-    * the pages stay pinned until the region goes away, so hand the import
-    * cookie back.  MEM_FREE understands the cookie, not the address the job
-    * descriptor uses, and if the munmap() above already tore the region down
-    * the kernel just rejects this, which is harmless. */
-   if (kbase_bo->user_buffer && kbase_bo->import_cookie) {
-      struct kbase_ioctl_mem_free req = { .gpu_addr = kbase_bo->import_cookie };
-      if (ioctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &req))
-         mesa_loge("kbase: USER_BUFFER MEM_FREE failed: %s", strerror(errno));
-   } else if (!kbase_bo->same_va) {
+   if (!kbase_bo->same_va) {
       struct kbase_ioctl_mem_free req = { .gpu_addr = kbase_bo->gpu_va };
       if (ioctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &req))
          mesa_loge("kbase: KBASE_IOCTL_MEM_FREE failed: %s", strerror(errno));

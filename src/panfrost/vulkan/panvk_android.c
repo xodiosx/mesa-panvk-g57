@@ -221,68 +221,6 @@ panvk_android_get_wsi_memory(struct panvk_device *dev,
    return VK_SUCCESS;
 }
 
-/* PANVK_AHB_TRACE=1 dumps the geometry of every hardware buffer that is
- * handed to us, so it can be compared against what the consumer of the buffer
- * expects to read.
- */
-static bool
-panvk_android_ahb_trace(void)
-{
-   static int enabled = -1;
-
-   if (enabled < 0) {
-      const char *value = getenv("PANVK_AHB_TRACE");
-      enabled = (value && value[0] && strcmp(value, "0") != 0) ? 1 : 0;
-   }
-
-   return enabled == 1;
-}
-
-static void
-panvk_android_ahb_trace_dump(const char *tag, struct AHardwareBuffer *ahb,
-                             const struct panvk_image *img,
-                             const VkSubresourceLayout *layout)
-{
-   if (!panvk_android_ahb_trace())
-      return;
-
-   AHardwareBuffer_Desc desc;
-   memset(&desc, 0, sizeof(desc));
-   AHardwareBuffer_describe(ahb, &desc);
-   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
-
-   /* AHardwareBuffer_Desc has no public allocation size and there is no public
-    * AHardwareBuffer_getSize(), so estimate it from the described geometry.
-    * The authoritative size is the subresource layout dumped below.
-    */
-   uint64_t est_size = (uint64_t)desc.stride * desc.height * desc.layers;
-
-   fprintf(stderr,
-           "PANVKDBG AHB %s ahb=%p handle=%s fd=%d width=%u height=%u "
-           "layers=%u format=%d usage=0x%llx stride=%u est_size=%llu\n",
-           tag, (void *)ahb,
-           handle ? "yes" : "no", handle ? handle->data[0] : -1, desc.width,
-           desc.height, desc.layers, (int)desc.format,
-           (unsigned long long)desc.usage, desc.stride,
-           (unsigned long long)est_size);
-
-   if (img)
-      fprintf(stderr,
-              "PANVKDBG AHB %s img=%p type=%d fmt=%d extent=%ux%u mips=%u "
-              "layers=%u samples=%d tiling=%d usage=0x%llx ext_types=0x%x\n",
-              tag, (void *)img, (int)img->vk.image_type, (int)img->vk.format,
-              img->vk.extent.width, img->vk.extent.height, img->vk.mip_levels,
-              img->vk.array_layers, (int)img->vk.samples, (int)img->vk.tiling,
-              (unsigned long long)img->vk.usage, img->vk.external_handle_types);
-
-   if (layout)
-      fprintf(stderr,
-              "PANVKDBG AHB %s pitch=%llu offset=%llu size=%llu\n", tag,
-              (unsigned long long)layout->rowPitch,
-              (unsigned long long)layout->offset,
-              (unsigned long long)layout->size);
-}
-
 static VkResult
 panvk_android_ahb_image_init(struct AHardwareBuffer *ahb,
                              struct panvk_image *img)
@@ -304,8 +242,6 @@ panvk_android_ahb_image_init(struct AHardwareBuffer *ahb,
              mod_info.drmFormatModifierPlaneCount,
              (unsigned long long)layouts[0].rowPitch,
              (unsigned long long)layouts[0].offset);
-
-   panvk_android_ahb_trace_dump("IMAGE_INIT", ahb, img, &layouts[0]);
 
    /* Unknown gralloc layout is not a valid explicit DRM modifier.
     * A linear interpretation is an opt-in experiment, not layout discovery.
@@ -458,23 +394,10 @@ panvk_android_import_ahb_memory(VkDevice device,
       .allocationSize = mem_reqs.size,
       .memoryTypeIndex = mem_type_index,
    };
-   if (panvk_android_ahb_trace())
-      fprintf(stderr,
-              "PANVKDBG AHB IMPORT ahb=%p fd=%d size=%llu typeBits=0x%x "
-              "memType=%u (asked %u) img=%p buf=%p\n",
-              (void *)ahb, dma_buf_fd, (unsigned long long)mem_reqs.size,
-              mem_reqs.memoryTypeBits, mem_type_index,
-              pAllocateInfo->memoryTypeIndex, (void *)img_handle,
-              (void *)buf_handle);
-
    result = dev->dispatch_table.AllocateMemory(device, &alloc_info, pAllocator,
                                                pMemory);
    if (result != VK_SUCCESS)
       close(dup_fd);
-
-   if (panvk_android_ahb_trace())
-      fprintf(stderr, "PANVKDBG AHB IMPORT result=%d memory=%p\n", result,
-              (void *)*pMemory);
 
    return result;
 }

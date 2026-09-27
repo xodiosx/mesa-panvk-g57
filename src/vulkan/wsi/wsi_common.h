@@ -76,15 +76,6 @@ struct wsi_device {
    bool has_timeline_semaphore;
    bool has_host_query_reset;
 
-   /** Do not import the SHM segment as host memory for the CPU blit
-    *
-    * If true, the CPU blit destination is an ordinary host-visible device
-    * allocation that the WSI maps itself, instead of the X11 SHM segment
-    * handed to the driver through VkImportMemoryHostPointerInfoEXT.  Drivers
-    * whose host import cannot be addressed by a job need this.
-    */
-   bool blit_no_shm_import;
-
    /** Whether the device uses 32bpp formats for 24bpp
     *
     * If true, VkImages created with R8G8B8/B8G8R8 formats will be
