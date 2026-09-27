@@ -22,16 +22,24 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 180
     steps:
-      - name: Install host build tools (meson 1.4.0 + LLVM dev)
+      # ─────────────────────────────────────────────────────────────
+      # KEY: libdrm-dev is required. It provides /usr/include/xf86drm.h,
+      # /usr/include/xf86drmMode.h, and /usr/include/libdrm/*.h. Without
+      # it the Termux sysroot's libdrm.pc is found by pkg-config, but
+      # the actual headers are missing, so pan_kmod.c fails on
+      # #include <xf86drm.h>.
+      # ─────────────────────────────────────────────────────────────
+      - name: Install host build tools
         run: |
           sudo apt update
           sudo apt install -y ninja-build pkg-config python3-mako python3-pip \
             glslang-tools flex bison curl ca-certificates cmake \
-            llvm-18-dev libclang-18-dev libclc-18-dev \
-            libllvmspirvlib-18-dev libelf-dev \
-            zlib1g-dev libexpat1-dev
+            clang-19 llvm-19-dev libclang-19-dev libclang-cpp19-dev \
+            libclc-19 libclc-19-dev libllvmspirvlib-19-dev \
+            libdrm-dev zlib1g-dev libzstd-dev libelf-dev spirv-tools \
+            libexpat1-dev
           pip install --user meson==1.4.0
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
@@ -45,7 +53,7 @@ jobs:
           echo "ANDROID_NDK_ROOT=/opt/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
           chmod +x /opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/*
 
-      - name: Setup Termux sysroot
+      - name: Setup Termux sysroot (X11 + real Android headers)
         run: |
           mkdir termux && cd termux
           wget -q https://github.com/xodiosx/Wine-arm64ce/releases/download/wine-14/termux-rootfs.tar
@@ -55,42 +63,69 @@ jobs:
           mkdir -p /data/data/com.termux/files/usr/tmp
           sudo chmod -R a+rX /data/data/com.termux/files/usr
 
-      - name: Provide android_lf.h to Termux sysroot
+      - name: Provide android_lf.h
         run: |
           NDK_HEADER=$(find /opt/android-ndk-r27c -name android_lf.h -print -quit)
           if [ -n "$NDK_HEADER" ]; then
             sudo cp "$NDK_HEADER" /data/data/com.termux/files/usr/include/
-            echo "Copied $NDK_HEADER"
           else
-            echo "WARNING: android_lf.h not found in NDK"
             sudo touch /data/data/com.termux/files/usr/include/android_lf.h
           fi
 
-      - name: Install extra Termux debs (libxkbcommon, libxcb)
+      - name: Install extra Termux debs
         run: |
           mkdir -p /tmp/debs && cd /tmp/debs
           fetch_deb() {
-            local pkg=$1
-            local url=$2
+            local pkg=$1 url=$2
             local file=$(curl -sL "$url" | grep -oE "${pkg}_[^\"<>]+_aarch64\.deb" | head -n 1)
-            if [ -z "$file" ]; then
-              echo "⚠️ $pkg not found — skipping"
-              return 0
-            fi
+            [ -z "$file" ] && { echo "⚠️ $pkg not found"; return 0; }
             wget -q "${url}${file}" || true
           }
           fetch_deb "libxkbcommon" "https://packages.termux.dev/apt/termux-x11/pool/main/libx/libxkbcommon/" || true
-          fetch_deb "libxcb" 
-          fetch_deb "libdrm"       "https://packages.termux.dev/apt/termux-main/pool/main/libd/libdrm/" || true
-          
+          fetch_deb "libxcb"       "https://packages.termux.dev/apt/termux-main/pool/main/libx/libxcb/" || true
           for deb in *.deb; do
             [ -e "$deb" ] || continue
             dpkg-deb -x "$deb" /tmp/debs/extracted/
           done
           sudo cp -r /tmp/debs/extracted/data/data/com.termux/files/usr/* \
                      /data/data/com.termux/files/usr/ 2>/dev/null || true
-          sudo chmod -R 755 /data/data/com.termux/files/usr/lib 2>/dev/null || true
-          sudo chmod -R 755 /data/data/com.termux/files/usr/include 2>/dev/null || true
+
+      # ─────────────────────────────────────────────────────────────
+      # NEW: copy libdrm headers from host libdrm-dev into Termux sysroot.
+      # pkg-config finds the Termux libdrm.pc, which advertises
+      # -idirafter <termux>/include/libdrm — but the header files
+      # themselves aren't there. Copy them so the compile succeeds.
+      # ─────────────────────────────────────────────────────────────
+      - name: Copy libdrm headers into Termux sysroot
+        run: |
+          set -euo pipefail
+          SYSROOT=/data/data/com.termux/files/usr
+          mkdir -p "$SYSROOT/include/libdrm"
+
+          # Flat headers (xf86drm.h, xf86drmMode.h)
+          for h in xf86drm.h xf86drmMode.h; do
+            if [ -f "/usr/include/$h" ]; then
+              sudo cp "/usr/include/$h" "$SYSROOT/include/"
+              echo "✔ copied /usr/include/$h"
+            else
+              echo "⚠️  /usr/include/$h not found on host"
+            fi
+          done
+
+          # libdrm subdir headers (drm.h, drm_mode.h, drm_fourcc.h, ...)
+          if [ -d /usr/include/libdrm ]; then
+            sudo cp -a /usr/include/libdrm/*.h "$SYSROOT/include/libdrm/" 2>/dev/null || true
+            # Some subdirs (nouveau, etc.) — copy directories too if present
+            for sub in /usr/include/libdrm/*/; do
+              [ -d "$sub" ] || continue
+              sudo cp -a "$sub" "$SYSROOT/include/libdrm/" 2>/dev/null || true
+            done
+            echo "✔ copied libdrm/*.h"
+          fi
+
+          echo "==== sysroot libdrm headers ===="
+          ls -la "$SYSROOT/include/xf86drm"* 2>/dev/null || true
+          ls -la "$SYSROOT/include/libdrm/" | head -20
 
       - name: Setup pkg-config wrapper
         run: |
@@ -102,10 +137,28 @@ jobs:
           SCRIPT
           sudo chmod +x /usr/local/bin/termux-pkg-config
 
-      # ──────────────────────────────────────────────────────────
-      # Mock headers for things the sysroot lacks
-      # ──────────────────────────────────────────────────────────
-      - name: Inject mock libudev.h
+      - name: Checkout PanVK source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.mesa_branch }}
+          path: mesa
+          fetch-depth: 1
+
+      - name: Report checked-out commit
+        working-directory: mesa
+        run: |
+          git --no-pager log -1 --oneline
+          ls -A | head -40
+
+      - name: Apply essential Termux Bionic patches
+        working-directory: mesa
+        run: |
+          sed -i "s/dependency('libudev',/dependency('libudev', required : false, disabler : true, /g" meson.build
+          sed -i "s/has_header('libudev.h')/false/g" meson.build
+          curl -sSfL "https://raw.githubusercontent.com/termux/termux-packages/master/packages/mesa/0015-define-reallocarray.patch" | patch -N -p1 || true
+          echo "✔ Termux patches applied"
+
+      - name: Inject mock libudev header
         run: |
           sudo tee /data/data/com.termux/files/usr/include/libudev.h > /dev/null << 'EOF'
           #ifndef MOCK_LIBUDEV_H
@@ -126,105 +179,53 @@ jobs:
           static inline const char *udev_device_get_property_value(struct udev_device *d, const char *p) { return 0; }
           #endif
           EOF
-          echo "✔ Mock libudev.h installed"
 
       - name: Inject mock valgrind.h
         run: |
           sudo tee /data/data/com.termux/files/usr/include/valgrind.h > /dev/null << 'EOF'
-          /* Minimal valgrind.h stub — no-ops for all macros Mesa uses.
-           * The Termux sysroot ships valgrind.pc but not valgrind.h, so
-           * meson enables HAVE_VALGRIND and then every #include <valgrind.h>
-           * fails. These stubs satisfy the include without pulling in the
-           * real valgrind headers. */
           #ifndef __MOCK_VALGRIND_H
           #define __MOCK_VALGRIND_H
-
           #define NVALGRIND 1
           #define RUNNING_ON_VALGRIND 0
-
-          #define VALGRIND_CREATE_MEMPOOL(pool, rzB, is_zeroed)          ((void)0)
-          #define VALGRIND_DESTROY_MEMPOOL(pool)                          ((void)0)
-          #define VALGRIND_MEMPOOL_ALLOC(pool, addr, size)                ((void)0)
-          #define VALGRIND_MEMPOOL_FREE(pool, addr)                       ((void)0)
-          #define VALGRIND_MEMPOOL_CHANGE(pool, addrA, addrB, size)       ((void)0)
-          #define VALGRIND_MEMPOOL_EXISTS(pool)                           0
-
-          #define VALGRIND_MAKE_MEM_DEFINED(addr, size)                   ((unsigned)0)
-          #define VALGRIND_MAKE_MEM_UNDEFINED(addr, size)                 ((unsigned)0)
-          #define VALGRIND_MAKE_MEM_NOACCESS(addr, size)                  ((unsigned)0)
-          #define VALGRIND_MAKE_MEM_DEFINED_IF_ADDRESSABLE(addr, size)    ((unsigned)0)
-
-          #define VALGRIND_MALLOCLIKE_BLOCK(addr, sizeB, rzB, is_zeroed)  ((void)0)
-          #define VALGRIND_FREELIKE_BLOCK(addr, rzB)                      ((void)0)
-          #define VALGRIND_RESIZEINPLACE_BLOCK(a, b, c, d)                ((void)0)
-
-          #define VALGRIND_CHECK_MEM_IS_DEFINED(addr, size)               ((void)0)
-          #define VALGRIND_CHECK_MEM_IS_ADDRESSABLE(addr, size)           ((void)0)
-          #define VALGRIND_CHECK_VALUE_IS_DEFINED(value)                  ((void)0)
-
-          #define VALGRIND_DISCARD_TRANSLATIONS(addr, size)               ((void)0)
-          #define VALGRIND_DO_LEAK_CHECK                                  ((void)0)
-          #define VALGRIND_DO_ADDED_LEAK_CHECK                            ((void)0)
-          #define VALGRIND_DO_CHANGED_LEAK_CHECK                          ((void)0)
-          #define VALGRIND_DO_NEW_LEAK_CHECK                              ((void)0)
-          #define VALGRIND_DO_QUICK_LEAK_CHECK                            ((void)0)
-
-          #define VALGRIND_COUNT_ERRORS                                   0
-          #define VALGRIND_COUNT_LEAKS(a, b, c, d)                        ((void)0)
-          #define VALGRIND_COUNT_LEAK_BLOCKS(a, b, c, d)                  ((void)0)
-
-          #define VALGRIND_GET_VBITS(addr, vbits, size)                   ((unsigned)0)
-          #define VALGRIND_SET_VBITS(addr, vbits, size)                   ((unsigned)0)
-
-          #define VALGRIND_PRINTF(...)                                    ((void)0)
-          #define VALGRIND_PRINTF_BACKTRACE(...)                          ((void)0)
-
-          #define VALGRIND_STACK_REGISTER(start, end)                     0
-          #define VALGRIND_STACK_DEREGISTER(id)                           ((void)0)
-          #define VALGRIND_STACK_CHANGE(id, start, end)                   ((void)0)
-
-          #define VALGRIND_HG_DISABLE_CHECKING(addr, len)                 ((void)0)
-          #define VALGRIND_HG_ENABLE_CHECKING(addr, len)                  ((void)0)
-
-          #define VALGRIND_CLO_CHANGE(flag)                               ((void)0)
-
+          #define VALGRIND_CREATE_MEMPOOL(a, b, c)          ((void)0)
+          #define VALGRIND_DESTROY_MEMPOOL(a)               ((void)0)
+          #define VALGRIND_MEMPOOL_ALLOC(a, b, c)           ((void)0)
+          #define VALGRIND_MEMPOOL_FREE(a, b)               ((void)0)
+          #define VALGRIND_MEMPOOL_CHANGE(a, b, c, d)       ((void)0)
+          #define VALGRIND_MEMPOOL_EXISTS(a)                0
+          #define VALGRIND_MAKE_MEM_DEFINED(a, b)           ((unsigned)0)
+          #define VALGRIND_MAKE_MEM_UNDEFINED(a, b)         ((unsigned)0)
+          #define VALGRIND_MAKE_MEM_NOACCESS(a, b)          ((unsigned)0)
+          #define VALGRIND_MAKE_MEM_DEFINED_IF_ADDRESSABLE(a, b) ((unsigned)0)
+          #define VALGRIND_MALLOCLIKE_BLOCK(a, b, c, d)     ((void)0)
+          #define VALGRIND_FREELIKE_BLOCK(a, b)             ((void)0)
+          #define VALGRIND_RESIZEINPLACE_BLOCK(a, b, c, d)  ((void)0)
+          #define VALGRIND_CHECK_MEM_IS_DEFINED(a, b)       ((void)0)
+          #define VALGRIND_CHECK_MEM_IS_ADDRESSABLE(a, b)   ((void)0)
+          #define VALGRIND_CHECK_VALUE_IS_DEFINED(a)        ((void)0)
+          #define VALGRIND_DISCARD_TRANSLATIONS(a, b)       ((void)0)
+          #define VALGRIND_DO_LEAK_CHECK                    ((void)0)
+          #define VALGRIND_DO_ADDED_LEAK_CHECK              ((void)0)
+          #define VALGRIND_DO_CHANGED_LEAK_CHECK            ((void)0)
+          #define VALGRIND_DO_NEW_LEAK_CHECK                ((void)0)
+          #define VALGRIND_DO_QUICK_LEAK_CHECK              ((void)0)
+          #define VALGRIND_COUNT_ERRORS                     0
+          #define VALGRIND_COUNT_LEAKS(a, b, c, d)          ((void)0)
+          #define VALGRIND_COUNT_LEAK_BLOCKS(a, b, c, d)    ((void)0)
+          #define VALGRIND_GET_VBITS(a, b, c)               ((unsigned)0)
+          #define VALGRIND_SET_VBITS(a, b, c)               ((unsigned)0)
+          #define VALGRIND_PRINTF(...)                      ((void)0)
+          #define VALGRIND_PRINTF_BACKTRACE(...)            ((void)0)
+          #define VALGRIND_STACK_REGISTER(a, b)             0
+          #define VALGRIND_STACK_DEREGISTER(a)              ((void)0)
+          #define VALGRIND_STACK_CHANGE(a, b, c)            ((void)0)
+          #define VALGRIND_HG_DISABLE_CHECKING(a, b)        ((void)0)
+          #define VALGRIND_HG_ENABLE_CHECKING(a, b)         ((void)0)
+          #define VALGRIND_CLO_CHANGE(a)                    ((void)0)
           #define __VALGRIND_MAJOR__ 3
           #define __VALGRIND_MINOR__ 22
-
-          #endif /* __MOCK_VALGRIND_H */
+          #endif
           EOF
-          echo "✔ Mock valgrind.h installed"
-          ls -lh /data/data/com.termux/files/usr/include/valgrind.h
-
-      # ──────────────────────────────────────────────────────────
-      # Source checkout + Termux patches
-      # ──────────────────────────────────────────────────────────
-      - name: Checkout PanVK source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.mesa_branch }}
-          path: mesa
-          fetch-depth: 1
-
-      - name: Report checked-out commit
-        working-directory: mesa
-        run: |
-          git --no-pager log -1 --oneline
-          ls -A | head -40
-
-      - name: Apply essential Termux Bionic patches
-        working-directory: mesa
-        run: |
-          sed -i "s/dependency('libudev',/dependency('libudev', required : false, disabler : true, /g" meson.build
-          sed -i "s/has_header('libudev.h')/false/g" meson.build
-
-          apply_termux_patch() {
-            local patchfile="$1"
-            echo "Applying $patchfile..."
-            curl -sSfL "https://raw.githubusercontent.com/termux/termux-packages/master/packages/mesa/$patchfile" | patch -N -p1 || true
-          }
-          apply_termux_patch "0015-define-reallocarray.patch"
-          echo "✔ Termux patches applied"
 
       - name: Override Vulkan API version (optional)
         if: github.event.inputs.api_override != ''
@@ -232,20 +233,21 @@ jobs:
         run: |
           VER="${{ github.event.inputs.api_override }}"
           DEVFILE="src/panfrost/vulkan/panvk_physical_device.c"
-          if [ ! -f "$DEVFILE" ]; then
-            echo "❌ $DEVFILE not found"
-            exit 1
-          fi
+          [ -f "$DEVFILE" ] || { echo "❌ $DEVFILE not found"; exit 1; }
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
-          echo "Forced API version to $VER"
 
-      # ──────────────────────────────────────────────────────────
-      # Host tools build
-      # ──────────────────────────────────────────────────────────
-      - name: Configure host tools build (native, LLVM enabled)
+      # ─────────────────────────────────────────────────────────────
+      # PASS 1 — Host tools (native x86_64, LLVM 19)
+      # ─────────────────────────────────────────────────────────────
+      - name: Configure host tools (native)
         working-directory: mesa
+        env:
+          CC: clang-19
+          CXX: clang++-19
+          LLVM_CONFIG: /usr/bin/llvm-config-19
         run: |
           meson setup build-host \
+            --buildtype=release \
             -Dplatforms=[] \
             -Dgallium-drivers=[] \
             -Dvulkan-drivers=[] \
@@ -253,37 +255,43 @@ jobs:
             -Dprecomp-compiler=enabled \
             -Dinstall-precomp-compiler=true \
             -Dllvm=enabled \
-            -Dmesa-clc=enabled \
-            -Dinstall-mesa-clc=true
+            -Dmesa-clc=enabled -Dinstall-mesa-clc=true
 
-      - name: Build host tools
+      - name: Build host tools (native)
         working-directory: mesa
+        env:
+          CC: clang-19
+          CXX: clang++-19
+          LLVM_CONFIG: /usr/bin/llvm-config-19
         run: |
           ninja -C build-host \
             src/compiler/clc/mesa_clc \
             src/compiler/spirv/vtn_bindgen2 \
             src/panfrost/clc/panfrost_compile
+          find build-host -type f -executable \
+            \( -name 'mesa_clc' -o -name 'vtn_bindgen2' -o -name 'panfrost_compile' \) -print
 
-      - name: Stage host tools on PATH
-        working-directory: mesa
+      - name: Stage host tools on PATH (dashed + underscored)
         run: |
-          ln -sf "build-host/src/compiler/clc/mesa_clc"       "build-host/src/compiler/clc/mesa-clc"
-          ln -sf "build-host/src/compiler/spirv/vtn_bindgen2" "build-host/src/compiler/spirv/vtn-bindgen2"
-          ln -sf "build-host/src/panfrost/clc/panfrost_compile" \
-                 "build-host/src/compiler/spirv/panfrost-compile"
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/host-bin"
+          for name in mesa_clc vtn_bindgen2 panfrost_compile; do
+            bin=$(find "$GITHUB_WORKSPACE/mesa/build-host" -type f -executable -name "$name" | head -n1)
+            if [ -z "$bin" ]; then
+              echo "❌ $name not found in build-host"
+              exit 1
+            fi
+            dashed=$(echo "$name" | tr '_' '-')
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
+            echo "✔ staged $name -> $dashed"
+          done
+          ls -la "$GITHUB_WORKSPACE/host-bin/"
+          echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
-          echo "==== host tools ===="
-          ls -lh build-host/src/compiler/clc/mesa_clc \
-                 build-host/src/compiler/spirv/vtn_bindgen2 \
-                 build-host/src/panfrost/clc/panfrost_compile
-
-          HOST_TOOLS="$PWD/build-host/src/compiler/clc:$PWD/build-host/src/compiler/spirv:$PWD/build-host/src/panfrost/clc"
-          echo "HOST_TOOLS=$HOST_TOOLS" >> "$GITHUB_ENV"
-          echo "Added to PATH: $HOST_TOOLS"
-
-      # ──────────────────────────────────────────────────────────
-      # Cross build
-      # ──────────────────────────────────────────────────────────
+      # ─────────────────────────────────────────────────────────────
+      # PASS 2 — Cross build for aarch64-linux-android
+      # ─────────────────────────────────────────────────────────────
       - name: Create Meson cross file
         run: |
           TARGET="aarch64-linux-android"
@@ -291,7 +299,7 @@ jobs:
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           cat > ~/cross_file.txt << EOF
           [host_machine]
-          system = 'linux'
+          system = 'android'
           cpu_family = 'aarch64'
           cpu = 'aarch64'
           endian = 'little'
@@ -302,45 +310,54 @@ jobs:
           ar = '${NDK_BIN}/llvm-ar'
           strip = '${NDK_BIN}/llvm-strip'
           pkg-config = 'termux-pkg-config'
+
+          [properties]
+          needs_exe_wrapper = true
           EOF
           cat ~/cross_file.txt
 
-      - name: Configure Mesa (PanVK + Android + kbase, host tools)
-        env:
-          PATH: ${{ env.HOST_TOOLS }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - name: Configure PanVK (cross, uses host CLC)
         run: |
           meson setup build mesa \
             --cross-file ~/cross_file.txt \
-            -Dvulkan-drivers=panfrost \
-            -Dgallium-drivers= \
+            --buildtype=release \
             -Dplatforms=android \
             -Dplatform-sdk-version=29 \
             -Dandroid-stub=true \
             -Dandroid-libbacktrace=disabled \
+            -Dvulkan-drivers=panfrost \
+            -Dgallium-drivers= \
+            -Dpanfrost-kmds=kbase,panthor \
+            -Dpanvk-use-kbase=true \
             -Dllvm=disabled \
             -Dmesa-clc=system \
             -Dprecomp-compiler=system \
-            -Dbuildtype=release \
-            -Dprefix=/usr \
-            -Dstrip=true \
+            -Dspirv-tools=disabled \
             -Dglx=disabled \
             -Dgbm=disabled \
             -Dopengl=false \
             -Degl=disabled \
             -Dgles1=disabled \
             -Dgles2=disabled \
-            -Dpanfrost-kmds=kbase,panthor \
-            -Dpanvk-use-kbase=true \
+            -Dshader-cache=disabled \
             -Dxmlconfig=disabled \
-            -Dvalgrind=disabled
+            -Dexpat=disabled \
+            -Dlibunwind=disabled \
+            -Dzstd=disabled \
+            -Dvideo-codecs= \
+            -Dperfetto=false \
+            -Dprefix=/usr \
+            -Dstrip=true
 
       - name: Build PanVK ICD
         env:
-          PATH: ${{ env.HOST_TOOLS }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        run: ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
+          PATH: ${{ github.workspace }}/host-bin:/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
 
       - name: Package PanVK artifact
         run: |
+          set -euo pipefail
           mkdir -p panvk_out/lib panvk_out/share/vulkan/icd.d
 
           SO=$(find build/src/panfrost/vulkan -maxdepth 1 -name 'libvulkan_panfrost.so' -print -quit)
@@ -374,8 +391,8 @@ jobs:
         with:
           name: panvk-build-logs
           path: |
+            build/meson-logs/
             mesa/build-host/meson-logs/
-            mesa/build/meson-logs/
           if-no-files-found: ignore
 
       - name: Upload release assets
