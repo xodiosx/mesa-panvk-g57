@@ -179,17 +179,7 @@ prepare_tex_descs(struct panvk_image_view *view)
             pan_unpack(&view->descs.tex[0], TEXTURE, texture);
             pan_unpack((const struct mali_generic_plane_packed *)ptr.cpu,
                        GENERIC_PLANE, plane);
-            fprintf(stderr,
-                    "PANVKDBG COPY_TEXTURE image=%p view=%p surfaces=%016llx "
-                    "payload_gpu=%016llx SRC=%016llx size=%llu row_stride=%llu "
-                    "mip=%u layer=%u\n",
-                    (void *)image, (void *)view,
-                    (unsigned long long)texture.surfaces,
-                    (unsigned long long)ptr.gpu,
-                    (unsigned long long)plane.pointer,
-                    (unsigned long long)plane.size,
-                    (unsigned long long)plane.row_stride, pview.first_level,
-                    pview.first_layer_or_z_slice);
+            (void)0;
          }
 #endif
 #if PAN_ARCH >= 9

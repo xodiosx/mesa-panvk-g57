@@ -391,9 +391,8 @@ panvk_image_get_mod(struct panvk_image *image,
     * CPU/software presentation path.  Do not let modifier selection choose
     * AFBC while testing that path.
     */
-   if (iusage.wsi) {
-      fprintf(stderr,
-              "PANVKDBG WSI image: forcing LINEAR modifier\n");
+   if (iusage.wsi || getenv("PANVK_NO_AFBC")) {
+      (void)0;
       return DRM_FORMAT_MOD_LINEAR;
    }
 
@@ -1364,17 +1363,7 @@ panvk_image_bind(struct panvk_device *dev,
 
    assert(mem);
 
-   fprintf(stderr,
-           "PANVKDBG IMAGE_BIND img=%p mem=%p memdev=%016llx offset=%016llx "
-           "modifier=%016llx planes=%u format=%u usage=%016llx\n",
-           (void *)image,
-           (void *)mem,
-           (unsigned long long)mem->addr.dev,
-           (unsigned long long)offset,
-           (unsigned long long)image->vk.drm_format_mod,
-           image->plane_count,
-           image->vk.format,
-           (unsigned long long)image->vk.usage);
+   (void)0;
 
    if (is_disjoint(image)) {
       const VkBindImagePlaneMemoryInfo *plane_info =
@@ -1393,13 +1382,7 @@ panvk_image_bind(struct panvk_device *dev,
       for (unsigned plane = 0; plane < image->plane_count; plane++) {
          panvk_image_plane_bind_mem(dev, &image->planes[plane], mem, offset);
 
-         fprintf(stderr,
-                 "PANVKDBG IMAGE_PLANE img=%p plane=%u base=%016llx "
-                 "mem_offset=%016llx\n",
-                 (void *)image,
-                 plane,
-                 (unsigned long long)image->planes[plane].plane.base,
-                 (unsigned long long)image->planes[plane].mem_offset);
+         (void)0;
       }
 
       panvk_image_report_binding(dev, image,
