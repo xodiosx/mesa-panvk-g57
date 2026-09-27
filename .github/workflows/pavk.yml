@@ -1,4 +1,4 @@
-name: Build PanVK G57 for Android (AHB + kbase)
+name: Build PanVK G57 for Android (AHB + kbase, two-pass)
 
 on:
   workflow_dispatch:
@@ -22,13 +22,17 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
-      - name: Install host build tools (pip meson 1.4.0)
+      - name: Install host build tools
         run: |
           sudo apt update
           sudo apt install -y ninja-build pkg-config python3-mako python3-pip \
-            glslang-tools flex bison curl ca-certificates cmake
+            glslang-tools flex bison curl ca-certificates cmake \
+            clang-19 llvm-19-dev libclang-19-dev libclang-cpp19-dev \
+            libclc-19 libclc-19-dev libllvmspirvlib-19-dev \
+            libdrm-dev zlib1g-dev libelf-dev spirv-tools \
+            libexpat1-dev libzstd-dev
           pip install --user meson==1.4.0
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
@@ -42,7 +46,7 @@ jobs:
           echo "ANDROID_NDK_ROOT=/opt/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
           chmod +x /opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/*
 
-      - name: Setup Termux sysroot (provides X11 + spirv-tools + real Android headers)
+      - name: Setup Termux sysroot (X11 + real Android headers)
         run: |
           mkdir termux && cd termux
           wget -q https://github.com/xodiosx/Wine-arm64ce/releases/download/wine-14/termux-rootfs.tar
@@ -52,48 +56,34 @@ jobs:
           mkdir -p /data/data/com.termux/files/usr/tmp
           sudo chmod -R a+rX /data/data/com.termux/files/usr
 
-      - name: Provide android_lf.h to Termux sysroot
+      - name: Provide android_lf.h
         run: |
           NDK_HEADER=$(find /opt/android-ndk-r27c -name android_lf.h -print -quit)
           if [ -n "$NDK_HEADER" ]; then
             sudo cp "$NDK_HEADER" /data/data/com.termux/files/usr/include/
-            echo "Copied $NDK_HEADER"
           else
-            echo "WARNING: android_lf.h not found in NDK"
             sudo touch /data/data/com.termux/files/usr/include/android_lf.h
           fi
 
-      - name: Install X11 + SPIRV-Tools + AHB headers into Termux sysroot
+      - name: Install extra Termux debs
         run: |
           mkdir -p /tmp/debs && cd /tmp/debs
-
           fetch_deb() {
-            local pkg=$1
-            local url=$2
+            local pkg=$1 url=$2
             local file=$(curl -sL "$url" | grep -oE "${pkg}_[^\"<>]+_aarch64\.deb" | head -n 1)
-            if [ -z "$file" ]; then
-              echo "❌ Failed to find $pkg at $url"
-              return 1
-            fi
-            echo "⬇️ Downloading $file..."
-            wget -q "${url}${file}"
+            [ -z "$file" ] && { echo "⚠️ $pkg not found"; return 0; }
+            wget -q "${url}${file}" || true
           }
-
           fetch_deb "libxkbcommon" "https://packages.termux.dev/apt/termux-x11/pool/main/libx/libxkbcommon/" || true
-          fetch_deb "spirv-tools"  "https://packages.termux.dev/apt/termux-main/pool/main/s/spirv-tools/" || true
           fetch_deb "libxcb"       "https://packages.termux.dev/apt/termux-main/pool/main/libx/libxcb/" || true
-
           for deb in *.deb; do
-            echo "📦 Extracting $deb..."
+            [ -e "$deb" ] || continue
             dpkg-deb -x "$deb" /tmp/debs/extracted/
           done
-
           sudo cp -r /tmp/debs/extracted/data/data/com.termux/files/usr/* \
                      /data/data/com.termux/files/usr/ 2>/dev/null || true
-          sudo chmod -R 755 /data/data/com.termux/files/usr/lib 2>/dev/null || true
-          sudo chmod -R 755 /data/data/com.termux/files/usr/include 2>/dev/null || true
 
-      - name: Setup pkg-config wrapper (avoids host header conflicts)
+      - name: Setup pkg-config wrapper
         run: |
           sudo tee /usr/local/bin/termux-pkg-config > /dev/null << 'SCRIPT'
           #!/bin/bash
@@ -103,9 +93,6 @@ jobs:
           SCRIPT
           sudo chmod +x /usr/local/bin/termux-pkg-config
 
-      # ----------------------------------------------------------------------
-      # Checkout our repo (this repo, at the branch the user asked for)
-      # ----------------------------------------------------------------------
       - name: Checkout PanVK source
         uses: actions/checkout@v4
         with:
@@ -117,24 +104,14 @@ jobs:
         working-directory: mesa
         run: |
           git --no-pager log -1 --oneline
-          echo "---- top-level ----"
-          ls -A | head -60
+          ls -A | head -40
 
-      # ----------------------------------------------------------------------
-      # Apply essential Termux Bionic patches (same set as the Turnip build)
-      # ----------------------------------------------------------------------
       - name: Apply essential Termux Bionic patches
         working-directory: mesa
         run: |
           sed -i "s/dependency('libudev',/dependency('libudev', required : false, disabler : true, /g" meson.build
           sed -i "s/has_header('libudev.h')/false/g" meson.build
-
-          apply_termux_patch() {
-            local patchfile="$1"
-            echo "Applying $patchfile..."
-            curl -sSfL "https://raw.githubusercontent.com/termux/termux-packages/master/packages/mesa/$patchfile" | patch -N -p1 || true
-          }
-          apply_termux_patch "0015-define-reallocarray.patch"
+          curl -sSfL "https://raw.githubusercontent.com/termux/termux-packages/master/packages/mesa/0015-define-reallocarray.patch" | patch -N -p1 || true
           echo "✔ Termux patches applied"
 
       - name: Inject mock libudev header
@@ -143,20 +120,11 @@ jobs:
           #ifndef MOCK_LIBUDEV_H
           #define MOCK_LIBUDEV_H
           #include <pthread.h>
-          #ifndef PTHREAD_CANCEL_ASYNCHRONOUS
-          #define PTHREAD_CANCEL_ASYNCHRONOUS 0
-          #endif
-          #ifndef PTHREAD_CANCEL_ENABLE
-          #define PTHREAD_CANCEL_ENABLE 1
-          #endif
-          static inline int pthread_setcanceltype(int type, int *oldtype) { return 0; }
-          static inline int pthread_setcancelstate(int state, int *oldstate) { return 0; }
-          static inline int pthread_cancel(pthread_t thread) { return 0; }
+          static inline int pthread_setcanceltype(int t, int *o) { return 0; }
+          static inline int pthread_setcancelstate(int s, int *o) { return 0; }
+          static inline int pthread_cancel(pthread_t t) { return 0; }
           static inline void pthread_testcancel(void) {}
-          struct udev;
-          struct udev_device;
-          struct udev_monitor;
-          struct udev_enumerate;
+          struct udev; struct udev_device; struct udev_monitor; struct udev_enumerate;
           static inline struct udev *udev_new(void) { return 0; }
           static inline struct udev *udev_ref(struct udev *u) { return u; }
           static inline void udev_unref(struct udev *u) {}
@@ -167,40 +135,97 @@ jobs:
           static inline const char *udev_device_get_property_value(struct udev_device *d, const char *p) { return 0; }
           #endif
           EOF
-          echo "✔ Mock libudev.h installed"
 
-      # ----------------------------------------------------------------------
-      # Optional API version override, same trick as the Turnip build but
-      # pointed at the PanVK device file
-      # ----------------------------------------------------------------------
       - name: Override Vulkan API version (optional)
         if: github.event.inputs.api_override != ''
         working-directory: mesa
         run: |
           VER="${{ github.event.inputs.api_override }}"
-          DEVFILE=$(find src/panfrost/vulkan -maxdepth 1 -name 'panvk_physical_device.c' -print -quit)
-          if [ -z "$DEVFILE" ]; then
-            echo "❌ Could not find panvk_physical_device.c"
-            exit 1
-          fi
-          echo "Forcing Vulkan API version to $VER in $DEVFILE"
+          DEVFILE="src/panfrost/vulkan/panvk_physical_device.c"
+          [ -f "$DEVFILE" ] || { echo "❌ $DEVFILE not found"; exit 1; }
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
 
-      # ----------------------------------------------------------------------
-      # Cross file, same shape as the Turnip one
-      # ----------------------------------------------------------------------
-      - name: Create Meson cross file for aarch64
+      # ───────────────────────────────────────────────────────────────
+      # PASS 1 — Host tools (native x86_64, LLVM enabled)
+      #
+      # mesa_clc        — compiles GLSL/SPIR-V at build time
+      # vtn_bindgen2    — SPIR-V → NIR binding generator
+      # panfrost_compile— PanVK-specific shader compiler
+      #
+      # These produce x86_64 binaries that run on the runner. The
+      # cross build then uses them via -Dmesa-clc=system
+      # -Dprecomp-compiler=system, avoiding LLVM on the target.
+      # ───────────────────────────────────────────────────────────────
+      - name: Configure host tools (native)
+        working-directory: mesa
+        env:
+          CC: clang-19
+          CXX: clang++-19
+          LLVM_CONFIG: /usr/bin/llvm-config-19
         run: |
-          CPU_FAMILY="aarch64"
-          CPU="aarch64"
+          meson setup build-host \
+            --buildtype=release \
+            -Dplatforms=[] \
+            -Dgallium-drivers=[] \
+            -Dvulkan-drivers=[] \
+            -Dtools=panfrost \
+            -Dprecomp-compiler=enabled \
+            -Dinstall-precomp-compiler=true \
+            -Dllvm=enabled \
+            -Dmesa-clc=enabled -Dinstall-mesa-clc=true
+
+      - name: Build host tools (native)
+        working-directory: mesa
+        env:
+          CC: clang-19
+          CXX: clang++-19
+          LLVM_CONFIG: /usr/bin/llvm-config-19
+        run: |
+          ninja -C build-host \
+            src/compiler/clc/mesa_clc \
+            src/compiler/spirv/vtn_bindgen2 \
+            src/panfrost/clc/panfrost_compile
+
+          echo "==== locate the built binaries ===="
+          find build-host -type f -executable \
+            \( -name 'mesa_clc' -o -name 'vtn_bindgen2' -o -name 'panfrost_compile' \) -print
+
+      - name: Stage host tools on PATH (dashed + underscored)
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/host-bin"
+          for name in mesa_clc vtn_bindgen2 panfrost_compile; do
+            bin=$(find "$GITHUB_WORKSPACE/mesa/build-host" -type f -executable -name "$name" | head -n1)
+            if [ -z "$bin" ]; then
+              echo "❌ $name not found in build-host"
+              exit 1
+            fi
+            dashed=$(echo "$name" | tr '_' '-')
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
+            echo "✔ staged $name -> $dashed"
+          done
+          echo "==== host-bin contents ===="
+          ls -la "$GITHUB_WORKSPACE/host-bin/"
+          echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
+
+      # ───────────────────────────────────────────────────────────────
+      # PASS 2 — Cross build for aarch64-linux-android
+      #
+      # LLVM off, CLC off, but precomp-compiler=system tells mesa
+      # "don't build CLC, just use the host binaries you find on PATH".
+      # That's how the reference tree avoids LLVM on the target.
+      # ───────────────────────────────────────────────────────────────
+      - name: Create Meson cross file
+        run: |
           TARGET="aarch64-linux-android"
           API=29
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           cat > ~/cross_file.txt << EOF
           [host_machine]
-          system = 'linux'
-          cpu_family = '${CPU_FAMILY}'
-          cpu = '${CPU}'
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
           endian = 'little'
 
           [binaries]
@@ -209,47 +234,58 @@ jobs:
           ar = '${NDK_BIN}/llvm-ar'
           strip = '${NDK_BIN}/llvm-strip'
           pkg-config = 'termux-pkg-config'
+
+          [properties]
+          needs_exe_wrapper = true
           EOF
           cat ~/cross_file.txt
 
-      # ----------------------------------------------------------------------
-      # Configure PanVK (kbase + panthor, android platform, AHB support)
-      # ----------------------------------------------------------------------
-      - name: Configure Mesa (PanVK + Android + kbase)
+      - name: Configure PanVK (cross, uses host CLC)
         run: |
           meson setup build mesa \
             --cross-file ~/cross_file.txt \
-            -Dvulkan-drivers=panfrost \
-            -Dgallium-drivers= \
+            --buildtype=release \
             -Dplatforms=android \
             -Dplatform-sdk-version=29 \
             -Dandroid-stub=true \
             -Dandroid-libbacktrace=disabled \
+            -Dvulkan-drivers=panfrost \
+            -Dgallium-drivers= \
+            -Dpanfrost-kmds=kbase,panthor \
+            -Dpanvk-use-kbase=true \
             -Dllvm=disabled \
-            -Dbuildtype=release \
-            -Dprefix=/usr \
-            -Dstrip=true \
+            -Dmesa-clc=system \
+            -Dprecomp-compiler=system \
+            -Dspirv-tools=disabled \
             -Dglx=disabled \
             -Dgbm=disabled \
             -Dopengl=false \
             -Degl=disabled \
             -Dgles1=disabled \
             -Dgles2=disabled \
-            -Dpanfrost-kmds=kbase,panthor \
-            -Dpanvk-use-kbase=true \
+            -Dshader-cache=disabled \
             -Dxmlconfig=disabled \
-            -Dvalgrind=disabled
+            -Dexpat=disabled \
+            -Dlibunwind=disabled \
+            -Dzstd=disabled \
+            -Dvideo-codecs= \
+            -Dperfetto=false \
+            -Dprefix=/usr \
+            -Dstrip=true
 
       - name: Build PanVK ICD
-        run: ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
+        env:
+          PATH: ${{ github.workspace }}/host-bin:/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
 
-      # ----------------------------------------------------------------------
-      # Package: ICD .so + AHB-capable manifest
-      # ----------------------------------------------------------------------
+      # ───────────────────────────────────────────────────────────────
+      # Package
+      # ───────────────────────────────────────────────────────────────
       - name: Package PanVK artifact
         run: |
-          mkdir -p panvk_out/lib
-          mkdir -p panvk_out/share/vulkan/icd.d
+          set -euo pipefail
+          mkdir -p panvk_out/lib panvk_out/share/vulkan/icd.d
 
           SO=$(find build/src/panfrost/vulkan -maxdepth 1 -name 'libvulkan_panfrost.so' -print -quit)
           if [ -z "$SO" ]; then
@@ -273,8 +309,6 @@ jobs:
           JSON
 
           ls -lh panvk_out/lib/
-          cat panvk_out/share/vulkan/icd.d/panfrost_icd.aarch64.json
-
           tar -cJf panvk-${{ github.event.inputs.mesa_branch }}-aarch64.tar.xz -C panvk_out .
           ls -lh panvk-*.tar.xz
 
@@ -283,7 +317,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: panvk-build-logs
-          path: build/meson-logs/
+          path: |
+            build/meson-logs/
+            mesa/build-host/meson-logs/
           if-no-files-found: ignore
 
       - name: Upload release assets
