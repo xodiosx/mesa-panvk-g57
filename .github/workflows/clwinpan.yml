@@ -1,4 +1,4 @@
-name: sync winlator-pan from mexicanbr0auth/mesa-panvk-g57
+name: sync winlator-pan (AHB + Winlator + AdrenoTools only)
 
 on:
   workflow_dispatch:
@@ -10,17 +10,42 @@ permissions:
 
 jobs:
   sync:
-    name: Mirror reference tree onto winlator-pan
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      BASE_REPO:   "${{ github.repository }}"
+      # Branch being synced and pushed.
       BASE_BRANCH: "winlator-pan"
+      # Reference source for the AHB / Winlator / AdrenoTools changes.
       REF_REPO:    "mexicanbr0auth/mesa-panvk-g57"
       REF_BRANCH:  "winlatormali-ci"
+      # Set this if your repo's default branch is NOT `main`.
+      # Leave empty to auto-detect from `git ls-remote --symref`.
+      BASE_MAIN_OVERRIDE: ""
     steps:
       # ──────────────────────────────────────────────────────────
-      # 1) Checkout the base branch with push credentials.
+      # 0) Print what we're about to do, so the log is self-explaining.
+      # ──────────────────────────────────────────────────────────
+      - name: Explain the sync plan
+        run: |
+          cat <<'EOF'
+          =================================================================
+          Sync plan
+          -----------------------------------------------------------------
+          1. Checkout          winlator-pan         (the branch we push back to)
+          2. Clone             <default branch>     (pristine base, latest)
+          3. Clone             mexicanbr0auth@winlatormali-ci  (reference)
+          4. Diff 1:           winlator-pan vs reference         -> artifact
+          5. Overlay reference into workspace
+          6. Restore every non-AHB/non-Winlator/non-AdrenoTools file
+             from the freshly cloned default branch
+          7. Diff 2:           restored workspace vs reference   -> artifact
+          8. Upload both diffs
+          9. Force-push workspace to winlator-pan
+          =================================================================
+          EOF
+
+      # ──────────────────────────────────────────────────────────
+      # 1) Checkout the branch we're going to sync.
       # ──────────────────────────────────────────────────────────
       - name: Checkout ${{ env.BASE_BRANCH }}
         uses: actions/checkout@v4
@@ -29,75 +54,130 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Configure git identity
+      - name: Configure git
         run: |
           set -euo pipefail
           git config --local user.email "github-actions@users.noreply.github.com"
           git config --local user.name  "github-actions"
           git remote set-url origin \
             "https://x-access-token:${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
-          echo "==== remote ===="
           git remote -v
-          echo "==== base HEAD ===="
+          echo "==== $BASE_BRANCH HEAD ===="
           git --no-pager log -1 --oneline
 
       # ──────────────────────────────────────────────────────────
-      # 2) Clone the reference fork. List branches first so we
-      #    can see exactly what exists, then fall back through
-      #    candidates if the preferred name is missing.
+      # 2) Resolve the default branch of THIS repo.
+      #    Explicit, logged, exportable. Fails loudly if undetectable.
+      # ──────────────────────────────────────────────────────────
+      - name: Resolve default branch of ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$BASE_MAIN_OVERRIDE" ]]; then
+            DEFAULT="$BASE_MAIN_OVERRIDE"
+            echo ">>> using explicit override: $DEFAULT"
+          else
+            echo "==== querying default branch via symref ===="
+            SYMREF=$(git ls-remote --symref \
+                       "https://github.com/${{ github.repository }}.git" HEAD)
+            echo "$SYMREF"
+            DEFAULT=$(echo "$SYMREF" \
+                      | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')
+          fi
+
+          if [[ -z "$DEFAULT" ]]; then
+            echo "ERROR: could not determine default branch."
+            echo "Set BASE_MAIN_OVERRIDE in the workflow env to fix."
+            exit 1
+          fi
+
+          echo ">>> default branch is: $DEFAULT"
+          echo "BASE_MAIN=$DEFAULT" >> "$GITHUB_ENV"
+
+      # ──────────────────────────────────────────────────────────
+      # 3) Clone the default branch fresh. This is the pristine
+      #    source of truth we restore files from. It's cloned on
+      #    every run so any push to main is picked up immediately.
+      # ──────────────────────────────────────────────────────────
+      - name: Clone ${{ env.BASE_MAIN }} from ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/base-main
+
+          echo "==== cloning ${{ github.repository }} @ $BASE_MAIN ===="
+          git clone --depth 1 --branch "$BASE_MAIN" \
+            "https://github.com/${{ github.repository }}.git" \
+            /tmp/base-main
+
+          # Snapshot the commit so the artifact is self-describing.
+          BASE_MAIN_SHA=$(git -C /tmp/base-main rev-parse HEAD)
+          echo "BASE_MAIN_SHA=$BASE_MAIN_SHA" >> "$GITHUB_ENV"
+          echo ">>> $BASE_MAIN @ $BASE_MAIN_SHA"
+
+          # Strip .git so diff / copy never walk into it.
+          rm -rf /tmp/base-main/.git
+
+          echo "==== base-main top-level ===="
+          ls -A /tmp/base-main | head -60
+
+          echo
+          echo "==== sanity: is this the base repo? ===="
+          for f in \
+            src/panfrost/vulkan/panvk_instance.c \
+            src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c \
+            src/vulkan/wsi/wsi_common.c
+          do
+            if [[ -f "/tmp/base-main/$f" ]]; then
+              echo "  OK   $f"
+            else
+              echo "  MISS $f  <- base main might be a different tree"
+            fi
+          done
+
+      # ──────────────────────────────────────────────────────────
+      # 4) Clone the reference (mexicanbr0auth).
       # ──────────────────────────────────────────────────────────
       - name: Clone reference (${{ env.REF_REPO }})
         run: |
           set -euo pipefail
-          REF_DIR=/tmp/ref
-          rm -rf "$REF_DIR"
+          rm -rf /tmp/ref
 
           echo "==== branches available in $REF_REPO ===="
           git ls-remote --heads "https://github.com/$REF_REPO.git" \
             | awk '{print "  " $2}' | sed 's|refs/heads/||' | sort
 
-          echo
-          echo "==== selecting reference branch (preferred: $REF_BRANCH) ===="
           CANDIDATES="$REF_BRANCH winlatormali-ci winlator-cl winlator main master"
-          USED_REF=""
+          USED=""
           for br in $CANDIDATES; do
             if git ls-remote --heads "https://github.com/$REF_REPO.git" \
                  "refs/heads/$br" 2>/dev/null | grep -q "refs/heads/$br"; then
-              USED_REF="$br"
-              echo ">>> matched candidate: $br"
-              break
+              USED="$br"; echo ">>> matched: $br"; break
             fi
           done
-          if [[ -z "$USED_REF" ]]; then
-            USED_REF=$(git ls-remote --symref \
-                         "https://github.com/$REF_REPO.git" HEAD 2>/dev/null \
-                       | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
+          if [[ -z "$USED" ]]; then
+            USED=$(git ls-remote --symref \
+                     "https://github.com/$REF_REPO.git" HEAD 2>/dev/null \
+                   | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')
           fi
-          [[ -n "$USED_REF" ]] || { echo "ERROR: no usable branch from $REF_REPO" >&2; exit 1; }
-          echo "REF_BRANCH_USED=$USED_REF" >> "$GITHUB_ENV"
+          [[ -n "$USED" ]] || { echo "ERROR: no usable branch from $REF_REPO"; exit 1; }
+          echo "REF_BRANCH_USED=$USED" >> "$GITHUB_ENV"
 
-          echo
-          echo "==== cloning $REF_REPO @ $USED_REF ===="
-          git clone --depth 1 --branch "$USED_REF" \
-            "https://github.com/$REF_REPO.git" "$REF_DIR"
+          git clone --depth 1 --branch "$USED" \
+            "https://github.com/$REF_REPO.git" /tmp/ref
 
-          REF_COMMIT=$(git -C "$REF_DIR" rev-parse HEAD)
-          echo "REF_COMMIT=$REF_COMMIT" >> "$GITHUB_ENV"
-          echo "reference commit: $REF_COMMIT"
+          REF_SHA=$(git -C /tmp/ref rev-parse HEAD)
+          echo "REF_SHA=$REF_SHA" >> "$GITHUB_ENV"
+          echo ">>> $REF_REPO @ $USED : $REF_SHA"
 
-          # Strip .git so rsync / diff never walk into it.
-          rm -rf "$REF_DIR/.git"
+          rm -rf /tmp/ref/.git
 
-          echo
           echo "==== reference top-level ===="
-          ls -A "$REF_DIR" | head -60
+          ls -A /tmp/ref | head -60
 
       # ──────────────────────────────────────────────────────────
-      # 3) Generate a diff BEFORE mirroring, as a diagnostic
-      #    artifact. Excludes match the mirror step:
-      #      .git   .github   *.md
+      # 5) Pre-sync diff: current winlator-pan vs reference.
       # ──────────────────────────────────────────────────────────
-      - name: Generate diff (base vs reference, pre-mirror)
+      - name: Pre-sync diff (winlator-pan vs reference)
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/diff-out"
@@ -105,167 +185,283 @@ jobs:
           EXCLUDES=(
             --exclude=.git
             --exclude=.github
-            --exclude='*.md'
+            --exclude=*.md
+            --exclude=diff-out
           )
 
-          echo "==== running diff ===="
           set +e
           diff -ruN "${EXCLUDES[@]}" \
             "$GITHUB_WORKSPACE" /tmp/ref \
-            > "$GITHUB_WORKSPACE/diff-out/winlator-ref.patch"
-          DIFF_RC=$?
+            > "$GITHUB_WORKSPACE/diff-out/01-pre-sync.patch"
           set -e
-          echo "diff exit code: $DIFF_RC  (0=identical, 1=differences, 2=error)"
 
-          ls -lh "$GITHUB_WORKSPACE/diff-out/winlator-ref.patch"
-
-          echo
-          echo "==== file-level summary ===="
           set +e
           diff -rq "${EXCLUDES[@]}" \
             "$GITHUB_WORKSPACE" /tmp/ref \
-            > "$GITHUB_WORKSPACE/diff-out/winlator-ref-summary.txt" 2>&1
+            > "$GITHUB_WORKSPACE/diff-out/01-pre-sync-summary.txt" 2>&1
           set -e
-          wc -l "$GITHUB_WORKSPACE/diff-out/winlator-ref-summary.txt"
-          echo "---- first 60 lines ----"
-          head -60 "$GITHUB_WORKSPACE/diff-out/winlator-ref-summary.txt" || true
-          echo "------------------------"
 
-          {
-            echo "### Base repository"
-            echo "- URL:    https://github.com/$BASE_REPO"
-            echo "- Branch: $BASE_BRANCH"
-            echo "- Commit: ${{ github.sha }}"
-            echo
-            echo "### Reference repository"
-            echo "- URL:    https://github.com/$REF_REPO"
-            echo "- Branch: $REF_BRANCH_USED"
-            echo "- Commit: $REF_COMMIT"
-            echo
-            echo "### Diff direction"
-            echo "\`- \` lines: present in base, absent in reference"
-            echo "\`+ \` lines: present in reference, absent in base"
-            echo
-            echo "### Note"
-            echo "This diff shows the state BEFORE mirroring. The mirror"
-            echo "step that follows overwrites every non-excluded file in"
-            echo "the base with the reference version, so after the push"
-            echo "the only differences that remain are \`.github/\` and"
-            echo "\`*.md\` files, which are excluded."
-          } > "$GITHUB_WORKSPACE/diff-out/README.md"
-
-          cat "$GITHUB_WORKSPACE/diff-out/README.md"
+          ls -lh "$GITHUB_WORKSPACE/diff-out/01-pre-sync.patch"
+          echo "---- first 40 lines of summary ----"
+          head -40 "$GITHUB_WORKSPACE/diff-out/01-pre-sync-summary.txt" || true
 
       # ──────────────────────────────────────────────────────────
-      # 4) Mirror the reference tree onto the base.
-      #    - `--delete` removes files present in base but not in ref,
-      #      so the branch becomes a true mirror.
-      #    - Excludes protect .github/, *.md, .git/.
-      #    - backup-dir lets us list what was deleted for the log.
+      # 6) Overlay reference into the workspace.
       # ──────────────────────────────────────────────────────────
-      - name: Mirror reference tree onto base
+      - name: Overlay reference into workspace
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
 
-          echo "=============================================="
-          echo "Mirroring /tmp/ref -> $GITHUB_WORKSPACE"
-          echo "Excludes: .git  .github  *.md"
-          echo "=============================================="
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' \
+            ! -name '.github' \
+            ! -name 'diff-out' \
+            -exec rm -rf {} +
 
-          # Dry-run first, so the log shows exactly what will be
-          # deleted before it happens.
-          echo
-          echo "==== dry run: files that would be deleted ===="
-          rsync -a --delete --dry-run --itemize-changes \
-            --exclude='.git/' \
-            --exclude='.github/' \
-            --exclude='*.md' \
-            /tmp/ref/ "$GITHUB_WORKSPACE/" \
-            | grep '^\*deleting' || echo "  (none)"
-
-          echo
-          echo "==== dry run: files that would be updated ===="
-          rsync -a --delete --dry-run --itemize-changes \
-            --exclude='.git/' \
-            --exclude='.github/' \
-            --exclude='*.md' \
-            /tmp/ref/ "$GITHUB_WORKSPACE/" \
-            | grep -v '^\*deleting' | head -40 || true
-
-          echo
-          echo "==== performing mirror ===="
-          # Real run. --delete makes destination match source exactly
-          # for non-excluded paths.
-          rsync -a --delete \
+          rsync -a \
             --exclude='.git/' \
             --exclude='.github/' \
             --exclude='*.md' \
             /tmp/ref/ "$GITHUB_WORKSPACE/"
 
-          echo
-          echo "==== workspace top-level after mirror ===="
+          echo "==== workspace top-level after overlay ===="
           ls -A "$GITHUB_WORKSPACE" | head -60
 
-          echo
-          echo "==== sanity: critical files present? ===="
-          MISSING=0
-          for f in \
-            src/vulkan/wsi/wsi_common_android.c \
-            src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h \
-            src/util/u_gralloc/u_gralloc_panvk_test.h \
-            .github/winlatormali/build.sh \
-            .github/winlatormali/package.py \
-            .github/workflows/winpan.yml \
-            .github/workflows/clwinpan.yml
-          do
-            if [[ -f "$GITHUB_WORKSPACE/$f" ]]; then
-              echo "  OK  $f"
-            else
-              echo "  MISSING  $f"
-              MISSING=1
+      # ──────────────────────────────────────────────────────────
+      # 7) Restore everything NOT on the keep-list from
+      #    the freshly cloned base main.
+      # ──────────────────────────────────────────────────────────
+      - name: Restore non-AHB/non-Winlator files from ${{ env.BASE_MAIN }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          echo "================================================================"
+          echo "Restoring from: ${{ github.repository }} @ $BASE_MAIN"
+          echo "Commit:         $BASE_MAIN_SHA"
+          echo "================================================================"
+
+          # Whitelist: paths that stay at reference version.
+          # Everything else is restored from base main.
+          KEEP=(
+            # ---- brand-new files only present in reference ----
+            "src/vulkan/wsi/wsi_common_android.c"
+            "src/util/u_gralloc/u_gralloc_panvk_test.h"
+            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h"
+
+            # ---- Android WSI wiring ----
+            "src/vulkan/wsi/wsi_common.c"
+            "src/vulkan/wsi/wsi_common.h"
+            "src/vulkan/wsi/wsi_common_private.h"
+            "src/vulkan/wsi/wsi_common_x11.c"
+            "src/vulkan/wsi/meson.build"
+
+            # ---- Android native buffer header ----
+            "include/vulkan/vk_android_native_buffer.h"
+
+            # ---- PanVK Android + gralloc plumbing ----
+            "src/panfrost/vulkan/panvk_android.c"
+            "src/panfrost/vulkan/panvk_android_hal_bridge.c"
+            "src/util/u_gralloc/u_gralloc_fallback.c"
+            "src/vulkan/runtime/vk_android.c"
+
+            # ---- PanVK physical device / extension advertisement ----
+            "src/panfrost/vulkan/panvk_vX_physical_device.c"
+            "src/panfrost/vulkan/panvk_physical_device.c"
+            "src/panfrost/vulkan/panvk_physical_device.h"
+            "src/panfrost/vulkan/panvk_device_memory.c"
+
+            # ---- PanVK WSI setup (blit_no_shm_import) ----
+            "src/panfrost/vulkan/panvk_wsi.c"
+            "src/panfrost/vulkan/panvk_instance.c"
+
+            # ---- kbase USER_BUFFER import fix ----
+            "src/panfrost/lib/kmod/kbase_kmod.c"
+
+            # ---- JM submit/drain (Winlator JM path) ----
+            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c"
+            "src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c"
+
+            # ---- PanVK build (HAL bridge guard) ----
+            "src/panfrost/vulkan/meson.build"
+
+            # ---- pan_query_core_count() 2-arg refactor ----
+            "src/panfrost/lib/pan_props.c"
+            "src/panfrost/lib/pan_props.h"
+            "src/panfrost/lib/kmod/panfrost_kmod.c"
+            "src/panfrost/perf/pan_perf.c"
+            "src/gallium/drivers/panfrost/pan_device.c"
+            "src/gallium/drivers/panfrost/pan_screen.c"
+          )
+
+          is_keep() {
+            local f="$1"
+            for p in "${KEEP[@]}"; do
+              [[ "$f" == "$p" ]] && return 0
+            done
+            return 1
+          }
+
+          RESTORED=0
+          DELETED=0
+          KEPT=0
+          MISSING_IN_MAIN=0
+
+          while IFS= read -r -d '' f; do
+            rel="${f#./}"
+            [[ "$rel" == .git/* ]]      && continue
+            [[ "$rel" == .github/* ]]   && continue
+            [[ "$rel" == diff-out/* ]]  && continue
+            [[ "$rel" == *.md ]]        && continue
+
+            if is_keep "$rel"; then
+              KEPT=$((KEPT + 1))
+              continue
             fi
-          done
-          if [[ "$MISSING" -eq 1 ]]; then
-            echo
-            echo "WARNING: some critical files are missing after the mirror."
-            echo "Source files should have come from the reference, and"
-            echo ".github/ files should have been preserved by the excludes."
-          fi
+
+            if [[ -e "/tmp/base-main/$rel" ]]; then
+              mkdir -p "$(dirname "$rel")"
+              cp -a "/tmp/base-main/$rel" "$rel"
+              RESTORED=$((RESTORED + 1))
+            else
+              rm -f "$rel"
+              DELETED=$((DELETED + 1))
+              # Log once per file so we can tell what main didn't have.
+              echo "  deleted (not in $BASE_MAIN): $rel"
+            fi
+          done < <(find . -type f -print0)
+
+          # Prune directories that became empty after deletions.
+          find . -mindepth 1 -type d -empty \
+            -not -path './.git/*' \
+            -not -path './.github/*' \
+            -not -path './diff-out/*' \
+            -delete 2>/dev/null || true
+
+          echo
+          echo "=================== restore summary ==================="
+          echo "Source branch       : $BASE_MAIN"
+          echo "Source commit       : $BASE_MAIN_SHA"
+          echo "Kept from reference : $KEPT"
+          echo "Restored from main  : $RESTORED"
+          echo "Deleted (not in main): $DELETED"
+          echo "======================================================="
 
       # ──────────────────────────────────────────────────────────
-      # 5) Upload the diff artifact. Runs regardless of whether the
-      #    push later succeeds or fails.
+      # 8) Post-restore diff: what still differs from reference.
       # ──────────────────────────────────────────────────────────
-      - name: Upload diff patch (always)
+      - name: Post-restore diff (workspace vs reference)
+        run: |
+          set -euo pipefail
+
+          EXCLUDES=(
+            --exclude=.git
+            --exclude=.github
+            --exclude=*.md
+            --exclude=diff-out
+          )
+
+          set +e
+          diff -ruN "${EXCLUDES[@]}" \
+            "$GITHUB_WORKSPACE" /tmp/ref \
+            > "$GITHUB_WORKSPACE/diff-out/02-post-restore.patch"
+          set -e
+
+          set +e
+          diff -rq "${EXCLUDES[@]}" \
+            "$GITHUB_WORKSPACE" /tmp/ref \
+            > "$GITHUB_WORKSPACE/diff-out/02-post-restore-summary.txt" 2>&1
+          set -e
+
+          ls -lh "$GITHUB_WORKSPACE/diff-out/02-post-restore.patch"
+          echo "---- first 60 lines of summary ----"
+          head -60 "$GITHUB_WORKSPACE/diff-out/02-post-restore-summary.txt" || true
+          echo "---- line count ----"
+          wc -l "$GITHUB_WORKSPACE/diff-out/02-post-restore-summary.txt" || true
+
+      # ──────────────────────────────────────────────────────────
+      # 9) README for the artifact.
+      # ──────────────────────────────────────────────────────────
+      - name: Write diff README
+        run: |
+          set -euo pipefail
+          cat > "$GITHUB_WORKSPACE/diff-out/README.md" <<EOF
+          # winlator-pan sync — diff bundle
+
+          ## Repos and commits used in this run
+          - Base branch : https://github.com/${{ github.repository }} @ $BASE_BRANCH @ ${{ github.sha }}
+          - Base main   : https://github.com/${{ github.repository }} @ $BASE_MAIN @ $BASE_MAIN_SHA
+          - Reference   : https://github.com/$REF_REPO @ $REF_BRANCH_USED @ $REF_SHA
+
+          ## Diffs
+          - \`01-pre-sync.patch\`      — \`$BASE_BRANCH\` vs reference *before* anything changes.
+          - \`02-post-restore.patch\` — after mirror + restore, what still differs from reference.
+
+          ## Restore policy
+          Workspace starts as a copy of the reference. Then every file is checked:
+          - If its path is on the keep-list, it keeps the reference version.
+          - Otherwise the file is restored from \`$BASE_MAIN\` (or deleted if \`$BASE_MAIN\` has no such file).
+
+          ## Keep-list (paths that stay at reference version)
+          - \`src/vulkan/wsi/wsi_common_android.c\` (new)
+          - \`src/util/u_gralloc/u_gralloc_panvk_test.h\` (new)
+          - \`src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h\` (new)
+          - \`src/vulkan/wsi/wsi_common.c\`
+          - \`src/vulkan/wsi/wsi_common.h\`
+          - \`src/vulkan/wsi/wsi_common_private.h\`
+          - \`src/vulkan/wsi/wsi_common_x11.c\`
+          - \`src/vulkan/wsi/meson.build\`
+          - \`include/vulkan/vk_android_native_buffer.h\`
+          - \`src/panfrost/vulkan/panvk_android.c\`
+          - \`src/panfrost/vulkan/panvk_android_hal_bridge.c\`
+          - \`src/util/u_gralloc/u_gralloc_fallback.c\`
+          - \`src/vulkan/runtime/vk_android.c\`
+          - \`src/panfrost/vulkan/panvk_vX_physical_device.c\`
+          - \`src/panfrost/vulkan/panvk_physical_device.c\`
+          - \`src/panfrost/vulkan/panvk_physical_device.h\`
+          - \`src/panfrost/vulkan/panvk_device_memory.c\`
+          - \`src/panfrost/vulkan/panvk_wsi.c\`
+          - \`src/panfrost/vulkan/panvk_instance.c\`
+          - \`src/panfrost/lib/kmod/kbase_kmod.c\`
+          - \`src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c\`
+          - \`src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c\`
+          - \`src/panfrost/vulkan/meson.build\`
+          - \`src/panfrost/lib/pan_props.c\`
+          - \`src/panfrost/lib/pan_props.h\`
+          - \`src/panfrost/lib/kmod/panfrost_kmod.c\`
+          - \`src/panfrost/perf/pan_perf.c\`
+          - \`src/gallium/drivers/panfrost/pan_device.c\`
+          - \`src/gallium/drivers/panfrost/pan_screen.c\`
+          EOF
+          cat "$GITHUB_WORKSPACE/diff-out/README.md"
+
+      # ──────────────────────────────────────────────────────────
+      # 10) Upload both diffs.
+      # ──────────────────────────────────────────────────────────
+      - name: Upload diff bundle (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: winlator-ref-diff-${{ github.run_number }}
-          path: |
-            diff-out/winlator-ref.patch
-            diff-out/winlator-ref-summary.txt
-            diff-out/README.md
+          name: winlator-diffs-${{ github.run_number }}
+          path: diff-out/
           if-no-files-found: warn
 
       # ──────────────────────────────────────────────────────────
-      # 6) Commit and force-push. Only pushes if something changed.
-      #    .github/ is never staged so workflow files on the target
-      #    branch are never modified by this job.
+      # 11) Commit and force-push.
       # ──────────────────────────────────────────────────────────
       - name: Commit and force-push to ${{ env.BASE_BRANCH }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
 
-          # Never stage CI-only scaffolding or generated artifacts.
           git add -A -- \
             ':(exclude).github' \
             ':(exclude)diff-out' \
             ':(exclude)*.md'
 
           if git diff --cached --quiet; then
-            echo ">>> No changes to commit — base already matches reference."
+            echo ">>> Nothing to commit — tree already matches."
             exit 0
           fi
 
@@ -273,10 +469,9 @@ jobs:
           git diff --cached --stat | tail -60
           echo "------------------------"
 
-          git commit -q -m "sync: mirror $REF_REPO@$REF_BRANCH_USED onto $BASE_BRANCH ($(date -u +%Y%m%d-%H%M%S))"
+          git commit -q -m "sync: reference AHB/Winlator/AdrenoTools + restore rest from $BASE_MAIN"
           git --no-pager log -1 --oneline
 
-          echo
           echo ">>> force-pushing to origin/$BASE_BRANCH"
           git push --force origin "HEAD:refs/heads/$BASE_BRANCH"
           echo ">>> push done"
