@@ -330,6 +330,7 @@ jobs:
             -Dpanfrost-kmds=kbase,panthor \
             -Dpanvk-use-kbase=true \
             -Dllvm=disabled \
+           -Dvalgrind=disabled \
             -Dmesa-clc=system \
             -Dprecomp-compiler=system \
             -Dspirv-tools=disabled \
