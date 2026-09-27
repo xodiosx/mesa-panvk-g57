@@ -53,16 +53,16 @@ jobs:
       BUILD_JOBS: '2'
       # Reference fork/branch to diff the current tree against.
       REF_REPO:   "mexicanbr0auth/mesa-panvk-g57"
-      REF_BRANCH: "winlator-cl"
+      REF_BRANCH: "winlatormali-ci"
     steps:
       - uses: actions/checkout@v4
 
       # ─────────────────────────────────────────────────────────────
       # Clone the reference fork and diff it against the current
       # checked-out tree. Produces a unified patch that tells us
-      # exactly what the winlator-cl branch has that our branch
-      # does not (and vice versa). Runs before the build so the
-      # patch exists even if everything after this step fails.
+      # exactly what the reference branch has that our branch does
+      # not (and vice versa). Runs before the build so the patch
+      # exists even if everything after this step fails.
       # ─────────────────────────────────────────────────────────────
       - name: Generate diff vs ${{ env.REF_REPO }}@${{ env.REF_BRANCH }}
         run: |
@@ -72,17 +72,52 @@ jobs:
           REF_DIR=/tmp/winlator-ref
           rm -rf "$REF_DIR"
 
-          echo "==== cloning $REF_REPO @ $REF_BRANCH ===="
-          git clone --depth 1 --branch "$REF_BRANCH" \
+          echo "==== branches available in $REF_REPO ===="
+          git ls-remote --heads "https://github.com/$REF_REPO.git" \
+            | awk '{print "  " $2}' | sed 's|refs/heads/||' | sort
+
+          echo
+          echo "==== selecting reference branch (preferred: $REF_BRANCH) ===="
+          CANDIDATES="$REF_BRANCH winlatormali-ci winlator-cl winlator main master"
+          USED_REF=""
+          for br in $CANDIDATES; do
+            if git ls-remote --heads "https://github.com/$REF_REPO.git" \
+                 "refs/heads/$br" 2>/dev/null | grep -q "refs/heads/$br"; then
+              USED_REF="$br"
+              echo ">>> matched candidate: $br"
+              break
+            else
+              echo "    not present: $br"
+            fi
+          done
+
+          if [[ -z "$USED_REF" ]]; then
+            USED_REF=$(git ls-remote --symref \
+                         "https://github.com/$REF_REPO.git" HEAD 2>/dev/null \
+                       | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
+            echo ">>> no candidate matched; using repo default: ${USED_REF:-<unknown>}"
+          fi
+
+          if [[ -z "$USED_REF" ]]; then
+            echo "ERROR: no usable branch from $REF_REPO" >&2
+            exit 1
+          fi
+          echo "REF_BRANCH_USED=$USED_REF" >> "$GITHUB_ENV"
+
+          echo
+          echo "==== cloning $REF_REPO @ $USED_REF ===="
+          git clone --depth 1 --branch "$USED_REF" \
             "https://github.com/$REF_REPO.git" "$REF_DIR"
+
+          # Capture the reference HEAD before stripping .git.
+          REF_COMMIT=$(git -C "$REF_DIR" rev-parse HEAD)
+          echo "REF_COMMIT=$REF_COMMIT" >> "$GITHUB_ENV"
 
           # Drop .git from the ref so diff doesn't walk into it.
           rm -rf "$REF_DIR/.git"
 
           cd "$GITHUB_WORKSPACE"
 
-          # Build the exclude list — paths that exist only because we're
-          # running CI in this repo and have no bearing on upstream.
           EXCLUDES=(
             --exclude=.git
             --exclude=.ci-python
@@ -114,7 +149,6 @@ jobs:
 
           ls -lh diff-out/winlator-ref.patch
 
-          # Short summary: file-level changes only.
           echo
           echo "==== file-level summary ===="
           set +e
@@ -127,7 +161,6 @@ jobs:
           head -60 diff-out/winlator-ref-summary.txt || true
           echo "------------------------"
 
-          # Record HEADs so the artifact is self-describing.
           {
             echo "### Source repository"
             echo "- URL:    https://github.com/${{ github.repository }}"
@@ -136,8 +169,8 @@ jobs:
             echo
             echo "### Reference repository"
             echo "- URL:    https://github.com/$REF_REPO"
-            echo "- Branch: $REF_BRANCH"
-            echo "- Commit: $(git -C /tmp/winlator-ref rev-parse HEAD 2>/dev/null || echo unknown)"
+            echo "- Branch: $USED_REF"
+            echo "- Commit: $REF_COMMIT"
             echo
             echo "### Diff direction"
             echo "\`- \` lines: present in source branch, absent in reference"
@@ -261,9 +294,9 @@ jobs:
 
             ### Diff vs reference branch
             A unified diff against
-            `mexicanbr0auth/mesa-panvk-g57@winlator-cl` is attached as
-            `winlator-ref.patch`. Read `README.md` in the same artifact
-            for direction and provenance.
+            `mexicanbr0auth/mesa-panvk-g57` is attached as
+            `winlator-ref.patch`. Read `README.md` for direction and
+            provenance.
 
             ### What is included
             - **PanVK** — Vulkan driver for Mali-G57 (Valhall JM) via kbase
@@ -272,7 +305,7 @@ jobs:
             ### Files
             - `PanVK-G57-WinlatorMali-candidate-*.zip` — packaged driver
               (only present if the build succeeded)
-            - `winlator-ref.patch` — diff vs the winlator-cl branch
+            - `winlator-ref.patch` — diff vs the reference branch
             - `winlator-ref-summary.txt` — file-level summary of the diff
             - `README.md` — provenance for the diff
 
