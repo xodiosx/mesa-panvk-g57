@@ -24,13 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      # ─────────────────────────────────────────────────────────────
-      # KEY: libdrm-dev is required. It provides /usr/include/xf86drm.h,
-      # /usr/include/xf86drmMode.h, and /usr/include/libdrm/*.h. Without
-      # it the Termux sysroot's libdrm.pc is found by pkg-config, but
-      # the actual headers are missing, so pan_kmod.c fails on
-      # #include <xf86drm.h>.
-      # ─────────────────────────────────────────────────────────────
       - name: Install host build tools
         run: |
           sudo apt update
@@ -90,19 +83,12 @@ jobs:
           sudo cp -r /tmp/debs/extracted/data/data/com.termux/files/usr/* \
                      /data/data/com.termux/files/usr/ 2>/dev/null || true
 
-      # ─────────────────────────────────────────────────────────────
-      # NEW: copy libdrm headers from host libdrm-dev into Termux sysroot.
-      # pkg-config finds the Termux libdrm.pc, which advertises
-      # -idirafter <termux>/include/libdrm — but the header files
-      # themselves aren't there. Copy them so the compile succeeds.
-      # ─────────────────────────────────────────────────────────────
       - name: Copy libdrm headers into Termux sysroot
         run: |
           set -euo pipefail
           SYSROOT=/data/data/com.termux/files/usr
           mkdir -p "$SYSROOT/include/libdrm"
 
-          # Flat headers (xf86drm.h, xf86drmMode.h)
           for h in xf86drm.h xf86drmMode.h; do
             if [ -f "/usr/include/$h" ]; then
               sudo cp "/usr/include/$h" "$SYSROOT/include/"
@@ -112,10 +98,8 @@ jobs:
             fi
           done
 
-          # libdrm subdir headers (drm.h, drm_mode.h, drm_fourcc.h, ...)
           if [ -d /usr/include/libdrm ]; then
             sudo cp -a /usr/include/libdrm/*.h "$SYSROOT/include/libdrm/" 2>/dev/null || true
-            # Some subdirs (nouveau, etc.) — copy directories too if present
             for sub in /usr/include/libdrm/*/; do
               [ -d "$sub" ] || continue
               sudo cp -a "$sub" "$SYSROOT/include/libdrm/" 2>/dev/null || true
@@ -177,53 +161,6 @@ jobs:
           static inline void udev_device_unref(struct udev_device *d) {}
           static inline const char *udev_device_get_devnode(struct udev_device *d) { return 0; }
           static inline const char *udev_device_get_property_value(struct udev_device *d, const char *p) { return 0; }
-          #endif
-          EOF
-
-      - name: Inject mock valgrind.h
-        run: |
-          sudo tee /data/data/com.termux/files/usr/include/valgrind.h > /dev/null << 'EOF'
-          #ifndef __MOCK_VALGRIND_H
-          #define __MOCK_VALGRIND_H
-          #define NVALGRIND 1
-          #define RUNNING_ON_VALGRIND 0
-          #define VALGRIND_CREATE_MEMPOOL(a, b, c)          ((void)0)
-          #define VALGRIND_DESTROY_MEMPOOL(a)               ((void)0)
-          #define VALGRIND_MEMPOOL_ALLOC(a, b, c)           ((void)0)
-          #define VALGRIND_MEMPOOL_FREE(a, b)               ((void)0)
-          #define VALGRIND_MEMPOOL_CHANGE(a, b, c, d)       ((void)0)
-          #define VALGRIND_MEMPOOL_EXISTS(a)                0
-          #define VALGRIND_MAKE_MEM_DEFINED(a, b)           ((unsigned)0)
-          #define VALGRIND_MAKE_MEM_UNDEFINED(a, b)         ((unsigned)0)
-          #define VALGRIND_MAKE_MEM_NOACCESS(a, b)          ((unsigned)0)
-          #define VALGRIND_MAKE_MEM_DEFINED_IF_ADDRESSABLE(a, b) ((unsigned)0)
-          #define VALGRIND_MALLOCLIKE_BLOCK(a, b, c, d)     ((void)0)
-          #define VALGRIND_FREELIKE_BLOCK(a, b)             ((void)0)
-          #define VALGRIND_RESIZEINPLACE_BLOCK(a, b, c, d)  ((void)0)
-          #define VALGRIND_CHECK_MEM_IS_DEFINED(a, b)       ((void)0)
-          #define VALGRIND_CHECK_MEM_IS_ADDRESSABLE(a, b)   ((void)0)
-          #define VALGRIND_CHECK_VALUE_IS_DEFINED(a)        ((void)0)
-          #define VALGRIND_DISCARD_TRANSLATIONS(a, b)       ((void)0)
-          #define VALGRIND_DO_LEAK_CHECK                    ((void)0)
-          #define VALGRIND_DO_ADDED_LEAK_CHECK              ((void)0)
-          #define VALGRIND_DO_CHANGED_LEAK_CHECK            ((void)0)
-          #define VALGRIND_DO_NEW_LEAK_CHECK                ((void)0)
-          #define VALGRIND_DO_QUICK_LEAK_CHECK              ((void)0)
-          #define VALGRIND_COUNT_ERRORS                     0
-          #define VALGRIND_COUNT_LEAKS(a, b, c, d)          ((void)0)
-          #define VALGRIND_COUNT_LEAK_BLOCKS(a, b, c, d)    ((void)0)
-          #define VALGRIND_GET_VBITS(a, b, c)               ((unsigned)0)
-          #define VALGRIND_SET_VBITS(a, b, c)               ((unsigned)0)
-          #define VALGRIND_PRINTF(...)                      ((void)0)
-          #define VALGRIND_PRINTF_BACKTRACE(...)            ((void)0)
-          #define VALGRIND_STACK_REGISTER(a, b)             0
-          #define VALGRIND_STACK_DEREGISTER(a)              ((void)0)
-          #define VALGRIND_STACK_CHANGE(a, b, c)            ((void)0)
-          #define VALGRIND_HG_DISABLE_CHECKING(a, b)        ((void)0)
-          #define VALGRIND_HG_ENABLE_CHECKING(a, b)         ((void)0)
-          #define VALGRIND_CLO_CHANGE(a)                    ((void)0)
-          #define __VALGRIND_MAJOR__ 3
-          #define __VALGRIND_MINOR__ 22
           #endif
           EOF
 
@@ -330,7 +267,6 @@ jobs:
             -Dpanfrost-kmds=kbase,panthor \
             -Dpanvk-use-kbase=true \
             -Dllvm=disabled \
-           -Dvalgrind=disabled \
             -Dmesa-clc=system \
             -Dprecomp-compiler=system \
             -Dspirv-tools=disabled \
@@ -344,10 +280,10 @@ jobs:
             -Dxmlconfig=disabled \
             -Dexpat=disabled \
             -Dlibunwind=disabled \
+            -Dvalgrind=disabled \
             -Dzstd=disabled \
             -Dvideo-codecs= \
             -Dperfetto=false \
-            -Dandroid-libbacktrace=disabled \
             -Dstrip=true
 
       - name: Build PanVK ICD
