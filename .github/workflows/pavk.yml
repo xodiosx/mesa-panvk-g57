@@ -347,7 +347,7 @@ jobs:
             -Dzstd=disabled \
             -Dvideo-codecs= \
             -Dperfetto=false \
-            -Dprefix=/usr \
+            -Dandroid-libbacktrace=disabled \
             -Dstrip=true
 
       - name: Build PanVK ICD
