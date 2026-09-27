@@ -1,525 +1,259 @@
-name: clone PanVK for Winlator (aarch64, cross-compile)
+name: sync winlator-pan from mexicanbr0auth/mesa-panvk-g57
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Tag to create (leave empty to auto-generate)"
-        required: false
-        default: ""
+  push:
+    branches: [winlator-pan]
 
 permissions:
   contents: write
 
 jobs:
-  prepare:
+  sync:
+    name: Sync base with winlatormali reference
     runs-on: ubuntu-latest
-    outputs:
-      date:  ${{ steps.ts.outputs.date }}
-      time:  ${{ steps.ts.outputs.time }}
-      stamp: ${{ steps.ts.outputs.stamp }}
-      tag:   ${{ steps.ts.outputs.tag }}
-    steps:
-      - name: Compute build timestamp and tag
-        id: ts
-        run: |
-          DATE=$(date -u +'%Y-%m-%d')
-          TIME=$(date -u +'%H%M%S')
-          STAMP="${DATE}-${TIME}"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          echo "date=$DATE"           >> "$GITHUB_OUTPUT"
-          echo "time=$TIME"           >> "$GITHUB_OUTPUT"
-          echo "stamp=$STAMP"         >> "$GITHUB_OUTPUT"
-          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG="${GITHUB_REF_NAME}"
-          elif [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
-            TAG="${{ github.event.inputs.release_tag }}"
-          else
-            TAG="build-${DATE}-${TIME}-${SHORT_SHA}"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-  prepare-winlator-branch:
-    needs: [prepare]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 30
     env:
-      BASE_REPO:      "xodiosx/mesa-panvk-mali-g57"
-      WINLATOR_REPO:  "mexicanbr0auth/mesa-panvk-g57"
-      WINLATOR_BRANCH: "winlator-cl"
-      TARGET_BRANCH:  "winlator"
-      EXCLUDE_PATHS:  ".github/workflows"
+      # Base — the branch we sync INTO and push back to.
+      BASE_REPO:   "${{ github.repository }}"
+      BASE_BRANCH: "winlator-pan"
+
+      # Reference — the winlatormali source we pull FROM.
+      REF_REPO:   "mexicanbr0auth/mesa-panvk-g57"
+      REF_BRANCH: "winlatormali-ci"
     steps:
-      - name: Checkout
+      # ──────────────────────────────────────────────────────────
+      # 1) Checkout the base branch with push credentials.
+      # ──────────────────────────────────────────────────────────
+      - name: Checkout ${{ env.BASE_BRANCH }}
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
           token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Configure git credentials
+      - name: Configure git identity
         run: |
           set -euo pipefail
           git config --local user.email "github-actions@users.noreply.github.com"
           git config --local user.name  "github-actions"
           git remote set-url origin \
             "https://x-access-token:${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          echo "==== remote ===="
           git remote -v
+          echo "==== base HEAD ===="
+          git --no-pager log -1 --oneline
 
-      - name: Write patcher script
-        run: |
-          mkdir -p "${{ github.workspace }}/ci-scripts"
-          cat > "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py" << 'PYEOF'
-          #!/usr/bin/env python3
-          """
-          Source-tree transformations applied before compilation.
-
-          1. Neutralize every `fprintf(stderr, "PANVKDBG ...")` statement
-             by replacing the call with `(void)0`.
-
-          2. Rename the PanVK Vulkan driver name to "panvcake".
-
-          3. Change the Vulkan driver ID reported by PanVK from
-             VK_DRIVER_ID_MESA_PANVK to a custom value.
-          """
-          import re
-          import sys
-          from pathlib import Path
-
-          ROOTS = [Path("src/panfrost"), Path("src/vulkan")]
-
-          REWRAP_RE = re.compile(
-              r'if\s*\(\s*0\s*\)\s*(?=fprintf\s*\(\s*stderr\s*,\s*"PANVKDBG)'
-          )
-          START_RE = re.compile(
-              r'fprintf\s*\(\s*stderr\s*,\s*(?="PANVKDBG)'
-          )
-
-          CUSTOM_DRIVER_ID = "((VkDriverId)0x0000CAFE)"
-          DRIVER_ID_RE = re.compile(r'\bVK_DRIVER_ID_MESA_PANVK\b')
-
-          DRIVER_NAME_PATTERNS = [
-              (re.compile(r'"Mesa PanVK"'), '"PanVCake"'),
-              (re.compile(r'"PanVK"'),      '"PanVCake"'),
-              (re.compile(r'"panvk"'),      '"panvcake"'),
-          ]
-
-          def _find_close_paren(src, open_paren_idx):
-              depth = 0
-              i = open_paren_idx
-              in_str = False
-              in_chr = False
-              while i < len(src):
-                  c = src[i]
-                  if in_str:
-                      if c == "\\":
-                          i += 2
-                          continue
-                      if c == '"':
-                          in_str = False
-                  elif in_chr:
-                      if c == "\\":
-                          i += 2
-                          continue
-                      if c == "'":
-                          in_chr = False
-                  else:
-                      if c == '"':
-                          in_str = True
-                      elif c == "'":
-                          in_chr = True
-                      elif c == "(":
-                          depth += 1
-                      elif c == ")":
-                          depth -= 1
-                          if depth == 0:
-                              return i + 1
-                  i += 1
-              return None
-
-          def silence_fprintf(src):
-              src = REWRAP_RE.sub("", src)
-              out = []
-              i = 0
-              count = 0
-              while i < len(src):
-                  idx = src.find("fprintf", i)
-                  if idx == -1:
-                      out.append(src[i:])
-                      break
-                  m = START_RE.match(src, idx)
-                  if not m:
-                      out.append(src[i:idx + len("fprintf")])
-                      i = idx + len("fprintf")
-                      continue
-                  open_paren = src.find("(", m.start())
-                  close_paren = _find_close_paren(src, open_paren)
-                  if close_paren is None:
-                      out.append(src[i:])
-                      break
-                  out.append(src[i:idx])
-                  out.append("(void)0")
-                  i = close_paren
-                  count += 1
-              return "".join(out), count
-
-          def rename_driver(src):
-              n_name = 0
-              n_id = 0
-              for pat, repl in DRIVER_NAME_PATTERNS:
-                  src, k = pat.subn(repl, src)
-                  n_name += k
-              src, k = DRIVER_ID_RE.subn(CUSTOM_DRIVER_ID, src)
-              n_id += k
-              return src, n_name, n_id
-
-          def main():
-              for root in ROOTS:
-                  if not root.exists():
-                      print(f"ERROR: {root} not found", file=sys.stderr)
-                      return 1
-              total_neutralized = 0
-              total_names = 0
-              total_ids = 0
-              files_modified = 0
-              for root in ROOTS:
-                  for path in sorted(root.rglob("*")):
-                      if path.suffix not in (".c", ".h", ".cpp", ".cc",
-                                             ".cxx", ".hpp"):
-                          continue
-                      try:
-                          src = path.read_text()
-                      except UnicodeDecodeError:
-                          continue
-                      orig = src
-                      if '"PANVKDBG' in src:
-                          src, n = silence_fprintf(src)
-                          if n:
-                              print(f"{path}: neutralized {n} PANVKDBG call(s)")
-                              total_neutralized += n
-                      before = src
-                      src, n_name, n_id = rename_driver(src)
-                      if src != before:
-                          if n_name or n_id:
-                              print(f"{path}: driver rename "
-                                    f"({n_name} name, {n_id} id)")
-                              total_names += n_name
-                              total_ids += n_id
-                      if src != orig:
-                          path.write_text(src)
-                          files_modified += 1
-              print()
-              print(f"Files modified:                   {files_modified}")
-              print(f"PANVKDBG calls neutralized:       {total_neutralized}")
-              print(f"Driver-name strings renamed:      {total_names}")
-              print(f"Driver-ID occurrences replaced:   {total_ids}")
-              return 0
-
-          if __name__ == "__main__":
-              sys.exit(main())
-          PYEOF
-          chmod +x "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
-          wc -l "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
-
-      - name: Clone base + winlator source
+      # ──────────────────────────────────────────────────────────
+      # 2) Clone the reference fork. List branches first so we
+      #    can see exactly what exists, then fall back through
+      #    candidates if the preferred name is missing.
+      # ──────────────────────────────────────────────────────────
+      - name: Clone reference (${{ env.REF_REPO }})
         run: |
           set -euo pipefail
-          rm -rf /tmp/base /tmp/winlator-src
+          REF_DIR=/tmp/ref
+          rm -rf "$REF_DIR"
 
-          echo "Branches available in $WINLATOR_REPO:"
-          git ls-remote --heads "https://github.com/$WINLATOR_REPO.git" \
+          echo "==== branches available in $REF_REPO ===="
+          git ls-remote --heads "https://github.com/$REF_REPO.git" \
             | awk '{print "  " $2}' | sed 's|refs/heads/||' | sort
 
-          CANDIDATES="$WINLATOR_BRANCH winlator-cl winlator main master"
-          USED=""
+          echo
+          echo "==== selecting reference branch (preferred: $REF_BRANCH) ===="
+          CANDIDATES="$REF_BRANCH winlatormali-ci winlator-cl winlator main master"
+          USED_REF=""
           for br in $CANDIDATES; do
-            if git ls-remote --heads \
-                 "https://github.com/$WINLATOR_REPO.git" \
+            if git ls-remote --heads "https://github.com/$REF_REPO.git" \
                  "refs/heads/$br" 2>/dev/null | grep -q "refs/heads/$br"; then
-              USED="$br"
+              USED_REF="$br"
               echo ">>> matched candidate: $br"
               break
             fi
           done
-          if [[ -z "$USED" ]]; then
-            USED=$(git ls-remote --symref \
-                     "https://github.com/$WINLATOR_REPO.git" HEAD 2>/dev/null \
-                   | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
-            echo ">>> no candidate matched; using repo default: ${USED:-<unknown>}"
+          if [[ -z "$USED_REF" ]]; then
+            USED_REF=$(git ls-remote --symref \
+                         "https://github.com/$REF_REPO.git" HEAD 2>/dev/null \
+                       | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
           fi
-          if [[ -z "$USED" ]]; then
-            echo "ERROR: no usable branch from $WINLATOR_REPO" >&2
-            exit 1
-          fi
-          echo "WINLATOR_BRANCH_USED=$USED" >> "$GITHUB_ENV"
+          [[ -n "$USED_REF" ]] || { echo "ERROR: no usable branch from $REF_REPO" >&2; exit 1; }
+          echo "REF_BRANCH_USED=$USED_REF" >> "$GITHUB_ENV"
 
-          git clone --depth 1 "https://github.com/$BASE_REPO.git" /tmp/base
-          git clone --depth 1 --branch "$USED" \
-            "https://github.com/$WINLATOR_REPO.git" /tmp/winlator-src
+          echo
+          echo "==== cloning $REF_REPO @ $USED_REF ===="
+          git clone --depth 1 --branch "$USED_REF" \
+            "https://github.com/$REF_REPO.git" "$REF_DIR"
 
-          rm -rf /tmp/base/.git /tmp/winlator-src/.git
+          REF_COMMIT=$(git -C "$REF_DIR" rev-parse HEAD)
+          echo "REF_COMMIT=$REF_COMMIT" >> "$GITHUB_ENV"
+          echo "reference commit: $REF_COMMIT"
 
-      - name: Copy missing files from winlator source into base
+          # Strip .git so diff / copy never walk into it.
+          rm -rf "$REF_DIR/.git"
+
+          echo
+          echo "==== reference top-level ===="
+          ls -A "$REF_DIR" | head -60
+
+      # ──────────────────────────────────────────────────────────
+      # 3) Diff BEFORE we copy anything. This is what gets
+      #    uploaded as the artifact — it shows exactly what the
+      #    reference has that the base does not (and vice versa).
+      #    Excludes match what the sync will skip:
+      #      .git   .github   *.md
+      # ──────────────────────────────────────────────────────────
+      - name: Generate diff (base vs reference, pre-copy)
         run: |
           set -euo pipefail
-          cd /tmp/winlator-src
+          mkdir -p "$GITHUB_WORKSPACE/diff-out"
+
+          EXCLUDES=(
+            --exclude=.git
+            --exclude=.github
+            --exclude='*.md'
+          )
+
+          echo "==== running diff ===="
+          set +e
+          diff -ruN "${EXCLUDES[@]}" \
+            "$GITHUB_WORKSPACE" /tmp/ref \
+            > "$GITHUB_WORKSPACE/diff-out/winlator-ref.patch"
+          DIFF_RC=$?
+          set -e
+          echo "diff exit code: $DIFF_RC  (0=identical, 1=differences, 2=error)"
+
+          ls -lh "$GITHUB_WORKSPACE/diff-out/winlator-ref.patch"
+
+          echo
+          echo "==== file-level summary ===="
+          set +e
+          diff -rq "${EXCLUDES[@]}" \
+            "$GITHUB_WORKSPACE" /tmp/ref \
+            > "$GITHUB_WORKSPACE/diff-out/winlator-ref-summary.txt" 2>&1
+          set -e
+          wc -l "$GITHUB_WORKSPACE/diff-out/winlator-ref-summary.txt"
+          echo "---- first 60 lines ----"
+          head -60 "$GITHUB_WORKSPACE/diff-out/winlator-ref-summary.txt" || true
+          echo "------------------------"
+
+          {
+            echo "### Base repository"
+            echo "- URL:    https://github.com/$BASE_REPO"
+            echo "- Branch: $BASE_BRANCH"
+            echo "- Commit: ${{ github.sha }}"
+            echo
+            echo "### Reference repository"
+            echo "- URL:    https://github.com/$REF_REPO"
+            echo "- Branch: $REF_BRANCH_USED"
+            echo "- Commit: $REF_COMMIT"
+            echo
+            echo "### Diff direction"
+            echo "\`- \` lines: present in base, absent in reference"
+            echo "\`+ \` lines: present in reference, absent in base"
+            echo
+            echo "### Excludes"
+            echo "\`.git\`  \`.github\`  \`*.md\`"
+          } > "$GITHUB_WORKSPACE/diff-out/README.md"
+
+          cat "$GITHUB_WORKSPACE/diff-out/README.md"
+
+      # ──────────────────────────────────────────────────────────
+      # 4) Copy every file/folder present in the reference that
+      #    doesn't exist in the base yet. Files that already exist
+      #    are left alone (the diff above shows their content
+      #    differences but we don't touch them).
+      #
+      #    Excluded paths: .git, .github, *.md
+      # ──────────────────────────────────────────────────────────
+      - name: Copy missing files/folders from reference into base
+        run: |
+          set -euo pipefail
 
           is_excluded() {
             local rel="$1"
-            for p in $EXCLUDE_PATHS; do
-              case "$rel" in
-                "$p"|"$p"/*) return 0 ;;
-              esac
-            done
+            case "$rel" in
+              .git|.git/*)             return 0 ;;
+              .github|.github/*)       return 0 ;;
+              *.md)                    return 0 ;;
+            esac
             return 1
           }
 
+          cd /tmp/ref
+
           COUNT=0
           SKIPPED=0
+
+          echo "=============================================="
+          echo "Copying files present only in $REF_BRANCH_USED:"
+          echo "=============================================="
           while IFS= read -r rel; do
             rel="${rel#./}"
             [[ -z "$rel" ]] && continue
-            [[ "$rel" == ".git"* ]] && continue
 
             if is_excluded "$rel"; then
-              echo "  ~ excluded: $rel"
               SKIPPED=$((SKIPPED + 1))
               continue
             fi
 
-            dest="/tmp/base/$rel"
-            if [[ -e "$dest" ]]; then continue; fi
+            dest="$GITHUB_WORKSPACE/$rel"
+            if [[ -e "$dest" ]]; then
+              continue
+            fi
 
             mkdir -p "$(dirname "$dest")"
-            cp -a "/tmp/winlator-src/$rel" "$dest"
+            cp -a "/tmp/ref/$rel" "$dest"
             echo "  + $rel"
             COUNT=$((COUNT + 1))
           done < <(find . -type f -print | sort)
 
-          echo "Total new files copied: $COUNT  excluded: $SKIPPED"
+          echo
+          echo "Total new files copied: $COUNT"
+          echo "Total files skipped (excluded): $SKIPPED"
 
-      - name: Generate patch (base → winlator) and apply
-        run: |
-          set -euo pipefail
-          cd /tmp
-
-          EXCLUDES=("--exclude=.git")
-          for p in $EXCLUDE_PATHS; do
-            EXCLUDES+=("--exclude=$p")
-          done
-
-          diff -ruN "${EXCLUDES[@]}" \
-            base winlator-src > /tmp/winlator.patch || true
-
-          cd /tmp/base
-          if [[ -s /tmp/winlator.patch ]]; then
-            if patch -p1 --batch --forward < /tmp/winlator.patch; then
-              echo ">>> patch applied cleanly onto base"
-            else
-              echo ">>> patch reported rejects; listing .rej:"
-              find . -name '*.rej' -print || true
-            fi
-          else
-            echo ">>> patch empty"
-          fi
-
-          mkdir -p "$GITHUB_WORKSPACE/winlator-patch"
-          cp /tmp/winlator.patch "$GITHUB_WORKSPACE/winlator-patch/"
-
-      - name: Apply python patcher
-        run: |
-          set -euo pipefail
-          cd /tmp/base
-          python3 "$GITHUB_WORKSPACE/ci-scripts/patch_panvkdbg.py"
-
-      - name: Restore executable bits
-        run: |
-          set -euo pipefail
-          cd /tmp/base
-          while IFS= read -r f; do
-            case "$f" in
-              *.sh|*.bash|*.py|*.pl|*.rb|*.zsh) chmod +x "$f" || true ;;
-            esac
-          done < <(find . -type f -print)
-
-      - name: Commit and force-push to winlator branch
-        run: |
-          set -euo pipefail
-          cd /tmp/base
-
-          echo "=============================================="
-          echo "Stripping .github/workflows from the tree"
-          echo "=============================================="
-          rm -rf .github/workflows
-          find . -path './.git' -prune -o -type d -empty -print -delete 2>/dev/null || true
-
-          git init -q -b "$TARGET_BRANCH"
-          git config user.email "github-actions@users.noreply.github.com"
-          git config user.name  "github-actions"
-
-          git remote add origin \
-            "https://x-access-token:${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
-
-          git add -A
-          git commit -q -m "winlator: mixed source $(date -u +%Y%m%d-%H%M%S)"
-          git --no-pager log -1 --oneline
-          echo ">>> workflows in this commit:"
-          git ls-files .github/workflows/ 2>/dev/null || echo "    (none)"
-
-          echo ">>> force-pushing with PAT (workflow scope)"
-          git push --force origin "$TARGET_BRANCH"
-          echo ">>> push done"
-
-      - name: Upload winlator.patch artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: winlator-source-patch-${{ needs.prepare.outputs.stamp }}
-          path: ${{ github.workspace }}/winlator-patch/winlator.patch
-          if-no-files-found: warn
-
-  build:
-    needs: [prepare, prepare-winlator-branch]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      NDK_VERSION: 28.2.13676358
-      ANDROID_API: '35'
-      BUILD_JOBS: '2'
-    steps:
-      - name: Checkout winlator branch
-        uses: actions/checkout@v4
-        with:
-          ref: winlator
-          fetch-depth: 1
-          token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
-
-      - name: Report checked-out commit and CI scripts
-        run: |
-          set -euo pipefail
-          git --no-pager log -1 --oneline
-          ls -A | head -40
-          ls -la .github/winlatormali/ 2>/dev/null || echo "  (.github/winlatormali missing)"
-          ls -la .github/workflows/ 2>/dev/null || echo "  (.github/workflows missing — expected)"
-
-      - name: Verify build scripts are present
-        run: |
-          set -euo pipefail
-          MISSING=0
-          for f in .github/winlatormali/build.sh .github/winlatormali/package.py; do
-            if [[ ! -f "$f" ]]; then
-              echo "ERROR: $f missing on the winlator branch"
-              MISSING=1
-            else
-              echo "OK: $f"
-            fi
-          done
-          if [[ "$MISSING" -eq 1 ]]; then
-            find .github -maxdepth 3 -type f 2>/dev/null || true
-            exit 1
-          fi
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build cmake pkgconf bison flex ripgrep \
-            clang-19 llvm-19-dev libclang-19-dev libclang-cpp19-dev \
-            libclc-19 libclc-19-dev libllvmspirvlib-19-dev libdrm-dev \
-            zlib1g-dev python3-venv patchelf
-          python3 -m venv .ci-python
-          .ci-python/bin/pip install meson==1.8.3 Mako==1.3.10 \
-            packaging==25.0 PyYAML==6.0.2 ply==3.11
-          echo "$GITHUB_WORKSPACE/.ci-python/bin" >> "$GITHUB_PATH"
-
-      - name: Install Android NDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDKMANAGER="$(command -v sdkmanager || true)"
-          if [[ -z "$SDKMANAGER" ]]; then
-            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          fi
-          "$SDKMANAGER" "ndk;$NDK_VERSION"
-          echo "PANVK_NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
-
-      - name: Build host tools and Android driver
-        run: bash .github/winlatormali/build.sh
-
-      - name: Validate ELF and create driver ZIP
-        run: python3 .github/winlatormali/package.py
-
-      - name: Upload candidate
-        uses: actions/upload-artifact@v4
-        with:
-          name: PanVK-G57-WinlatorMali-candidate-${{ needs.prepare.outputs.stamp }}
-          path: out-winlatormali/
-          if-no-files-found: error
-
-      - name: Upload build logs
+      # ──────────────────────────────────────────────────────────
+      # 5) Upload the diff artifact. Runs regardless of whether
+      #    the push later succeeds or fails.
+      # ──────────────────────────────────────────────────────────
+      - name: Upload diff patch (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PanVK-G57-WinlatorMali-build-logs-${{ needs.prepare.outputs.stamp }}
+          name: winlator-ref-diff-${{ github.run_number }}
           path: |
-            build-winlatormali-native/meson-logs/
-            build-winlatormali-android/meson-logs/
-            ci-winlatormali/build.log
-            ci-winlatormali/provenance.txt
-          if-no-files-found: ignore
+            diff-out/winlator-ref.patch
+            diff-out/winlator-ref-summary.txt
+            diff-out/README.md
+          if-no-files-found: warn
 
-  release:
-    needs: [prepare, prepare-winlator-branch, build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: List downloaded files
-        run: find artifacts -type f -exec ls -lh {} \;
-
-      - name: Drop empty artifact files
+      # ──────────────────────────────────────────────────────────
+      # 6) Commit and force-push to the base branch.
+      #    Only pushes if something changed.
+      # ──────────────────────────────────────────────────────────
+      - name: Commit and force-push to ${{ env.BASE_BRANCH }}
         run: |
-          find artifacts -type f -empty -print -delete || true
-          find artifacts -type f -exec ls -lh {} \;
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          name: "${{ needs.prepare.outputs.tag }} — PanVK for Winlator ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
-          body: |
-            ## PanVK for Winlator (aarch64, cross-compile via Android NDK)
+          # Never stage CI-only scaffolding.
+          git add -A -- \
+            ':(exclude).github' \
+            ':(exclude)diff-out' \
+            ':(exclude)*.md'
 
-            Cross-compiled on `ubuntu-24.04` using NDK `28.2.13676358`
-            and Android API `35`.
+          if git diff --cached --quiet; then
+            echo ">>> No changes to commit — base already matches reference."
+            exit 0
+          fi
 
-            **Build date (UTC):** `${{ needs.prepare.outputs.date }}`
-            **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
-            **Commit:** `${{ github.sha }}`
+          echo "---- staged summary ----"
+          git diff --cached --stat | tail -40
+          echo "------------------------"
 
-            ### Source provenance
-            - Base: `xodiosx/mesa-panvk-mali-g57`
-            - Winlator source: `mexicanbr0auth/mesa-panvk-g57` (winlator-cl)
-            - Copied missing files, patched common files, applied
-              PANVKDBG neutralizer + driver rename.
-            - `.github/workflows` intentionally not modified.
+          git commit -q -m "sync: import winlatormali source from $REF_REPO@$REF_BRANCH_USED"
+          git --no-pager log -1 --oneline
 
-            Pre-patch diff attached as `winlator.patch`.
-
-            ### Files
-            - `PanVK-G57-WinlatorMali-candidate-*.zip` — packaged driver
-            - `winlator.patch` — diff of files present in both trees
-          files: |
-            artifacts/**/*
-          overwrite_files: true
-          generate_release_notes: true
-          prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo
+          echo ">>> force-pushing to origin/$BASE_BRANCH"
+          git push --force origin "HEAD:refs/heads/$BASE_BRANCH"
+          echo ">>> push done"
