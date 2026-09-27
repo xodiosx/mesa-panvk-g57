@@ -1,195 +1,23 @@
-name: PanVK G57 WinlatorMali Android
+name: PanVK G57 - WinlatorMali Android candidate
 
 on:
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Tag to create (leave empty to auto-generate)"
-        required: false
-        default: ""
   push:
     branches: [winlator-pan]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      date:  ${{ steps.ts.outputs.date }}
-      time:  ${{ steps.ts.outputs.time }}
-      stamp: ${{ steps.ts.outputs.stamp }}
-      tag:   ${{ steps.ts.outputs.tag }}
-    steps:
-      - name: Compute build timestamp and tag
-        id: ts
-        run: |
-          DATE=$(date -u +'%Y-%m-%d')
-          TIME=$(date -u +'%H%M%S')
-          STAMP="${DATE}-${TIME}"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          echo "date=$DATE"           >> "$GITHUB_OUTPUT"
-          echo "time=$TIME"           >> "$GITHUB_OUTPUT"
-          echo "stamp=$STAMP"         >> "$GITHUB_OUTPUT"
-          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG="${GITHUB_REF_NAME}"
-          elif [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
-            TAG="${{ github.event.inputs.release_tag }}"
-          else
-            TAG="build-${DATE}-${TIME}-${SHORT_SHA}"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
   android:
-    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       NDK_VERSION: 28.2.13676358
       ANDROID_API: '35'
       BUILD_JOBS: '2'
-      # Reference fork/branch to diff the current tree against.
-      REF_REPO:   "mexicanbr0auth/mesa-panvk-g57"
-      REF_BRANCH: "winlatormali-ci"
     steps:
       - uses: actions/checkout@v4
-
-      # ─────────────────────────────────────────────────────────────
-      # Clone the reference fork and diff it against the current
-      # checked-out tree. Produces a unified patch that tells us
-      # exactly what the reference branch has that our branch does
-      # not (and vice versa). Runs before the build so the patch
-      # exists even if everything after this step fails.
-      # ─────────────────────────────────────────────────────────────
-      - name: Generate diff vs ${{ env.REF_REPO }}@${{ env.REF_BRANCH }}
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$GITHUB_WORKSPACE/diff-out"
-          REF_DIR=/tmp/winlator-ref
-          rm -rf "$REF_DIR"
-
-          echo "==== branches available in $REF_REPO ===="
-          git ls-remote --heads "https://github.com/$REF_REPO.git" \
-            | awk '{print "  " $2}' | sed 's|refs/heads/||' | sort
-
-          echo
-          echo "==== selecting reference branch (preferred: $REF_BRANCH) ===="
-          CANDIDATES="$REF_BRANCH winlatormali-ci winlator-cl winlator main master"
-          USED_REF=""
-          for br in $CANDIDATES; do
-            if git ls-remote --heads "https://github.com/$REF_REPO.git" \
-                 "refs/heads/$br" 2>/dev/null | grep -q "refs/heads/$br"; then
-              USED_REF="$br"
-              echo ">>> matched candidate: $br"
-              break
-            else
-              echo "    not present: $br"
-            fi
-          done
-
-          if [[ -z "$USED_REF" ]]; then
-            USED_REF=$(git ls-remote --symref \
-                         "https://github.com/$REF_REPO.git" HEAD 2>/dev/null \
-                       | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
-            echo ">>> no candidate matched; using repo default: ${USED_REF:-<unknown>}"
-          fi
-
-          if [[ -z "$USED_REF" ]]; then
-            echo "ERROR: no usable branch from $REF_REPO" >&2
-            exit 1
-          fi
-          echo "REF_BRANCH_USED=$USED_REF" >> "$GITHUB_ENV"
-
-          echo
-          echo "==== cloning $REF_REPO @ $USED_REF ===="
-          git clone --depth 1 --branch "$USED_REF" \
-            "https://github.com/$REF_REPO.git" "$REF_DIR"
-
-          # Capture the reference HEAD before stripping .git.
-          REF_COMMIT=$(git -C "$REF_DIR" rev-parse HEAD)
-          echo "REF_COMMIT=$REF_COMMIT" >> "$GITHUB_ENV"
-
-          # Drop .git from the ref so diff doesn't walk into it.
-          rm -rf "$REF_DIR/.git"
-
-          cd "$GITHUB_WORKSPACE"
-
-          EXCLUDES=(
-            --exclude=.git
-            --exclude=.ci-python
-            --exclude=ci-winlatormali
-            --exclude=build-winlatormali-native
-            --exclude=build-winlatormali-android
-            --exclude=out-winlatormali
-            --exclude=diff-out
-            --exclude=__pycache__
-            --exclude='*.o'
-            --exclude='*.a'
-            --exclude='*.so'
-            --exclude='*.so.*'
-          )
-
-          echo
-          echo "==== running diff ===="
-          set +e
-          diff -ruN "${EXCLUDES[@]}" \
-            "$GITHUB_WORKSPACE" "$REF_DIR" \
-            > diff-out/winlator-ref.patch
-          DIFF_RC=$?
-          set -e
-          echo "diff exit code: $DIFF_RC  (0=identical, 1=differences, 2=error)"
-
-          if [[ "$DIFF_RC" -eq 2 ]]; then
-            echo "WARNING: diff produced an error; patch may be truncated"
-          fi
-
-          ls -lh diff-out/winlator-ref.patch
-
-          echo
-          echo "==== file-level summary ===="
-          set +e
-          diff -rq "${EXCLUDES[@]}" \
-            "$GITHUB_WORKSPACE" "$REF_DIR" \
-            > diff-out/winlator-ref-summary.txt 2>&1
-          set -e
-          wc -l diff-out/winlator-ref-summary.txt
-          echo "---- first 60 lines ----"
-          head -60 diff-out/winlator-ref-summary.txt || true
-          echo "------------------------"
-
-          {
-            echo "### Source repository"
-            echo "- URL:    https://github.com/${{ github.repository }}"
-            echo "- Branch: ${{ github.ref_name }}"
-            echo "- Commit: ${{ github.sha }}"
-            echo
-            echo "### Reference repository"
-            echo "- URL:    https://github.com/$REF_REPO"
-            echo "- Branch: $USED_REF"
-            echo "- Commit: $REF_COMMIT"
-            echo
-            echo "### Diff direction"
-            echo "\`- \` lines: present in source branch, absent in reference"
-            echo "\`+ \` lines: present in reference, absent in source"
-          } > diff-out/README.md
-
-          cat diff-out/README.md
-
-      - name: Upload diff patch (always, even if build fails)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: winlator-ref-diff-${{ needs.prepare.outputs.stamp }}
-          path: |
-            diff-out/winlator-ref.patch
-            diff-out/winlator-ref-summary.txt
-            diff-out/README.md
-          if-no-files-found: warn
-
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -201,7 +29,6 @@ jobs:
           .ci-python/bin/pip install meson==1.8.3 Mako==1.3.10 \
             packaging==25.0 PyYAML==6.0.2 ply==3.11
           echo "$GITHUB_WORKSPACE/.ci-python/bin" >> "$GITHUB_PATH"
-
       - name: Install Android NDK
         shell: bash
         run: |
@@ -212,114 +39,24 @@ jobs:
           fi
           "$SDKMANAGER" "ndk;$NDK_VERSION"
           echo "PANVK_NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
-
-      - name: Disable local-sources sha256 check
-        run: |
-          set -euo pipefail
-          BUILD=".github/winlatormali/build.sh"
-          [[ -f "$BUILD" ]] || { echo "ERROR: $BUILD not found"; exit 1; }
-
-          echo "==== sha256sum references (before) ===="
-          grep -n 'sha256sum' "$BUILD" || echo "  (none)"
-
-          sed -i -E \
-            's|^([[:space:]]*)sha256sum[[:space:]]+-c[[:space:]]+[^[:space:]]*local-sources\.sha256.*$|\1# [CI-disabled] sha256 check removed|' \
-            "$BUILD"
-
-          echo "==== sha256sum references (after) ===="
-          grep -n 'sha256sum' "$BUILD" || echo "  (none remaining)"
-
-          rm -f .github/winlatormali/local-sources.sha256
-
       - name: Build host tools and Android driver
         run: bash .github/winlatormali/build.sh
-
       - name: Validate ELF and create driver ZIP
         run: python3 .github/winlatormali/package.py
-
       - name: Upload candidate
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: PanVK-G57-WinlatorMali-candidate-${{ needs.prepare.outputs.stamp }}
+          name: PanVK-G57-WinlatorMali-candidate
           path: out-winlatormali/
           if-no-files-found: error
-
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PanVK-G57-WinlatorMali-build-logs-${{ needs.prepare.outputs.stamp }}
+          name: PanVK-G57-WinlatorMali-build-logs
           path: |
             build-winlatormali-native/meson-logs/
             build-winlatormali-android/meson-logs/
             ci-winlatormali/build.log
             ci-winlatormali/provenance.txt
           if-no-files-found: ignore
-
-  release:
-    needs: [prepare, android]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: List downloaded files
-        run: find artifacts -type f -exec ls -lh {} \;
-
-      - name: Drop empty artifact files
-        run: |
-          find artifacts -type f -empty -print -delete || true
-          find artifacts -type f -exec ls -lh {} \;
-
-      - name: Create GitHub Release
-        if: hashFiles('artifacts/**') != ''
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          name: "${{ needs.prepare.outputs.tag }} — PanVK G57 WinlatorMali ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
-          body: |
-            ## PanVK G57 for WinlatorMali (aarch64, cross-compile via Android NDK)
-
-            Cross-compiled on `ubuntu-24.04` using NDK `28.2.13676358`
-            and Android API `35`.
-
-            **Build date (UTC):** `${{ needs.prepare.outputs.date }}`
-            **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
-            **Commit:** `${{ github.sha }}`
-
-            ### Diff vs reference branch
-            A unified diff against
-            `mexicanbr0auth/mesa-panvk-g57` is attached as
-            `winlator-ref.patch`. Read `README.md` for direction and
-            provenance.
-
-            ### What is included
-            - **PanVK** — Vulkan driver for Mali-G57 (Valhall JM) via kbase
-              (panthor). No Zink, no GL/EGL frontends.
-
-            ### Files
-            - `PanVK-G57-WinlatorMali-candidate-*.zip` — packaged driver
-              (only present if the build succeeded)
-            - `winlator-ref.patch` — diff vs the reference branch
-            - `winlator-ref-summary.txt` — file-level summary of the diff
-            - `README.md` — provenance for the diff
-
-            ### Install (Winlator / Android container)
-            ```bash
-            unzip PanVK-G57-WinlatorMali-candidate-*.zip -d /path/to/rootfs
-            export VK_ICD_FILENAMES=/path/to/rootfs/share/vulkan/icd.d/panfrost_icd.aarch64.json
-            export LD_LIBRARY_PATH=/path/to/rootfs/lib:$LD_LIBRARY_PATH
-            ```
-          files: |
-            artifacts/**/*
-          fail_on_unmatched_files: false
-          overwrite_files: true
-          generate_release_notes: true
-          prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
