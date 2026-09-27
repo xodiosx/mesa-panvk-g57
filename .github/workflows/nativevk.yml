@@ -92,6 +92,9 @@ jobs:
 
           3. Change the Vulkan driver ID reported by PanVK from
              VK_DRIVER_ID_MESA_PANVK to a custom value.
+
+          4. Teach Zink's zink_set_driver_strings() to display "panvcake"
+             for that custom ID (otherwise GL_RENDERER shows "Driver Unknown").
           """
           import re
           import sys
@@ -114,6 +117,8 @@ jobs:
               (re.compile(r'"PanVK"'),      '"PanVCake"'),
               (re.compile(r'"panvk"'),      '"panvcake"'),
           ]
+
+          ZINK_SCREEN = Path("src/gallium/drivers/zink/zink_screen.c")
 
 
           def _find_close_paren(src, open_paren_idx):
@@ -192,6 +197,56 @@ jobs:
               return src, n_name, n_id
 
 
+          def patch_zink(src):
+              """
+              zink_set_driver_strings() calls vk_DriverId_to_str() and only
+              uses the result if the string contains "VK_DRIVER_ID_". Our
+              custom ID isn't in the generated table, so the string is
+              "UNKNOWN_<value>" and Zink prints "Driver Unknown" in
+              GL_RENDERER.
+
+              Add a special case so when the driver ID equals our custom
+              value the display name is "panvcake".
+
+              Returns (src, 0)  if already patched,
+                      (src, 1)  on success,
+                      (src, -1) if the expected pattern was not found.
+              """
+              if 'zink_driverid(screen)) == 0x0000CAFE' in src:
+                  return src, 0
+
+              old = (
+                  '   const char *driver_name = vk_DriverId_to_str(zink_driverid(screen)) + strlen("VK_DRIVER_ID_");\n'
+                  '   int written = snprintf(buf, sizeof(buf), "zink Vulkan %d.%d(%s (%s))",\n'
+                  '      VK_VERSION_MAJOR(screen->info.device_version),\n'
+                  '      VK_VERSION_MINOR(screen->info.device_version),\n'
+                  '      screen->info.props.deviceName,\n'
+                  '      strstr(vk_DriverId_to_str(zink_driverid(screen)), "VK_DRIVER_ID_") ? driver_name : "Driver Unknown"\n'
+                  '   );'
+              )
+
+              new = (
+                  '   const char *driver_name = vk_DriverId_to_str(zink_driverid(screen)) + strlen("VK_DRIVER_ID_");\n'
+                  '   /* Downstream: report a friendly name for our non-standard driver ID. */\n'
+                  '   const char *name_part;\n'
+                  '   if ((unsigned)zink_driverid(screen) == 0x0000CAFE)\n'
+                  '      name_part = "panvcake";\n'
+                  '   else\n'
+                  '      name_part = strstr(vk_DriverId_to_str(zink_driverid(screen)), "VK_DRIVER_ID_") ? driver_name : "Driver Unknown";\n'
+                  '   int written = snprintf(buf, sizeof(buf), "zink Vulkan %d.%d(%s (%s))",\n'
+                  '      VK_VERSION_MAJOR(screen->info.device_version),\n'
+                  '      VK_VERSION_MINOR(screen->info.device_version),\n'
+                  '      screen->info.props.deviceName,\n'
+                  '      name_part\n'
+                  '   );'
+              )
+
+              if old not in src:
+                  return src, -1
+              src = src.replace(old, new, 1)
+              return src, 1
+
+
           def main():
               for root in ROOTS:
                   if not root.exists():
@@ -201,6 +256,7 @@ jobs:
               total_neutralized = 0
               total_names = 0
               total_ids = 0
+              total_zink = 0
               files_modified = 0
 
               for root in ROOTS:
@@ -234,11 +290,28 @@ jobs:
                           path.write_text(src)
                           files_modified += 1
 
+              if ZINK_SCREEN.exists():
+                  src = ZINK_SCREEN.read_text()
+                  src2, n = patch_zink(src)
+                  if n == -1:
+                      print(f"WARNING: {ZINK_SCREEN}: expected pattern not "
+                            f"found; check the file manually.")
+                  elif n == 0:
+                      print(f"{ZINK_SCREEN}: zink already patched (skipped)")
+                  else:
+                      ZINK_SCREEN.write_text(src2)
+                      print(f"{ZINK_SCREEN}: zink driver-name override added")
+                      total_zink = 1
+                      files_modified += 1
+              else:
+                  print(f"WARNING: {ZINK_SCREEN} not found")
+
               print()
               print(f"Files modified:                   {files_modified}")
               print(f"PANVKDBG calls neutralized:       {total_neutralized}")
               print(f"Driver-name strings renamed:      {total_names}")
               print(f"Driver-ID occurrences replaced:   {total_ids}")
+              print(f"Zink driver-name overrides added: {total_zink}")
 
               return 0
 
@@ -596,6 +669,10 @@ jobs:
               **`panvcake`**.
             - PanVK driver ID changed from `VK_DRIVER_ID_MESA_PANVK` to
               `(VkDriverId)0x0000CAFE`.
+            - Zink's `zink_set_driver_strings()` has an explicit case for
+              that ID so `glxinfo` reports
+              `zink Vulkan 1.3(Mali-G57 MC2 (panvcake))` instead of
+              `Driver Unknown`.
 
             ### Files
             - `panvk-zink-termux-aarch64-debugoptimized-${{ needs.prepare.outputs.stamp }}.tar.gz`
@@ -635,6 +712,16 @@ jobs:
             export PANVK_NO_AFBC=1
             export PANVK_SPLIT_SUBMIT=1
             glmark2
+            ```
+
+            ### Verify
+
+            ```bash
+            vulkaninfo | grep -i "driverName\\|panvcake"
+            # expect: driverName = panvcake
+
+            glxinfo | grep -i "OpenGL renderer"
+            # expect: GL_RENDERER: zink Vulkan 1.3(Mali-G57 MC2 (panvcake))
             ```
           files: |
             artifacts/*.tar.gz
