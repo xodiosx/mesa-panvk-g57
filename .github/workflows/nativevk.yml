@@ -1,4 +1,4 @@
-name: release PanVK + Zink for Termux (aarch64, native)
+name: release PanVc + Zink for Termux (aarch64, native)
 
 on:
   push:
@@ -353,11 +353,12 @@ jobs:
           SRC="${{ github.workspace }}/_src"
           DST="${{ github.workspace }}"
 
-          echo "--- syncing $SRC -> $DST (excluding VCS + markdown + binaries) ---"
+          echo "--- syncing $SRC -> $DST (excluding VCS + markdown + docs + binaries) ---"
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='.github/' \
             --exclude='*.md' \
+            --exclude='docs/' \
             --exclude='*.tar.gz' \
             --exclude='*.tar.xz' \
             --exclude='*.zip' \
@@ -395,10 +396,10 @@ jobs:
             if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
               BRANCH="main"
             fi
-            echo ">>> pushing to branch: ${BRANCH}"
+            echo ">>> force-pushing to branch: ${BRANCH}"
 
             git commit -m "CI: sync patched Mesa tree from xodiosx/mesa-panvk-mali-g57 ($(date -u +%Y%m%d-%H%M%S))"
-            git push origin "HEAD:refs/heads/${BRANCH}"
+            git push --force origin "HEAD:refs/heads/${BRANCH}"
             echo ">>> push succeeded"
           fi
         env:
