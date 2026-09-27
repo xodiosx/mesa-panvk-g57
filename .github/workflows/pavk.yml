@@ -80,8 +80,9 @@ jobs:
             wget -q "${url}${file}" || true
           }
           fetch_deb "libxkbcommon" "https://packages.termux.dev/apt/termux-x11/pool/main/libx/libxkbcommon/" || true
-          fetch_deb "libxcb"       "https://packages.termux.dev/apt/termux-main/pool/main/libx/libxcb/" || true
-
+          fetch_deb "libxcb" 
+          fetch_deb "libdrm"       "https://packages.termux.dev/apt/termux-main/pool/main/libd/libdrm/" || true
+          
           for deb in *.deb; do
             [ -e "$deb" ] || continue
             dpkg-deb -x "$deb" /tmp/debs/extracted/
