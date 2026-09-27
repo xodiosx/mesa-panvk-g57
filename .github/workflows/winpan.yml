@@ -1,50 +1,15 @@
-name: PanVK G57 WinlatorMali Android
+name: PanVK G57 - WinlatorMali Android candidate
 
 on:
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Tag to create (leave empty to auto-generate)"
-        required: false
-        default: ""
   push:
     branches: [winlator-pan]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      date:  ${{ steps.ts.outputs.date }}
-      time:  ${{ steps.ts.outputs.time }}
-      stamp: ${{ steps.ts.outputs.stamp }}
-      tag:   ${{ steps.ts.outputs.tag }}
-    steps:
-      - name: Compute build timestamp and tag
-        id: ts
-        run: |
-          DATE=$(date -u +'%Y-%m-%d')
-          TIME=$(date -u +'%H%M%S')
-          STAMP="${DATE}-${TIME}"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          echo "date=$DATE"           >> "$GITHUB_OUTPUT"
-          echo "time=$TIME"           >> "$GITHUB_OUTPUT"
-          echo "stamp=$STAMP"         >> "$GITHUB_OUTPUT"
-          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG="${GITHUB_REF_NAME}"
-          elif [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
-            TAG="${{ github.event.inputs.release_tag }}"
-          else
-            TAG="build-${DATE}-${TIME}-${SHORT_SHA}"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
   android:
-    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -52,31 +17,7 @@ jobs:
       ANDROID_API: '35'
       BUILD_JOBS: '2'
     steps:
-      # ──────────────────────────────────────────────────────────
-      # 1) Checkout the already-synced branch. No reference clone.
-      # ──────────────────────────────────────────────────────────
       - uses: actions/checkout@v4
-
-      - name: Report checked-out commit
-        run: |
-          set -euo pipefail
-          git --no-pager log -1 --oneline
-          echo "==== workspace top-level ===="
-          ls -A | head -60
-          echo "==== sanity: is this the synced tree? ===="
-          for f in \
-            src/vulkan/wsi/wsi_common_android.c \
-            src/util/u_gralloc/u_gralloc_panvk_test.h \
-            src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h \
-            .github/winlatormali/build.sh \
-            .github/winlatormali/package.py
-          do
-            if [[ -f "$f" ]]; then
-              echo "  OK   $f"
-            else
-              echo "  MISS $f  <- sync script may not have run yet"
-            fi
-          done
 
       - name: Install Linux build dependencies
         run: |
@@ -102,134 +43,111 @@ jobs:
           echo "PANVK_NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       # ──────────────────────────────────────────────────────────
-      # 2) Disable the sha256 check that lives in the reference's
-      #    build.sh (still references a manifest that isn't checked in
-      #    on this branch).
+      # Patch 1 — drop the sha256 manifest check from build.sh.
+      # The manifest is not checked in on this branch.
       # ──────────────────────────────────────────────────────────
-      - name: Disable local-sources sha256 check
+      - name: Patch build.sh (disable sha256 check)
         run: |
           set -euo pipefail
           BUILD=".github/winlatormali/build.sh"
           [[ -f "$BUILD" ]] || { echo "ERROR: $BUILD not found"; exit 1; }
-
-          echo "==== sha256sum references (before) ===="
-          grep -n 'sha256sum' "$BUILD" || echo "  (none)"
-
           sed -i -E \
             's|^([[:space:]]*)sha256sum[[:space:]]+-c[[:space:]]+[^[:space:]]*local-sources\.sha256.*$|\1# [CI-disabled] sha256 check removed|' \
             "$BUILD"
-
-          echo "==== sha256sum references (after) ===="
+          rm -f .github/winlatormali/local-sources.sha256
           grep -n 'sha256sum' "$BUILD" || echo "  (none remaining)"
 
-          rm -f .github/winlatormali/local-sources.sha256
-
       # ──────────────────────────────────────────────────────────
-      # 3) Neutralize the AHB trace dump helper. Uses NDK-unavailable
-      #    APIs (AHardwareBuffer_getSize, desc.allocationSize,
-      #    vk_object_base.handle). Debug-only, gated on
-      #    PANVK_AHB_TRACE=1, so a no-op stub is safe.
+      # Patch 2 — NDK 28 compat: panvk_android.c's trace dump helper
+      # uses APIs that don't exist in NDK 28's headers. Debug-only,
+      # gated on PANVK_AHB_TRACE=1, so replacing the body with a
+      # no-op stub is safe.
       # ──────────────────────────────────────────────────────────
-      - name: Patch panvk_android.c for NDK 28 compatibility
+      - name: Patch panvk_android.c (NDK 28 compat)
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import sys
-
           path = "src/panfrost/vulkan/panvk_android.c"
           try:
               src = open(path, encoding="utf-8").read()
           except FileNotFoundError:
-              print(f"ERROR: {path} not found", file=sys.stderr)
-              sys.exit(1)
+              print(f"ERROR: {path} not found", file=sys.stderr); sys.exit(1)
 
-          marker = "panvk_android_ahb_trace_dump"
           if "/* CI: trace dump disabled" in src:
-              print("Already patched — skipping.")
-              sys.exit(0)
+              print("Already patched — skipping."); sys.exit(0)
 
-          start = src.find(marker)
+          start = src.find("panvk_android_ahb_trace_dump")
           if start == -1:
-              print(f"WARNING: {marker} not found; nothing to do.")
-              sys.exit(0)
+              print("WARNING: helper not found; nothing to do."); sys.exit(0)
 
           brace = src.find("{", start)
           if brace == -1:
-              print("WARNING: could not locate opening brace.")
-              sys.exit(0)
+              print("WARNING: opening brace not found."); sys.exit(0)
 
-          depth = 0
-          i = brace
+          depth = 0; i = brace
           in_str = in_chr = False
-          in_line_comment = in_block_comment = False
+          in_line = in_block = False
           while i < len(src):
-              c = src[i]
-              nxt = src[i+1] if i+1 < len(src) else ""
-              if in_line_comment:
-                  if c == "\n":
-                      in_line_comment = False
-              elif in_block_comment:
-                  if c == "*" and nxt == "/":
-                      in_block_comment = False
-                      i += 1
+              c = src[i]; nxt = src[i+1] if i+1 < len(src) else ""
+              if in_line:
+                  if c == "\n": in_line = False
+              elif in_block:
+                  if c == "*" and nxt == "/": in_block = False; i += 1
               elif in_str:
-                  if c == "\\":
-                      i += 1
-                  elif c == '"':
-                      in_str = False
+                  if c == "\\": i += 1
+                  elif c == '"': in_str = False
               elif in_chr:
-                  if c == "\\":
-                      i += 1
-                  elif c == "'":
-                      in_chr = False
+                  if c == "\\": i += 1
+                  elif c == "'": in_chr = False
               else:
-                  if c == "/" and nxt == "/":
-                      in_line_comment = True
-                      i += 1
-                  elif c == "/" and nxt == "*":
-                      in_block_comment = True
-                      i += 1
-                  elif c == '"':
-                      in_str = True
-                  elif c == "'":
-                      in_chr = True
-                  elif c == "{":
-                      depth += 1
+                  if c == "/" and nxt == "/": in_line = True; i += 1
+                  elif c == "/" and nxt == "*": in_block = True; i += 1
+                  elif c == '"': in_str = True
+                  elif c == "'": in_chr = True
+                  elif c == "{": depth += 1
                   elif c == "}":
                       depth -= 1
-                      if depth == 0:
-                          break
+                      if depth == 0: break
               i += 1
 
           if depth != 0:
-              print("ERROR: could not match closing brace.", file=sys.stderr)
-              sys.exit(1)
+              print("ERROR: could not match closing brace.", file=sys.stderr); sys.exit(1)
 
           replacement = (
               "{\n"
               "   /* CI: trace dump disabled for NDK 28 — uses APIs not in\n"
-              "    * android/hardware_buffer.h (AHardwareBuffer_getSize),\n"
-              "    * AHardwareBuffer_Desc.allocationSize, and\n"
-              "    * vk_object_base.handle. Debug-only, gated on\n"
-              "    * PANVK_AHB_TRACE=1, so the stub is a no-op. */\n"
+              "    * android/hardware_buffer.h. Debug-only, gated on\n"
+              "    * PANVK_AHB_TRACE=1, so this stub is a no-op. */\n"
               "   (void)tag; (void)ahb; (void)img; (void)layout;\n"
               "   return;\n"
               "}"
           )
-
           new_src = src[:brace] + replacement + src[i+1:]
           open(path, "w", encoding="utf-8").write(new_src)
-          print(f"Patched {path}: body of {marker} replaced with a no-op stub.")
+          print(f"Patched {path}.")
           PY
 
-          echo "==== verify ===="
-          grep -n -A4 'panvk_android_ahb_trace_dump' \
-            src/panfrost/vulkan/panvk_android.c | head -40
+      # ──────────────────────────────────────────────────────────
+      # Patch 3 — build wsi_common_android.c under android-stub too.
+      # The reference condition has `not with_android_stub`, which
+      # excludes the file while wsi_common.c still calls its
+      # symbols → `undefined symbol: wsi_android_init_wsi`.
+      # ──────────────────────────────────────────────────────────
+      - name: Patch wsi/meson.build (build wsi_common_android.c)
+        run: |
+          set -euo pipefail
+          FILE="src/vulkan/wsi/meson.build"
+          [[ -f "$FILE" ]] || { echo "ERROR: $FILE not found"; exit 1; }
+          sed -i -E \
+            's|if with_platform_android and not with_android_stub and get_option|if with_platform_android and get_option|' \
+            "$FILE"
+          if grep -qE 'not with_android_stub' "$FILE"; then
+            echo "ERROR: substitution failed"; exit 1
+          fi
+          grep -n 'wsi_common_android.c' "$FILE" || { echo "ERROR: android WSI still missing"; exit 1; }
+          echo "OK: $FILE patched"
 
-      # ──────────────────────────────────────────────────────────
-      # 4) Build using the reference's own build.sh, which is already
-      #    part of this branch.
-      # ──────────────────────────────────────────────────────────
       - name: Build host tools and Android driver
         run: bash .github/winlatormali/build.sh
 
@@ -237,10 +155,9 @@ jobs:
         run: python3 .github/winlatormali/package.py
 
       - name: Upload candidate
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: PanVK-G57-WinlatorMali-candidate-${{ needs.prepare.outputs.stamp }}
+          name: PanVK-G57-WinlatorMali-candidate
           path: out-winlatormali/
           if-no-files-found: error
 
@@ -248,73 +165,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PanVK-G57-WinlatorMali-build-logs-${{ needs.prepare.outputs.stamp }}
+          name: PanVK-G57-WinlatorMali-build-logs
           path: |
             build-winlatormali-native/meson-logs/
             build-winlatormali-android/meson-logs/
             ci-winlatormali/build.log
             ci-winlatormali/provenance.txt
           if-no-files-found: ignore
-
-  release:
-    needs: [prepare, android]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: List downloaded files
-        run: find artifacts -type f -exec ls -lh {} \;
-
-      - name: Drop empty artifact files
-        run: |
-          find artifacts -type f -empty -print -delete || true
-          find artifacts -type f -exec ls -lh {} \;
-
-      - name: Create GitHub Release
-        if: hashFiles('artifacts/**') != ''
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          name: "${{ needs.prepare.outputs.tag }} — PanVK G57 WinlatorMali ${{ needs.prepare.outputs.date }} ${{ needs.prepare.outputs.time }} UTC"
-          body: |
-            ## PanVK G57 for WinlatorMali (aarch64, cross-compile via Android NDK)
-
-            Cross-compiled on `ubuntu-24.04` using NDK `28.2.13676358`
-            and Android API `35`.
-
-            **Build date (UTC):** `${{ needs.prepare.outputs.date }}`
-            **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
-            **Commit:** `${{ github.sha }}`
-
-            ### Source
-            Built from the already-synced `winlator-pan` branch. The sync
-            workflow is responsible for pulling in the reference's AHB /
-            Winlator / AdrenoTools changes; this workflow only builds.
-
-            ### Source patches applied before build
-            - `local-sources.sha256` check disabled.
-            - `panvk_android.c`: `panvk_android_ahb_trace_dump()` body
-              replaced with a no-op stub for NDK 28 compat.
-
-            ### Files
-            - `PanVK-G57-WinlatorMali-candidate-*.zip` — packaged driver
-
-            ### Install (Winlator / Android container)
-            ```bash
-            unzip PanVK-G57-WinlatorMali-candidate-*.zip -d /path/to/rootfs
-            export VK_ICD_FILENAMES=/path/to/rootfs/share/vulkan/icd.d/panfrost_icd.aarch64.json
-            export LD_LIBRARY_PATH=/path/to/rootfs/lib:$LD_LIBRARY_PATH
-            ```
-          files: |
-            artifacts/**/*
-          fail_on_unmatched_files: false
-          overwrite_files: true
-          generate_release_notes: true
-          prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
