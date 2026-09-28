@@ -8,14 +8,14 @@
 
 #include "vulkan/util/vk_util.h"
 
-#include "panvcake_android.h"
-#include "panvcake_device.h"
-#include "panvcake_device_memory.h"
+#include "panvk_android.h"
+#include "panvk_device.h"
+#include "panvk_device_memory.h"
 
 #if defined(HAVE_PAN_KMOD_KBASE)
 #include "lib/kmod/kbase_kmod.h"
 #endif
-#include "panvcake_entrypoints.h"
+#include "panvk_entrypoints.h"
 
 #include "pan_props.h"
 

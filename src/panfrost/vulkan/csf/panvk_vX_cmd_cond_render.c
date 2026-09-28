@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_entrypoints.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_entrypoints.h"
 
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdBeginConditionalRendering2EXT)(

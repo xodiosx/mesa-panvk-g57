@@ -6,7 +6,7 @@
 #ifndef PANVK_FB_PRELOAD_H
 #define PANVK_FB_PRELOAD_H
 
-#include "panvcake_cmd_buffer.h"
+#include "panvk_cmd_buffer.h"
 #include "pan_desc.h"
 #include "pan_fb.h"
 

@@ -15,11 +15,11 @@
 
 #include "genxml/cs_builder.h"
 
-#include "panvcake_cmd_desc_state.h"
-#include "panvcake_cmd_dispatch.h"
-#include "panvcake_cmd_draw.h"
-#include "panvcake_cmd_push_constant.h"
-#include "panvcake_queue.h"
+#include "panvk_cmd_desc_state.h"
+#include "panvk_cmd_dispatch.h"
+#include "panvk_cmd_draw.h"
+#include "panvk_cmd_push_constant.h"
+#include "panvk_queue.h"
 
 #include "vk_command_buffer.h"
 #include "vk_synchronization.h"

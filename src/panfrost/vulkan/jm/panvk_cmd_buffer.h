@@ -14,16 +14,16 @@
 
 #include "vulkan/runtime/vk_command_buffer.h"
 
-#include "panvcake_cmd_desc_state.h"
-#include "panvcake_cmd_dispatch.h"
-#include "panvcake_cmd_draw.h"
-#include "panvcake_cmd_push_constant.h"
-#include "panvcake_descriptor_set.h"
-#include "panvcake_descriptor_set_layout.h"
-#include "panvcake_device.h"
-#include "panvcake_macros.h"
-#include "panvcake_mempool.h"
-#include "panvcake_shader.h"
+#include "panvk_cmd_desc_state.h"
+#include "panvk_cmd_dispatch.h"
+#include "panvk_cmd_draw.h"
+#include "panvk_cmd_push_constant.h"
+#include "panvk_descriptor_set.h"
+#include "panvk_descriptor_set_layout.h"
+#include "panvk_device.h"
+#include "panvk_macros.h"
+#include "panvk_mempool.h"
+#include "panvk_shader.h"
 
 #include "pan_jc.h"
 

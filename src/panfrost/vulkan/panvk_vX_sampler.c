@@ -5,9 +5,9 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvcake_device.h"
-#include "panvcake_entrypoints.h"
-#include "panvcake_sampler.h"
+#include "panvk_device.h"
+#include "panvk_entrypoints.h"
+#include "panvk_sampler.h"
 
 #include "pan_afbc.h"
 #include "pan_encoder.h"

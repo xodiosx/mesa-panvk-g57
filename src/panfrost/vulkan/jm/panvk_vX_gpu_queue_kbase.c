@@ -5,11 +5,11 @@
  * DRM Panfrost por KBASE_IOCTL_JOB_SUBMIT direto em /dev/mali0.
  */
 
-#include "panvcake_device.h"
-#include "panvcake_physical_device.h"
-#include "panvcake_priv_bo.h"
-#include "panvcake_queue.h"
-#include "panvcake_cmd_buffer.h"
+#include "panvk_device.h"
+#include "panvk_physical_device.h"
+#include "panvk_priv_bo.h"
+#include "panvk_queue.h"
+#include "panvk_cmd_buffer.h"
 #include "decode.h"
 
 #include "lib/kmod/kbase_kmod.h"

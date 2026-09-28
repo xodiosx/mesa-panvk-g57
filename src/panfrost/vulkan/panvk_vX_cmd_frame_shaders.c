@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_cmd_frame_shaders.h"
+#include "panvk_cmd_frame_shaders.h"
 
-#include "panvcake_cmd_alloc.h"
-#include "panvcake_image_view.h"
-#include "panvcake_meta.h"
-#include "panvcake_shader.h"
+#include "panvk_cmd_alloc.h"
+#include "panvk_image_view.h"
+#include "panvk_meta.h"
+#include "panvk_shader.h"
 
 #include "nir_builder.h"
 

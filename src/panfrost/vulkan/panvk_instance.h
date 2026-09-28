@@ -9,7 +9,7 @@
 #include <stdint.h>
 
 #include "vk_instance.h"
-#include "panvcake_drirc.h"
+#include "panvk_drirc.h"
 
 #include "lib/kmod/pan_kmod.h"
 

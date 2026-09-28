@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_device.h"
+#include "panvk_device.h"
 
 #include "vk_limits.h"
 

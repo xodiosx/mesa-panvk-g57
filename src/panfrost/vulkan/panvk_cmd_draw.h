@@ -10,14 +10,14 @@
 #error "PAN_ARCH must be defined"
 #endif
 
-#include "panvcake_blend.h"
-#include "panvcake_cmd_desc_state.h"
-#include "panvcake_cmd_query.h"
-#include "panvcake_entrypoints.h"
-#include "panvcake_image.h"
-#include "panvcake_image_view.h"
-#include "panvcake_physical_device.h"
-#include "panvcake_shader.h"
+#include "panvk_blend.h"
+#include "panvk_cmd_desc_state.h"
+#include "panvk_cmd_query.h"
+#include "panvk_entrypoints.h"
+#include "panvk_image.h"
+#include "panvk_image_view.h"
+#include "panvk_physical_device.h"
+#include "panvk_shader.h"
 
 #include "vk_command_buffer.h"
 #include "vk_format.h"

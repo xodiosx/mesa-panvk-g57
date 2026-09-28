@@ -10,10 +10,10 @@
 #error "PAN_ARCH must be defined"
 #endif
 
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_cmd_desc_state.h"
-#include "panvcake_cmd_push_constant.h"
-#include "panvcake_descriptor_set.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_cmd_desc_state.h"
+#include "panvk_cmd_push_constant.h"
+#include "panvk_descriptor_set.h"
 
 struct panvk_shader;
 

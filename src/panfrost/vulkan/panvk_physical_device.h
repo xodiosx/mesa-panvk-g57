@@ -9,8 +9,8 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#include "panvcake_instance.h"
-#include "panvcake_macros.h"
+#include "panvk_instance.h"
+#include "panvk_macros.h"
 
 #include "vk_physical_device.h"
 #include "vk_sync.h"

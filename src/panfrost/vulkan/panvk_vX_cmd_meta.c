@@ -4,17 +4,17 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_buffer.h"
-#include "panvcake_cmd_meta.h"
-#include "panvcake_entrypoints.h"
-#include "panvcake_image.h"
-#include "panvcake_meta.h"
-#include "panvcake_tracepoints.h"
+#include "panvk_buffer.h"
+#include "panvk_cmd_meta.h"
+#include "panvk_entrypoints.h"
+#include "panvk_image.h"
+#include "panvk_meta.h"
+#include "panvk_tracepoints.h"
 #if PAN_ARCH >= 10
 #include "csf/panvk_instr.h"
 #endif
 
-#include "panvcake_cmd_precomp.h"
+#include "panvk_cmd_precomp.h"
 #include "libpan.h"
 #include "libpan_copy.h"
 #include "libpan_dgc.h"

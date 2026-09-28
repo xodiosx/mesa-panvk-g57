@@ -4,14 +4,14 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_utrace.h"
+#include "panvk_utrace.h"
 
 #include "kmod/pan_kmod.h"
 #include "util/log.h"
 #include "util/timespec.h"
-#include "panvcake_device.h"
-#include "panvcake_physical_device.h"
-#include "panvcake_priv_bo.h"
+#include "panvk_device.h"
+#include "panvk_physical_device.h"
+#include "panvk_priv_bo.h"
 #include "vk_sync.h"
 
 static struct panvk_device *

@@ -10,9 +10,9 @@
  */
 
 #include <stdio.h>
-#include "panvcake_wsi.h"
-#include "panvcake_instance.h"
-#include "panvcake_physical_device.h"
+#include "panvk_wsi.h"
+#include "panvk_instance.h"
+#include "panvk_physical_device.h"
 
 #include <stdlib.h>
 #include <string.h>

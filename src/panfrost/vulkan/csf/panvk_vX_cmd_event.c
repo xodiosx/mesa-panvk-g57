@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_entrypoints.h"
-#include "panvcake_event.h"
-#include "panvcake_instr.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_entrypoints.h"
+#include "panvk_event.h"
+#include "panvk_instr.h"
 
 #include "util/bitscan.h"
 

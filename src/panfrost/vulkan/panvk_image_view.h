@@ -17,7 +17,7 @@
 #include "pan_texture.h"
 
 #include "genxml/gen_macros.h"
-#include "panvcake_image.h"
+#include "panvk_image.h"
 
 struct panvk_priv_bo;
 

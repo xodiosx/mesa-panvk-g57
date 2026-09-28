@@ -12,12 +12,12 @@
 #include "vk_device.h"
 #include "vk_meta.h"
 
-#include "panvcake_blend.h"
-#include "panvcake_instance.h"
-#include "panvcake_macros.h"
-#include "panvcake_mempool.h"
-#include "panvcake_physical_device.h"
-#include "panvcake_utrace_perfetto.h"
+#include "panvk_blend.h"
+#include "panvk_instance.h"
+#include "panvk_macros.h"
+#include "panvk_mempool.h"
+#include "panvk_physical_device.h"
+#include "panvk_utrace_perfetto.h"
 
 #include "kmod/pan_kmod.h"
 #include "kmod/panthor_kmod.h"

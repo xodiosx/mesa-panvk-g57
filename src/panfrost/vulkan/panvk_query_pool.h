@@ -12,11 +12,11 @@
 
 #include <stdint.h>
 
-#include "panvcake_mempool.h"
+#include "panvk_mempool.h"
 #include "vk_query_pool.h"
 
 #if PAN_ARCH >= 10
-#include "panvcake_cmd_buffer.h"
+#include "panvk_cmd_buffer.h"
 #endif
 
 struct panvk_query_report {

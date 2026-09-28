@@ -14,7 +14,7 @@
 #include "util/simple_mtx.h"
 #include "libpan_dgc.h"
 #include "libpan_shaders.h"
-#include "panvcake_macros.h"
+#include "panvk_macros.h"
 
 struct panvk_cmd_buffer;
 

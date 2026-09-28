@@ -10,7 +10,7 @@
  */
 
 #include "util/build_id.h"
-#include "panvcake_drirc.h"
+#include "panvk_drirc.h"
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
 #include "util/u_call_once.h"
@@ -24,10 +24,10 @@
 #include "vk_alloc.h"
 #include "vk_log.h"
 
-#include "panvcake_entrypoints.h"
-#include "panvcake_instance.h"
-#include "panvcake_macros.h"
-#include "panvcake_physical_device.h"
+#include "panvk_entrypoints.h"
+#include "panvk_instance.h"
+#include "panvk_macros.h"
+#include "panvk_physical_device.h"
 
 #ifdef HAVE_VALGRIND
 #include <memcheck.h>

@@ -6,9 +6,9 @@
 #ifndef PANVK_CMD_ALLOC_H
 #define PANVK_CMD_ALLOC_H
 
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_macros.h"
-#include "panvcake_mempool.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_macros.h"
+#include "panvk_mempool.h"
 
 static inline struct pan_ptr
 panvk_cmd_alloc_from_pool(struct panvk_cmd_buffer *cmdbuf,

@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-#include "panvcake_device.h"
+#include "panvk_device.h"
 
 #include "vk_queue.h"
 

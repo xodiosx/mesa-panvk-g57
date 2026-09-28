@@ -15,11 +15,11 @@
 #include "pan_nir.h"
 #include "pan_shader.h"
 
-#include "panvcake_blend.h"
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_device.h"
-#include "panvcake_meta.h"
-#include "panvcake_shader.h"
+#include "panvk_blend.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_device.h"
+#include "panvk_meta.h"
+#include "panvk_shader.h"
 
 struct panvk_blend_shader_key {
    enum panvk_meta_object_key_type type;

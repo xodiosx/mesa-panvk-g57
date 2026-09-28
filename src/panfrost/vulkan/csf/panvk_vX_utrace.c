@@ -4,15 +4,15 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_utrace.h"
+#include "panvk_utrace.h"
 
 #include "util/os_misc.h"
 
 #include "drm-uapi/panthor_drm.h"
 
 #include "genxml/cs_builder.h"
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_device.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_device.h"
 
 static void
 cmd_write_timestamp(const struct panvk_device *dev, struct cs_builder *b,

@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-#include "panvcake_mempool.h"
+#include "panvk_mempool.h"
 
 #include "vk_buffer_view.h"
 

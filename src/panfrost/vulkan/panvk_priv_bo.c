@@ -8,8 +8,8 @@
 #include "vk_alloc.h"
 #include "vk_log.h"
 
-#include "panvcake_device.h"
-#include "panvcake_priv_bo.h"
+#include "panvk_device.h"
+#include "panvk_priv_bo.h"
 
 #include "kmod/pan_kmod.h"
 #include "pan_props.h"

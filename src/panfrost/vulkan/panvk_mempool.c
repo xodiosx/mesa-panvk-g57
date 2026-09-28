@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_device.h"
-#include "panvcake_mempool.h"
-#include "panvcake_priv_bo.h"
+#include "panvk_device.h"
+#include "panvk_mempool.h"
+#include "panvk_priv_bo.h"
 
 #include "kmod/pan_kmod.h"
 

@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_cmd_alloc.h"
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_entrypoints.h"
+#include "panvk_cmd_alloc.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_entrypoints.h"
 
 static VkResult
 prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,

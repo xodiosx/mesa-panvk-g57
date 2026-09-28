@@ -36,12 +36,12 @@
 #include "vk_physical_device.h"
 #include "vk_util.h"
 
-#include "panvcake_device.h"
-#include "panvcake_entrypoints.h"
-#include "panvcake_image.h"
-#include "panvcake_instance.h"
-#include "panvcake_physical_device.h"
-#include "panvcake_wsi.h"
+#include "panvk_device.h"
+#include "panvk_entrypoints.h"
+#include "panvk_image.h"
+#include "panvk_instance.h"
+#include "panvk_physical_device.h"
+#include "panvk_wsi.h"
 
 #include "pan_afbc.h"
 #include "pan_props.h"

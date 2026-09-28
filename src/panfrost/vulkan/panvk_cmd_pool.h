@@ -8,7 +8,7 @@
 
 #include "vk_command_pool.h"
 
-#include "panvcake_mempool.h"
+#include "panvk_mempool.h"
 
 struct panvk_cmd_pool {
    struct vk_command_pool vk;

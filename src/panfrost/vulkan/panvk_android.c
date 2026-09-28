@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_android.h"
+#include "panvk_android.h"
 
-#include "panvcake_device.h"
-#include "panvcake_image.h"
+#include "panvk_device.h"
+#include "panvk_image.h"
 
 #include "vndk/hardware_buffer.h"
 #include "vulkan/vk_android_native_buffer.h"

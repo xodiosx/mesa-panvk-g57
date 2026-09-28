@@ -15,10 +15,10 @@
 #include "pan_desc.h"
 #include "pan_earlyzs.h"
 
-#include "panvcake_cmd_push_constant.h"
-#include "panvcake_descriptor_set.h"
-#include "panvcake_macros.h"
-#include "panvcake_mempool.h"
+#include "panvk_cmd_push_constant.h"
+#include "panvk_descriptor_set.h"
+#include "panvk_macros.h"
+#include "panvk_mempool.h"
 
 #include "vk_pipeline_layout.h"
 

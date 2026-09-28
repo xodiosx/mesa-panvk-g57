@@ -15,11 +15,11 @@
 #include "pan_nir.h"
 #include "pan_shader.h"
 
-#include "panvcake_cmd_alloc.h"
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_device.h"
-#include "panvcake_meta.h"
-#include "panvcake_shader.h"
+#include "panvk_cmd_alloc.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_device.h"
+#include "panvk_meta.h"
+#include "panvk_shader.h"
 
 struct pan_nir_desc_copy_info {
    uint64_t sets[MAX_SETS];

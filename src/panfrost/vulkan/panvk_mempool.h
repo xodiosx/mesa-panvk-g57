@@ -6,7 +6,7 @@
 #ifndef __PANVK_POOL_H__
 #define __PANVK_POOL_H__
 
-#include "panvcake_priv_bo.h"
+#include "panvk_priv_bo.h"
 
 #include "kmod/pan_kmod.h"
 #include "pan_pool.h"

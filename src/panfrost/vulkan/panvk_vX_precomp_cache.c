@@ -8,9 +8,9 @@
 #include "util/macros.h"
 #include "bifrost/bifrost_compile.h"
 #include "libpan_shaders.h"
-#include "panvcake_device.h"
-#include "panvcake_precomp_cache.h"
-#include "panvcake_shader.h"
+#include "panvk_device.h"
+#include "panvk_precomp_cache.h"
+#include "panvk_shader.h"
 #include "vk_alloc.h"
 #include "vk_shader.h"
 

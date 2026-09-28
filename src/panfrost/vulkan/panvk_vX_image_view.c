@@ -15,11 +15,11 @@
 #include "vk_log.h"
 #include "vk_ycbcr_conversion.h"
 
-#include "panvcake_device.h"
-#include "panvcake_entrypoints.h"
-#include "panvcake_image.h"
-#include "panvcake_image_view.h"
-#include "panvcake_priv_bo.h"
+#include "panvk_device.h"
+#include "panvk_entrypoints.h"
+#include "panvk_image.h"
+#include "panvk_image_view.h"
+#include "panvk_priv_bo.h"
 
 #include "pan_afbc.h"
 #include "pan_texture.h"

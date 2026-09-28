@@ -5,8 +5,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_cmd_dispatch.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_cmd_dispatch.h"
 
 void
 panvk_per_arch(cmd_prepare_dispatch_sysvals)(

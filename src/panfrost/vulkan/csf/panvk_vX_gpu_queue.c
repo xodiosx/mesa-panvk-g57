@@ -8,13 +8,13 @@
 #include "genxml/cs_builder.h"
 #include "genxml/decode.h"
 
-#include "panvcake_buffer.h"
-#include "panvcake_cmd_buffer.h"
-#include "panvcake_device_memory.h"
-#include "panvcake_macros.h"
-#include "panvcake_priv_bo.h"
-#include "panvcake_queue.h"
-#include "panvcake_utrace.h"
+#include "panvk_buffer.h"
+#include "panvk_cmd_buffer.h"
+#include "panvk_device_memory.h"
+#include "panvk_macros.h"
+#include "panvk_priv_bo.h"
+#include "panvk_queue.h"
+#include "panvk_utrace.h"
 
 #include "pan_trace.h"
 
