@@ -46,6 +46,47 @@ jobs:
           echo "ANDROID_NDK_ROOT=/opt/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
           chmod +x /opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/*
 
+      # =====================================================================
+      # NEW: bring in the *real* Android AHB + native_handle headers so Mesa
+      # uses the true buffer_handle_t / AHardwareBuffer instead of its own
+      # fallback stubs. This replaces the old "Fix buffer_handle_t typedef
+      # conflict" patch step.
+      # =====================================================================
+      - name: Provide real Android AHB / native_handle headers (from AOSP)
+        run: |
+          set -euo pipefail
+          SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
+          AOSP_TAG="android-14.0.0_r1"
+          BASE="https://raw.githubusercontent.com/aosp-mirror/platform_system_core/${AOSP_TAG}/libcutils/include/cutils"
+
+          echo "==== NDK sysroot include dir ===="
+          echo "$SYSROOT"
+
+          # android/hardware_buffer.h ships with the public NDK — verify.
+          if [ ! -f "$SYSROOT/android/hardware_buffer.h" ]; then
+            echo "❌ android/hardware_buffer.h missing from NDK sysroot"
+            ls -la "$SYSROOT/android/" || true
+            exit 1
+          fi
+          echo "✔ android/hardware_buffer.h present in NDK sysroot"
+
+          # cutils/native_handle.h is NOT in the public NDK — fetch the real
+          # one from AOSP so <cutils/native_handle.h> resolves and defines the
+          # canonical native_handle_t / buffer_handle_t.
+          sudo mkdir -p "$SYSROOT/cutils"
+          sudo curl -sSfL "$BASE/native_handle.h" -o "$SYSROOT/cutils/native_handle.h"
+          sudo curl -sSfL "$BASE/compiler.h"      -o "$SYSROOT/cutils/compiler.h"
+
+          echo "==== cutils/native_handle.h (head) ===="
+          head -25 "$SYSROOT/cutils/native_handle.h"
+          echo "==== cutils/compiler.h (head) ===="
+          head -10 "$SYSROOT/cutils/compiler.h"
+
+          # Sanity: the real buffer_handle_t typedef must be visible.
+          echo "==== buffer_handle_t definition ===="
+          grep -n "buffer_handle_t" "$SYSROOT/cutils/native_handle.h"
+          grep -n "typedef struct native_handle" "$SYSROOT/cutils/native_handle.h"
+
       - name: Setup Termux sysroot (X11 + real Android headers)
         run: |
           mkdir termux && cd termux
@@ -173,38 +214,10 @@ jobs:
           #endif
           EOF
 
-      - name: Fix buffer_handle_t typedef conflict
-        working-directory: mesa
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import re
-          import sys
-
-          path = "include/vulkan/vk_android_native_buffer.h"
-          try:
-              src = open(path, encoding="utf-8").read()
-          except FileNotFoundError:
-              print(f"ERROR: {path} not found", file=sys.stderr)
-              sys.exit(1)
-
-          pattern = re.compile(
-              r'^#if\s+\(defined\(__ANDROID__\)\s*\|\|\s*defined\(ANDROID\)\)\s*&&\s*0.*$',
-              re.MULTILINE,
-          )
-
-          new_src, n = pattern.subn(
-              "#if defined(__ANDROID__) || defined(ANDROID)",
-              src,
-          )
-
-          if n == 0:
-              print("ERROR: pattern not found", file=sys.stderr)
-              sys.exit(1)
-
-          print(f"✔ replaced {n} occurrence(s)")
-          open(path, "w", encoding="utf-8").write(new_src)
-          PY
+      # NOTE: The old "Fix buffer_handle_t typedef conflict" step has been
+      #       REMOVED. Mesa's vk_android_native_buffer.h is left untouched;
+      #       the real cutils/native_handle.h + android/hardware_buffer.h
+      #       from the NDK sysroot now provide the correct types.
 
       - name: Guard panvk_android_hal_bridge out of Android builds
         working-directory: mesa
@@ -366,6 +379,17 @@ jobs:
         run: |
           ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
 
+      - name: Verify real AHB types made it into the driver
+        run: |
+          set -euo pipefail
+          SO="build/src/panfrost/vulkan/libvulkan_panfrost.so"
+          [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
+          echo "==== AHB-related symbols in the .so ===="
+          nm -D "$SO" 2>/dev/null | grep -iE 'AHardwareBuffer|native_handle' || \
+            echo "(no AHB symbols — check whether link step needs -landroid)"
+          echo "==== AHB-related strings in the .so ===="
+          strings "$SO" | grep -iE 'AHardwareBuffer|hardware_buffer' | head -20 || true
+
       - name: Package AdrenoTools driver ZIP
         run: |
           set -euo pipefail
@@ -444,6 +468,16 @@ jobs:
             for AdrenoTools / Winlator with AHB (Android Hardware Buffer) and
             kbase (proprietary Mali kernel driver) support enabled.
 
+            This build uses the **real Android AHB headers**:
+
+            - `android/hardware_buffer.h` (from the Android NDK sysroot)
+            - `cutils/native_handle.h` (fetched from AOSP, since it is not
+              part of the public NDK)
+
+            The Mesa fallback stubs in `vk_android_native_buffer.h` are no
+            longer enabled — `buffer_handle_t` and `AHardwareBuffer` are the
+            canonical Android types, matching what AdrenoTools expects.
+
             ## Install (AdrenoTools)
 
             1. Download the `panvcake_*.zip` asset below.
@@ -464,8 +498,6 @@ jobs:
               level, with no subfolder.
             - Built for Mali-G57 (Valhall JM) with the kbase kernel driver.
             - Workflow run: `${{ github.run_number }}`
-
-            
 
             The driver name should read `panvcake` (PanVK fork) rather than
             the stock Mali Vulkan driver.
