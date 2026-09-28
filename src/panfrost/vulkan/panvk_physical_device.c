@@ -438,7 +438,7 @@ init_shader_caches(struct panvk_physical_device *device,
    memcpy(device->cache_uuid, blake3, VK_UUID_SIZE);
 
 #ifdef ENABLE_SHADER_CACHE
-   char renderer[25];
+   char renderer[32];
    ASSERTED int len =
       snprintf(renderer, sizeof(renderer), "panvcake_0x%016" PRIx64,
                device->kmod.dev->props.gpu_id);
