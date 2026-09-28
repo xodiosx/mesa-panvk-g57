@@ -379,11 +379,14 @@ jobs:
           echo "--- syncing $SRC -> $DST (excluding VCS + markdown + binaries) ---"
           rsync -a --delete \
             --exclude='.git/' \
+            --exclude='docs/panvk_g57/' \
             --exclude='.github/' \
             --exclude='*.md' \
             --exclude='*.tar.gz' \
             --exclude='*.tar.xz' \
             --exclude='*.zip' \
+            --exclude='*.jpg' \
+            --exclude='*.png' \
             --exclude='_src/' \
             --exclude='ci-scripts/' \
             --exclude='termux-out-*/' \
