@@ -353,7 +353,6 @@ jobs:
             -Dmesa-clc=system \
             -Dprecomp-compiler=system \
             -Dspirv-tools=disabled \
-            -Dlibelf=disabled \
             -Dglx=disabled \
             -Dgbm=disabled \
             -Dopengl=false \
