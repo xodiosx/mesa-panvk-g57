@@ -10,8 +10,8 @@
 #error "PAN_ARCH must be defined"
 #endif
 
-#include "panvk_image.h"
-#include "panvk_mempool.h"
+#include "panvcake_image.h"
+#include "panvcake_mempool.h"
 
 #include "vk_format.h"
 #include "vk_meta.h"

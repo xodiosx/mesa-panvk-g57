@@ -23,17 +23,17 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_buffer.h"
-#include "panvk_buffer_view.h"
-#include "panvk_descriptor_set.h"
-#include "panvk_descriptor_set_layout.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_image.h"
-#include "panvk_image_view.h"
-#include "panvk_macros.h"
-#include "panvk_priv_bo.h"
-#include "panvk_sampler.h"
+#include "panvcake_buffer.h"
+#include "panvcake_buffer_view.h"
+#include "panvcake_descriptor_set.h"
+#include "panvcake_descriptor_set_layout.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_image.h"
+#include "panvcake_image_view.h"
+#include "panvcake_macros.h"
+#include "panvcake_priv_bo.h"
+#include "panvcake_sampler.h"
 
 static const void *
 get_desc_slot_ptr(struct panvk_descriptor_set *set, uint32_t binding,

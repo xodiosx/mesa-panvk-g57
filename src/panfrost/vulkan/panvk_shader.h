@@ -15,10 +15,10 @@
 #include "pan_desc.h"
 #include "pan_earlyzs.h"
 
-#include "panvk_cmd_push_constant.h"
-#include "panvk_descriptor_set.h"
-#include "panvk_macros.h"
-#include "panvk_mempool.h"
+#include "panvcake_cmd_push_constant.h"
+#include "panvcake_descriptor_set.h"
+#include "panvcake_macros.h"
+#include "panvcake_mempool.h"
 
 #include "vk_pipeline_layout.h"
 
@@ -188,7 +188,7 @@ struct panvk_graphics_sysvals {
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
 static_assert(offsetof(struct panvk_graphics_sysvals, blend) == 0,
-              "panvk_graphics_sysvals::blend must be at the start");
+              "panvcake_graphics_sysvals::blend must be at the start");
 static_assert(offsetof(struct panvk_graphics_sysvals, common) ==
                  offsetof(struct panvk_common_sysvals, common),
               "Common sysvals must be at the same offset everywhere");
@@ -197,7 +197,7 @@ static_assert((sizeof(struct panvk_graphics_sysvals) % FAU_WORD_SIZE) == 0,
 #if PAN_ARCH < 9
 static_assert((offsetof(struct panvk_graphics_sysvals, desc) % FAU_WORD_SIZE) ==
                  0,
-              "panvk_graphics_sysvals::desc must be 8-byte aligned");
+              "panvcake_graphics_sysvals::desc must be 8-byte aligned");
 #endif
 
 struct panvk_compute_sysvals {
@@ -232,7 +232,7 @@ static_assert((sizeof(struct panvk_compute_sysvals) % FAU_WORD_SIZE) == 0,
 #if PAN_ARCH < 9
 static_assert((offsetof(struct panvk_compute_sysvals, desc) % FAU_WORD_SIZE) ==
                  0,
-              "panvk_compute_sysvals::desc must be 8-byte aligned");
+              "panvcake_compute_sysvals::desc must be 8-byte aligned");
 #endif
 
 /* This is not the final offset in the push constant buffer (AKA FAU), but

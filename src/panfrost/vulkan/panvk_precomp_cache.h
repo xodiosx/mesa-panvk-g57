@@ -6,7 +6,7 @@
 #ifndef PANVK_PRECOMP_CACHE_H
 #define PANVK_PRECOMP_CACHE_H
 
-#include "panvk_device.h"
+#include "panvcake_device.h"
 #ifndef PAN_ARCH
 #error "PAN_ARCH must be defined"
 #endif
@@ -16,9 +16,9 @@
 #include "libpan_dgc.h"
 #include "libpan_shaders.h"
 #include "pan_shader.h"
-#include "panvk_macros.h"
-#include "panvk_mempool.h"
-#include "panvk_shader.h"
+#include "panvcake_macros.h"
+#include "panvcake_mempool.h"
+#include "panvcake_shader.h"
 
 struct panvk_device;
 

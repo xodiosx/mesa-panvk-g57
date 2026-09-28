@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvk_buffer.h"
-#include "panvk_device.h"
-#include "panvk_device_memory.h"
-#include "panvk_entrypoints.h"
+#include "panvcake_buffer.h"
+#include "panvcake_device.h"
+#include "panvcake_device_memory.h"
+#include "panvcake_entrypoints.h"
 
 #include "pan_props.h"
 

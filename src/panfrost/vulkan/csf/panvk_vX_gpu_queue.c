@@ -8,13 +8,13 @@
 #include "genxml/cs_builder.h"
 #include "genxml/decode.h"
 
-#include "panvk_buffer.h"
-#include "panvk_cmd_buffer.h"
-#include "panvk_device_memory.h"
-#include "panvk_macros.h"
-#include "panvk_priv_bo.h"
-#include "panvk_queue.h"
-#include "panvk_utrace.h"
+#include "panvcake_buffer.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_device_memory.h"
+#include "panvcake_macros.h"
+#include "panvcake_priv_bo.h"
+#include "panvcake_queue.h"
+#include "panvcake_utrace.h"
 
 #include "pan_trace.h"
 
@@ -1432,7 +1432,7 @@ init_utrace(struct panvk_gpu_queue *queue)
    if (!sync_type || !vk_sync_type_is_drm_syncobj(sync_type) ||
        !(sync_type->features & VK_SYNC_FEATURE_TIMELINE)) {
       return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
-                       "panvk CSF: timeline DRM syncobj required for queue "
+                       "panvcake CSF: timeline DRM syncobj required for queue "
                        "creation");
    }
 

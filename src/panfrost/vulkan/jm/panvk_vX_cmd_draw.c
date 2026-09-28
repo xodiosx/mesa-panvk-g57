@@ -12,21 +12,21 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_buffer.h"
-#include "panvk_cmd_alloc.h"
-#include "panvk_cmd_buffer.h"
-#include "panvk_cmd_desc_state.h"
-#include "panvk_cmd_draw.h"
-#include "panvk_cmd_meta.h"
-#include "panvk_cmd_precomp.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_image.h"
-#include "panvk_image_view.h"
-#include "panvk_instance.h"
-#include "panvk_meta.h"
-#include "panvk_priv_bo.h"
-#include "panvk_shader.h"
+#include "panvcake_buffer.h"
+#include "panvcake_cmd_alloc.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_cmd_desc_state.h"
+#include "panvcake_cmd_draw.h"
+#include "panvcake_cmd_meta.h"
+#include "panvcake_cmd_precomp.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_image.h"
+#include "panvcake_image_view.h"
+#include "panvcake_instance.h"
+#include "panvcake_meta.h"
+#include "panvcake_priv_bo.h"
+#include "panvcake_shader.h"
 
 #include "draw_helper.h"
 #include "pan_desc.h"
@@ -1451,7 +1451,8 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    VkResult result;
 
    if (unlikely(getenv("PANVK_VERBOSE")))
-      (void)0;
+      fprintf(stderr, "PANVKDBG panvk_cmd_draw: vs=%p cur_batch=%p\n",
+              (void *)vs, (void *)cmdbuf->cur_batch);
    /* If there's no vertex shader, we can skip the draw. */
    if (!panvk_priv_mem_check_alloc(vs->rsd))
       return;
@@ -2545,11 +2546,20 @@ panvk_v9_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *info)
           const uint32_t *jw = (const uint32_t *)job.cpu;
           (void)0;
           (void)0;
-          (void)0;
-          const struct mali_draw_packed *dp = draw_packed;
-          (void)0;
-          (void)0;
-          (void)0;
+          fprintf(stderr,
+                  "PANVKDBG malloc fs sh=%llx res=%llx tls=%016llx fau=%016llx cnt=%u\n",
+                  (unsigned long long)(fs ? panvk_priv_mem_dev_addr(fs->spd) : 0),
+                  (unsigned long long)cmdbuf->state.gfx.fs.desc.res_table,
+                  (unsigned long long)batch->tls.gpu,
+                  (unsigned long long)cmdbuf->state.gfx.fs.push_uniforms,
+                  fs ? fs->fau.total_count : 0);
+          fprintf(stderr,
+                  "PANVKDBG malloc vs pos=%016llx res=%016llx tls=%016llx fau=%016llx cnt=%u\n",
+                  (unsigned long long)pos_spd,
+                  (unsigned long long)cmdbuf->state.gfx.vs.desc.res_table,
+                  (unsigned long long)batch->tls.gpu,
+                  (unsigned long long)cmdbuf->state.gfx.vs.push_uniforms,
+                  vs->fau.total_count);
        }
    }
 

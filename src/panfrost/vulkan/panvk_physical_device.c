@@ -36,12 +36,12 @@
 #include "vk_physical_device.h"
 #include "vk_util.h"
 
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_image.h"
-#include "panvk_instance.h"
-#include "panvk_physical_device.h"
-#include "panvk_wsi.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_image.h"
+#include "panvcake_instance.h"
+#include "panvcake_physical_device.h"
+#include "panvcake_wsi.h"
 
 #include "pan_afbc.h"
 #include "pan_props.h"
@@ -440,7 +440,7 @@ init_shader_caches(struct panvk_physical_device *device,
 #ifdef ENABLE_SHADER_CACHE
    char renderer[25];
    ASSERTED int len =
-      snprintf(renderer, sizeof(renderer), "panvk_0x%016" PRIx64,
+      snprintf(renderer, sizeof(renderer), "panvcake_0x%016" PRIx64,
                device->kmod.dev->props.gpu_id);
    assert(len == sizeof(renderer) - 1);
 
@@ -975,7 +975,7 @@ get_gpu_model(struct panvk_physical_device *device,
    }
 
    *unknown_gpu = true;
-   mesa_logw("panvk: unknown gpu_id (%#" PRIx64 ") or variant (%#x); "
+   mesa_logw("panvcake: unknown gpu_id (%#" PRIx64 ") or variant (%#x); "
              "continuing with conservative \"%s\" defaults — expect issues",
              props->gpu_id, props->gpu_variant, device->model->name);
    return VK_SUCCESS;

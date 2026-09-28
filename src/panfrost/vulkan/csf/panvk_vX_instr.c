@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvk_instr.h"
-#include "panvk_tracepoints.h"
-#include "panvk_utrace.h"
+#include "panvcake_instr.h"
+#include "panvcake_tracepoints.h"
+#include "panvcake_utrace.h"
 
 #include "util/macros.h"
 

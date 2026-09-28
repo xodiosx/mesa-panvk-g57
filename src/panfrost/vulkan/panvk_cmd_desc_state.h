@@ -14,10 +14,10 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_cmd_pool.h"
-#include "panvk_descriptor_set.h"
-#include "panvk_macros.h"
-#include "panvk_shader.h"
+#include "panvcake_cmd_pool.h"
+#include "panvcake_descriptor_set.h"
+#include "panvcake_macros.h"
+#include "panvcake_shader.h"
 
 #include "vk_alloc.h"
 #include "vk_command_buffer.h"

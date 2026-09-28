@@ -5,8 +5,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvk_device.h"
-#include "panvk_macros.h"
+#include "panvcake_device.h"
+#include "panvcake_macros.h"
 
 #include "vk_drm_syncobj.h"
 #include "vk_log.h"

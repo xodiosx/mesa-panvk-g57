@@ -25,12 +25,12 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_descriptor_set_layout.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_image.h"
-#include "panvk_macros.h"
-#include "panvk_sampler.h"
+#include "panvcake_descriptor_set_layout.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_image.h"
+#include "panvcake_macros.h"
+#include "panvcake_sampler.h"
 
 #define PANVK_MAX_DESCS_PER_SET (1 << 24)
 

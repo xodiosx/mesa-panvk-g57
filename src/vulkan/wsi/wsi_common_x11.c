@@ -362,7 +362,15 @@ wsi_x11_connection_create(struct wsi_device *wsi_dev,
 
    wsi_conn->has_mit_shm = false;
 #if defined(HAVE_X11_DRM) && defined(HAVE_SYS_SHM_H)
-   (void)0;
+   fprintf(stderr,
+
+           "PANVKDBG XSHM_GATE dri3=%d present=%d wants_shm=%d\\n",
+
+           wsi_conn->has_dri3,
+
+           wsi_conn->has_present,
+
+           wants_shm);
 
    if (wsi_conn->has_dri3 && wsi_conn->has_present && wants_shm) {
       wsi_conn->has_mit_shm = x11_xcb_display_supports_xshm(conn, NULL);
@@ -2167,7 +2175,10 @@ x11_acquire_next_image(struct wsi_swapchain *wsi_chain,
    uint64_t timeout = info->timeout;
 
    if (unlikely(getenv("PANVK_VERBOSE")))
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG PRESENT X11_ACQUIRE_ENTER chain=%p timeout=%" PRIu64
+              " images=%u\n",
+              (void *)chain, timeout, chain->base.image_count);
 
    /* If the swapchain is in an error state, don't go any further. */
    VkResult result = x11_swapchain_read_status_atomic(chain);
@@ -2229,7 +2240,11 @@ x11_queue_present(struct wsi_swapchain *wsi_chain,
    xcb_xfixes_region_t update_area = 0;
 
    if (unlikely(getenv("PANVK_VERBOSE")))
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG PRESENT X11_QUEUE_ENTER chain=%p image=%u "
+              "present_id=%" PRIu64 " sw=%d blit=%d\n",
+              (void *)chain, image_index, present_id,
+              chain->base.wsi->sw, chain->base.blit.type);
 
    /* If the swapchain is in an error state, don't go any further. */
    VkResult status = x11_swapchain_read_status_atomic(chain);
@@ -3163,7 +3178,15 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    VkResult result;
    VkPresentModeKHR present_mode = wsi_swapchain_get_present_mode(wsi_device, pCreateInfo);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_CREATE_ENTER sw=%d format=%d "
+           "extent=%ux%u minImages=%u mode=%d\\n",
+           wsi_device->sw,
+           pCreateInfo->imageFormat,
+           pCreateInfo->imageExtent.width,
+           pCreateInfo->imageExtent.height,
+           pCreateInfo->minImageCount,
+           present_mode);
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
 
@@ -3269,7 +3292,10 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_cpu_image_params cpu_image_params;
    uint64_t *modifiers[2] = {NULL, NULL};
    if (wsi_device->sw) {
-            (void)0;
+            fprintf(stderr,
+              "PANVKDBG X11_MITSHM has_mit_shm=%d alloc_shm_choice=%p\\n",
+              wsi_conn->has_mit_shm,
+              wsi_conn->has_mit_shm ? (void *)&alloc_shm : NULL);
 
 cpu_image_params = (struct wsi_cpu_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_CPU,
@@ -3307,12 +3333,21 @@ cpu_image_params = (struct wsi_cpu_image_params) {
 #endif
    }
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_BEFORE_INIT sw=%d image_type=%d "
+           "image_params=%p\\n",
+           wsi_device->sw,
+           image_params ? image_params->image_type : -1,
+           (void *)image_params);
 
    result = wsi_swapchain_init(wsi_device, &chain->base, device, pCreateInfo,
                                image_params, pAllocator);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_AFTER_INIT result=%d blit=%d image_count=%u\\n",
+           result,
+           result == VK_SUCCESS ? chain->base.blit.type : -1,
+           result == VK_SUCCESS ? chain->base.image_count : 0);
 
    for (int i = 0; i < ARRAY_SIZE(modifiers); i++)
       vk_free(pAllocator, modifiers[i]);

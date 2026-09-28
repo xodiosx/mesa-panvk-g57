@@ -15,8 +15,8 @@
 
 #include "pan_blend.h"
 
-#include "panvk_macros.h"
-#include "panvk_mempool.h"
+#include "panvcake_macros.h"
+#include "panvcake_mempool.h"
 
 #include "vk_graphics_state.h"
 

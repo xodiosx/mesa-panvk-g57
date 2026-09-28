@@ -14,14 +14,14 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_buffer.h"
-#include "panvk_cmd_buffer.h"
-#include "panvk_cmd_meta.h"
-#include "panvk_cmd_precomp.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_macros.h"
-#include "panvk_query_pool.h"
+#include "panvcake_buffer.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_cmd_meta.h"
+#include "panvcake_cmd_precomp.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_macros.h"
+#include "panvcake_query_pool.h"
 
 #include "libpan.h"
 

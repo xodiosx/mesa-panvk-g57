@@ -5,8 +5,8 @@
  */
 #include "drm-uapi/panthor_drm.h"
 
-#include "panvk_cmd_buffer.h"
-#include "panvk_device.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_device.h"
 
 static enum cs_reg_perm
 tiler_oom_reg_perm_cb(struct cs_builder *b, unsigned reg)

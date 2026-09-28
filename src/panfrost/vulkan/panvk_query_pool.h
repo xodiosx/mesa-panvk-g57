@@ -12,11 +12,11 @@
 
 #include <stdint.h>
 
-#include "panvk_mempool.h"
+#include "panvcake_mempool.h"
 #include "vk_query_pool.h"
 
 #if PAN_ARCH >= 10
-#include "panvk_cmd_buffer.h"
+#include "panvcake_cmd_buffer.h"
 #endif
 
 struct panvk_query_report {
@@ -32,7 +32,7 @@ struct panvk_query_available_obj {
 };
 
 static_assert(sizeof(struct panvk_query_report) == 8,
-              "panvk_query_report size is expected to be 8");
+              "panvcake_query_report size is expected to be 8");
 
 struct panvk_query_pool {
    struct vk_query_pool vk;

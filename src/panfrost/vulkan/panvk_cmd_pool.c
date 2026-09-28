@@ -9,9 +9,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvk_cmd_pool.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
+#include "panvcake_cmd_pool.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
 #include "vk_common_entrypoints.h"
 
 #include "vk_alloc.h"

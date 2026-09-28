@@ -13,16 +13,16 @@
 
 #include "decode.h"
 
-#include "panvk_cmd_buffer.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_event.h"
-#include "panvk_image.h"
-#include "panvk_image_view.h"
-#include "panvk_instance.h"
-#include "panvk_physical_device.h"
-#include "panvk_priv_bo.h"
-#include "panvk_queue.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_event.h"
+#include "panvcake_image.h"
+#include "panvcake_image_view.h"
+#include "panvcake_instance.h"
+#include "panvcake_physical_device.h"
+#include "panvcake_priv_bo.h"
+#include "panvcake_queue.h"
 
 #include "vk_drm_syncobj.h"
 #include "vk_framebuffer.h"
@@ -238,12 +238,12 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
 
    if (!vk_queue || !vk_queue->base.device) {
-      mesa_loge("panvk: NULL queue or device in gpu_queue_submit");
+      mesa_loge("panvcake: NULL queue or device in gpu_queue_submit");
       return VK_ERROR_DEVICE_LOST;
    }
 
    if (!dev || !dev->kmod.dev) {
-      mesa_loge("panvk: submit on invalid device/queue");
+      mesa_loge("panvcake: submit on invalid device/queue");
       return VK_ERROR_DEVICE_LOST;
    }
 
@@ -256,7 +256,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    if (is_kbase && !getenv("PANVK_FORCE_ALT_SUBMIT"))
       return panvk_per_arch(kbase_jm_submit)(vk_queue, queue, dev, submit);
 
-   mesa_logd("panvk: gpu_queue_submit start, cmd_count=%u", submit->command_buffer_count);
+   mesa_logd("panvcake: gpu_queue_submit start, cmd_count=%u", submit->command_buffer_count);
 
    unsigned nr_semaphores = submit->wait_count + 1;
    uint32_t semaphores[nr_semaphores];
@@ -275,7 +275,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
          container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
 
       list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
-         mesa_logd("panvk: batch submit, vtc_jc=%s frag_jc=%s",
+         mesa_logd("panvcake: batch submit, vtc_jc=%s frag_jc=%s",
                    batch->vtc_jc.first_job ? "yes" : "no",
                    batch->frag_jc.first_job ? "yes" : "no");
          /* FIXME: should be done at the batch level */
@@ -386,7 +386,7 @@ struct panvk_gpu_queue *queue = vk_zalloc(&device->vk.alloc, sizeof(*queue), 8,
                                  &queue->sync);
       if (ret) {
          queue->sync = 0;
-         mesa_logd("panvk: drmSyncobjCreate failed (%d); continuing without "
+         mesa_logd("panvcake: drmSyncobjCreate failed (%d); continuing without "
                    "per-queue DRM syncobj", ret);
       }
 #ifdef HAVE_PAN_KMOD_KBASE

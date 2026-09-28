@@ -6,12 +6,12 @@
 #include "bifrost/bifrost_compile.h"
 #include "pan_desc.h"
 #include "pan_encoder.h"
-#include "panvk_cmd_alloc.h"
-#include "panvk_cmd_buffer.h"
-#include "panvk_cmd_precomp.h"
-#include "panvk_macros.h"
-#include "panvk_mempool.h"
-#include "panvk_precomp_cache.h"
+#include "panvcake_cmd_alloc.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_cmd_precomp.h"
+#include "panvcake_macros.h"
+#include "panvcake_mempool.h"
+#include "panvcake_precomp_cache.h"
 
 void
 panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,

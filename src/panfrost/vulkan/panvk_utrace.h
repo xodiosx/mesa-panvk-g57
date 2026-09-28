@@ -8,8 +8,8 @@
 
 #include "util/perf/u_trace.h"
 
-#include "panvk_macros.h"
-#include "panvk_mempool.h"
+#include "panvcake_macros.h"
+#include "panvcake_mempool.h"
 
 struct panvk_device;
 struct vk_sync;

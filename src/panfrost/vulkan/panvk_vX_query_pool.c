@@ -8,14 +8,14 @@
 #include "vk_log.h"
 
 #include "pan_props.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_query_pool.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_query_pool.h"
 
-#include "panvk_cmd_ts.h"
+#include "panvcake_cmd_ts.h"
 
 #if PAN_ARCH >= 10
-#include "panvk_queue.h"
+#include "panvcake_queue.h"
 #endif
 
 #define PANVK_QUERY_TIMEOUT 2000000000ull

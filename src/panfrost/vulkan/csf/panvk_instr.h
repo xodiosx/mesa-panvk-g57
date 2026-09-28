@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvk_cmd_buffer.h"
-#include "panvk_queue.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_queue.h"
 
 enum panvk_instr_work_type {
    PANVK_INSTR_WORK_TYPE_CMDBUF,

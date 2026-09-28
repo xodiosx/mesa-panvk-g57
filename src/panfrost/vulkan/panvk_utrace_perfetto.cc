@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvk_utrace_perfetto.h"
+#include "panvcake_utrace_perfetto.h"
 
 #include <functional>
 
@@ -15,10 +15,10 @@
 #include "util/timespec.h"
 #include "util/u_process.h"
 
-#include "panvk_device.h"
-#include "panvk_tracepoints.h"
-#include "panvk_tracepoints_perfetto.h"
-#include "panvk_utrace.h"
+#include "panvcake_device.h"
+#include "panvcake_tracepoints.h"
+#include "panvcake_tracepoints_perfetto.h"
+#include "panvcake_utrace.h"
 
 struct PanVKRenderpassTraits : public perfetto::DefaultDataSourceTraits {
    using IncrementalStateType = MesaRenderpassIncrementalState;

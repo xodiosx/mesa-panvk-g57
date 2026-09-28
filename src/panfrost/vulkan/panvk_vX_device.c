@@ -16,20 +16,20 @@
 #include "vk_common_entrypoints.h"
 #include "vk_drm_syncobj.h"
 
-#include "panvk_buffer.h"
-#include "panvk_cmd_alloc.h"
-#include "panvk_cmd_buffer.h"
-#include "panvk_device.h"
-#include "panvk_cmd_draw.h"
-#include "panvk_entrypoints.h"
-#include "panvk_instance.h"
-#include "panvk_macros.h"
-#include "panvk_physical_device.h"
-#include "panvk_precomp_cache.h"
-#include "panvk_priv_bo.h"
-#include "panvk_queue.h"
-#include "panvk_utrace.h"
-#include "panvk_utrace_perfetto.h"
+#include "panvcake_buffer.h"
+#include "panvcake_cmd_alloc.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_device.h"
+#include "panvcake_cmd_draw.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_instance.h"
+#include "panvcake_macros.h"
+#include "panvcake_physical_device.h"
+#include "panvcake_precomp_cache.h"
+#include "panvcake_priv_bo.h"
+#include "panvcake_queue.h"
+#include "panvcake_utrace.h"
+#include "panvcake_utrace_perfetto.h"
 
 #include "genxml/decode.h"
 #include "genxml/gen_macros.h"
@@ -365,7 +365,9 @@ panvk_queue_create(struct panvk_device *dev,
                    uint32_t queue_idx,
                    struct vk_queue **out_queue)
 {
-   (void)0;
+   fprintf(stderr, "PANVKDBG panvk_queue_create: family=%u, idx=%u, count=%u, kbase_stub=%d\n",
+           create_info->queueFamilyIndex, queue_idx, create_info->queueCount,
+           panvk_kbase_stub_queues(dev));
 #ifdef HAVE_PAN_KMOD_KBASE
    if (panvk_kbase_stub_queues(dev) &&
        create_info->queueFamilyIndex == PANVK_QUEUE_FAMILY_BIND)
@@ -455,18 +457,25 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                              &wsi_device_entrypoints, false);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG CREATE_DEVICE BEFORE_INIT enabledExtensionCount=%u\\n",
+           pCreateInfo->enabledExtensionCount);
    for (uint32_t panvkdbg_i = 0;
         panvkdbg_i < pCreateInfo->enabledExtensionCount;
         panvkdbg_i++) {
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG CREATE_DEVICE EXT[%u]=%s\\n",
+              panvkdbg_i,
+              pCreateInfo->ppEnabledExtensionNames[panvkdbg_i]);
    }
    fflush(stderr);
 
    result = vk_device_init(&device->vk, &physical_device->vk, &dispatch_table,
                            pCreateInfo, pAllocator);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG CREATE_DEVICE AFTER_INIT result=%d KHR_swapchain=%d\\n",
+           result, device->vk.enabled_extensions.KHR_swapchain);
    fflush(stderr);
 
    if (result != VK_SUCCESS)
@@ -707,7 +716,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 
       result = check_global_priority(physical_device, queue_create);
       if (result != VK_SUCCESS) {
-         (void)0;
+         fprintf(stderr, "PANVKDBG check_global_priority failed: result=%d\n", result);
          goto err_finish_queues;
       }
 
@@ -716,11 +725,6 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
          result = panvk_queue_create(device, queue_create, q, &queue);
          if (result != VK_SUCCESS) {
             (void)0;
-            goto err_finish_queues;
-         }
-      }
-   }
-   (void)0;
 
    result = panvk_per_arch(utrace_context_init)(device);
    if (result != VK_SUCCESS)

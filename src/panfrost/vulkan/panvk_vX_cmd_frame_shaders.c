@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvk_cmd_frame_shaders.h"
+#include "panvcake_cmd_frame_shaders.h"
 
-#include "panvk_cmd_alloc.h"
-#include "panvk_image_view.h"
-#include "panvk_meta.h"
-#include "panvk_shader.h"
+#include "panvcake_cmd_alloc.h"
+#include "panvcake_image_view.h"
+#include "panvcake_meta.h"
+#include "panvcake_shader.h"
 
 #include "nir_builder.h"
 
@@ -37,7 +37,7 @@ struct panvk_fb_sysvals {
    uint16_t layer_id;
 } __attribute__((aligned(FAU_WORD_SIZE)));
 static_assert(sizeof(struct panvk_fb_sysvals) % FAU_WORD_SIZE == 0,
-              "panvk_fb_sysvals is FAU_WORD-aligned.");
+              "panvcake_fb_sysvals is FAU_WORD-aligned.");
 
 static uint32_t
 key_locations_written(const struct panvk_frame_shader_key *key)

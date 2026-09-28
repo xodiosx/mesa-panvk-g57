@@ -18,12 +18,12 @@
 #include "vk_limits.h"
 #include "vk_shader_module.h"
 
-#include "panvk_instance.h"
-#include "panvk_buffer.h"
-#include "panvk_cmd_draw.h"
-#include "panvk_descriptor_set_layout.h"
-#include "panvk_physical_device.h"
-#include "panvk_wsi.h"
+#include "panvcake_instance.h"
+#include "panvcake_buffer.h"
+#include "panvcake_cmd_draw.h"
+#include "panvcake_descriptor_set_layout.h"
+#include "panvcake_physical_device.h"
+#include "panvcake_wsi.h"
 
 #include "pan_format.h"
 #include "pan_props.h"
@@ -1443,7 +1443,7 @@ panvk_per_arch(get_physical_device_properties)(
    if (PANVK_DEBUG(STARTUP)) {
       mesa_logi("%s (%s) %s", properties->driverName, properties->deviceName,
                 properties->driverInfo);
-      mesa_logi("panvk: gpu_id=0x%" PRIx64 " variant=0x%x "
+      mesa_logi("panvcake: gpu_id=0x%" PRIx64 " variant=0x%x "
                 "texture_features0=0x%08x afbc=%u afrc=%u",
                 device->kmod.dev->props.gpu_id,
                 device->kmod.dev->props.gpu_variant,

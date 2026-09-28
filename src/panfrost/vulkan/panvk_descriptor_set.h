@@ -15,12 +15,12 @@
 #include "util/bitset.h"
 #include "util/vma.h"
 
-#include "panvk_macros.h"
+#include "panvcake_macros.h"
 
 #include "vk_descriptor_update_template.h"
 #include "vk_object.h"
 
-#include "panvk_descriptor_set_layout.h"
+#include "panvcake_descriptor_set_layout.h"
 
 struct panvk_priv_bo;
 struct panvk_sysvals;

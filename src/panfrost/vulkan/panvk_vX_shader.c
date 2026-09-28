@@ -11,14 +11,14 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_cmd_buffer.h"
-#include "panvk_descriptor_set_layout.h"
-#include "panvk_device.h"
-#include "panvk_instance.h"
-#include "panvk_mempool.h"
-#include "panvk_physical_device.h"
-#include "panvk_sampler.h"
-#include "panvk_shader.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_descriptor_set_layout.h"
+#include "panvcake_device.h"
+#include "panvcake_instance.h"
+#include "panvcake_mempool.h"
+#include "panvcake_physical_device.h"
+#include "panvcake_sampler.h"
+#include "panvcake_shader.h"
 
 #include "spirv/nir_spirv.h"
 #include "util/memstream.h"

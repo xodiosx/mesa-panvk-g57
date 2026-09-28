@@ -11,20 +11,20 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_buffer.h"
-#include "panvk_cmd_alloc.h"
-#include "panvk_cmd_buffer.h"
-#include "panvk_cmd_desc_state.h"
-#include "panvk_cmd_draw.h"
-#include "panvk_cmd_frame_shaders.h"
-#include "panvk_cmd_pool.h"
-#include "panvk_cmd_push_constant.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_instance.h"
-#include "panvk_meta.h"
-#include "panvk_physical_device.h"
-#include "panvk_priv_bo.h"
+#include "panvcake_buffer.h"
+#include "panvcake_cmd_alloc.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_cmd_desc_state.h"
+#include "panvcake_cmd_draw.h"
+#include "panvcake_cmd_frame_shaders.h"
+#include "panvcake_cmd_pool.h"
+#include "panvcake_cmd_push_constant.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_instance.h"
+#include "panvcake_meta.h"
+#include "panvcake_physical_device.h"
+#include "panvcake_priv_bo.h"
 
 #include "pan_desc.h"
 #include "pan_encoder.h"
@@ -76,7 +76,11 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
    assert(batch);
 
    if (unlikely(getenv("PANVK_VERBOSE"))) {
-      (void)0;
+      fprintf(stderr, "PANVKDBG close_batch: fb=%llx vtc=%llx frag=%llx jobs=%u\n",
+              (unsigned long long)batch->fb.desc.gpu,
+              (unsigned long long)batch->vtc_jc.first_job,
+              (unsigned long long)batch->frag_jc.first_job,
+              (unsigned)util_dynarray_num_elements(&batch->jobs, void));
    }
    if (!batch->fb.desc.gpu && !batch->vtc_jc.first_job) {
       if (util_dynarray_num_elements(&batch->event_ops,
@@ -211,16 +215,20 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
          if (unlikely(getenv("PANVK_VERBOSE"))) {
               const uint32_t *w = (const uint32_t *)fbd.cpu;
               (void)0;
-              (void)0;
-              (void)0;
-              (void)0;
+              fprintf(stderr,
+                      "PANVKDBG fs modes=%u,%u,%u dcd=%llx\n",
+                      fs.modes[0], fs.modes[1], fs.modes[2],
+                      (unsigned long long)fs.dcd_pointer);
               (void)0;
               const uint32_t *rtw = (const uint32_t *)fb_descs.rts;
               (void)0;
-              (void)0;
               const struct pan_fb_load *ld = fbd_info.load;
              for (unsigned rt = 0; rt < render->fb.layout.rt_count; rt++) {
-                (void)0;
+                fprintf(stderr,
+                        "PANVKDBG load rt%u always=%d ib=%d bd=%d clr=%08x%08x\n",
+                        rt, ld->rts[rt].always, ld->rts[rt].in_bounds_load,
+                        ld->rts[rt].border_load,
+                        ld->rts[rt].clear.color.ui[0], ld->rts[rt].clear.color.ui[1]);
              }
          }
 

@@ -5,9 +5,9 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_cmd_alloc.h"
-#include "panvk_cmd_buffer.h"
-#include "panvk_entrypoints.h"
+#include "panvcake_cmd_alloc.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_entrypoints.h"
 
 static bool
 ensure_xfb_offsets(struct panvk_cmd_buffer *cmdbuf)

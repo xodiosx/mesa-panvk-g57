@@ -11,11 +11,11 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_buffer.h"
-#include "panvk_buffer_view.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_priv_bo.h"
+#include "panvcake_buffer.h"
+#include "panvcake_buffer_view.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_priv_bo.h"
 
 #include "pan_afbc.h"
 #include "pan_buffer.h"

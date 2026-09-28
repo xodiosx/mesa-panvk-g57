@@ -112,7 +112,7 @@ hwvulkan_module_t HAL_MODULE_INFO_SYM = {
          HWVULKAN_HARDWARE_MODULE_ID,
 
       .name =
-         "Mesa PanVK Mali-G57 Vulkan HAL",
+         "Mesa PanVCake Mali-G57 Vulkan HAL",
 
       .author =
          "Mesa",

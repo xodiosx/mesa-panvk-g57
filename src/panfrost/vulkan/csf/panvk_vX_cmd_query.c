@@ -14,17 +14,17 @@
 
 #include "genxml/gen_macros.h"
 
-#include "panvk_buffer.h"
-#include "panvk_cmd_alloc.h"
-#include "panvk_cmd_buffer.h"
-#include "panvk_cmd_meta.h"
-#include "panvk_cmd_precomp.h"
-#include "panvk_cmd_ts.h"
-#include "panvk_device.h"
-#include "panvk_entrypoints.h"
-#include "panvk_macros.h"
-#include "panvk_query_pool.h"
-#include "panvk_queue.h"
+#include "panvcake_buffer.h"
+#include "panvcake_cmd_alloc.h"
+#include "panvcake_cmd_buffer.h"
+#include "panvcake_cmd_meta.h"
+#include "panvcake_cmd_precomp.h"
+#include "panvcake_cmd_ts.h"
+#include "panvcake_device.h"
+#include "panvcake_entrypoints.h"
+#include "panvcake_macros.h"
+#include "panvcake_query_pool.h"
+#include "panvcake_queue.h"
 
 static enum panvk_subqueue_id
 panvk_subqueue_for_query_type(VkQueryType type)

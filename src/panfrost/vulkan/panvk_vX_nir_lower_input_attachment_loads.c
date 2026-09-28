@@ -10,8 +10,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "panvk_device.h"
-#include "panvk_shader.h"
+#include "panvcake_device.h"
+#include "panvcake_shader.h"
 
 #include "vk_graphics_state.h"
 

@@ -1432,7 +1432,16 @@ wsi_CreateSwapchainKHR(VkDevice _device,
    ICD_FROM_HANDLE(VkIcdSurfaceBase, surface, pCreateInfo->surface);
    struct wsi_device *wsi_device = device->physical->wsi_device;
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT CREATE_ENTER surface=%p format=%d "
+           "extent=%ux%u minImages=%u mode=%d sw=%d\\n",
+           (void *)(uintptr_t)pCreateInfo->surface,
+           pCreateInfo->imageFormat,
+           pCreateInfo->imageExtent.width,
+           pCreateInfo->imageExtent.height,
+           pCreateInfo->minImageCount,
+           wsi_swapchain_get_present_mode(wsi_device, pCreateInfo),
+           wsi_device->sw);
    struct wsi_interface *iface = wsi_device->force_headless_swapchain ?
       wsi_device->wsi[VK_ICD_WSI_PLATFORM_HEADLESS] :
       wsi_device->wsi[surface->platform];
@@ -2282,13 +2291,19 @@ wsi_common_acquire_next_image2(const struct wsi_device *wsi,
    VK_FROM_HANDLE(vk_device, device, _device);
 
    if (unlikely(getenv("PANVK_VERBOSE")))
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG PRESENT ACQUIRE_ENTER swapchain=%p timeout=%" PRIu64 "\n",
+              (void *)swapchain, pAcquireInfo->timeout);
 
    VkResult result = swapchain->acquire_next_image(swapchain, pAcquireInfo,
                                                    pImageIndex);
 
    if (unlikely(getenv("PANVK_VERBOSE")))
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG PRESENT ACQUIRE_RET swapchain=%p result=%d index=%u\n",
+              (void *)swapchain, result,
+              (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) ?
+                 *pImageIndex : UINT32_MAX);
 
    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
       return result;
@@ -2450,7 +2465,11 @@ wsi_common_queue_present(const struct wsi_device *wsi,
    struct vk_device *dev = queue->base.device;
 
    if (unlikely(getenv("PANVK_VERBOSE")))
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG PRESENT QUEUE_ENTER queue=%p swapchainCount=%u waitCount=%u\n",
+              (void *)queue,
+              pPresentInfo->swapchainCount,
+              pPresentInfo->waitSemaphoreCount);
 
    uint32_t current_frame = p_atomic_fetch_add(&dev->current_frame, 1);
    VkResult final_result = handle_trace(queue, dev, current_frame);
@@ -2909,14 +2928,20 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          region = &regions->pRegions[i];
 
       if (unlikely(getenv("PANVK_VERBOSE")))
-         (void)0;
+         fprintf(stderr,
+                 "PANVKDBG PRESENT BACKEND_ENTER i=%u swapchain=%p "
+                 "image=%u present_id=%" PRIu64 "\n",
+                 i, (void *)swapchain, image_index,
+                 image_signal_infos[i].present_id);
 
       results[i] = swapchain->queue_present(swapchain, image_index,
                                             image_signal_infos[i].present_id,
                                             region);
 
       if (unlikely(getenv("PANVK_VERBOSE")))
-         (void)0;
+         fprintf(stderr,
+                 "PANVKDBG PRESENT BACKEND_RET i=%u image=%u result=%d\n",
+                 i, image_index, results[i]);
 
       if (results[i] != VK_SUCCESS && results[i] != VK_SUBOPTIMAL_KHR)
          continue;
@@ -3171,7 +3196,12 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
    if (info->alloc_shm)
       sw_host_ptr = info->alloc_shm(image, info->linear_size);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG WSI_BLIT_SHM alloc_shm=%p sw_host_ptr=%p "
+           "size=%llu\n",
+           (void *)info->alloc_shm,
+           sw_host_ptr,
+           (unsigned long long)info->linear_size);
 
    VkExportMemoryAllocateInfo memory_export_info;
    VkImportMemoryHostPointerInfoEXT host_ptr_info;
@@ -3639,7 +3669,13 @@ wsi_configure_cpu_image(const struct wsi_swapchain *chain,
    assert(chain->blit.type == WSI_SWAPCHAIN_NO_BLIT ||
           chain->blit.type == WSI_SWAPCHAIN_BUFFER_BLIT);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG WSI_CPU_CONFIG blit=%d alloc_shm=%p "
+           "has_import_host=%d wants_linear=%d\n",
+           chain->blit.type,
+           (void *)params->alloc_shm,
+           chain->wsi->has_import_memory_host,
+           chain->wsi->wants_linear);
 
    VkExternalMemoryHandleTypeFlags handle_types = 0;
    if (params->alloc_shm && chain->blit.type != WSI_SWAPCHAIN_NO_BLIT)
