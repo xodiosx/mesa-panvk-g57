@@ -168,24 +168,40 @@ jobs:
         working-directory: mesa
         run: |
           set -euo pipefail
-          FILE="include/vulkan/vk_android_native_buffer.h"
-          [ -f "$FILE" ] || { echo "❌ $FILE not found"; exit 1; }
+          python3 - <<'PY'
+          import re
+          import sys
 
-          echo "==== relevant lines before ===="
-          grep -n -B2 -A6 'buffer_handle_t' "$FILE" | head -40
+          path = "include/vulkan/vk_android_native_buffer.h"
+          try:
+              src = open(path, encoding="utf-8").read()
+          except FileNotFoundError:
+              print(f"ERROR: {path} not found", file=sys.stderr)
+              sys.exit(1)
 
-          sed -i -E \
-            's|^#if[[:space:]]*\(defined\(__ANDROID__\)[[:space:]]*\|\|[[:space:]]*defined\(ANDROID\)\)[[:space:]]*&&[[:space:]]*0.*$|#if defined(__ANDROID__) \|\| defined(ANDROID)|' \
-            "$FILE"
+          pattern = re.compile(
+              r'^#if\s+\(defined\(__ANDROID__\)\s*\|\|\s*defined\(ANDROID\)\)\s*&&\s*0.*$',
+              re.MULTILINE,
+          )
 
-          echo "==== relevant lines after ===="
-          grep -n -B2 -A6 'buffer_handle_t' "$FILE" | head -40
+          new_src, n = pattern.subn(
+              "#if defined(__ANDROID__) || defined(ANDROID)",
+              src,
+          )
 
-          if grep -qE 'defined\(__ANDROID__\).*&&[[:space:]]*0' "$FILE"; then
-            echo "❌ substitution failed — pattern not found"
-            exit 1
-          fi
-          echo "✔ $FILE patched"
+          if n == 0:
+              print("ERROR: pattern not found; first 30 lines follow", file=sys.stderr)
+              for i, line in enumerate(src.splitlines()[:30], 1):
+                  print(f"{i}: {line}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"✔ replaced {n} occurrence(s)")
+          open(path, "w", encoding="utf-8").write(new_src)
+
+          print("==== lines 18-32 after patch ====")
+          for i, line in enumerate(new_src.splitlines()[17:32], 18):
+              print(f"{i}: {line}")
+          PY
 
       - name: Override Vulkan API version (optional)
         if: github.event.inputs.api_override != ''
