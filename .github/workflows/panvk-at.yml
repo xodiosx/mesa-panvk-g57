@@ -366,9 +366,6 @@ jobs:
         run: |
           ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
 
-      # ══════════════════════════════════════════════════════════════
-      # ONLY THIS STEP CHANGED — package as AdrenoTools driver ZIP
-      # ══════════════════════════════════════════════════════════════
       - name: Package AdrenoTools driver ZIP
         run: |
           set -euo pipefail
@@ -380,19 +377,16 @@ jobs:
             exit 1
           fi
 
-          # mesa version, e.g. 26.3.0-devel -> 26.3.0
-          MESA_VERSION=$(grep -oE "version[[:space:]]*:[[:space:]]*'[^']+'" mesa/meson.build \
-                         | head -n1 | sed -E "s/.*'([^']+)'.*/\1/" || true)
-          [ -z "$MESA_VERSION" ] && MESA_VERSION="unknown"
-          MESA_VERSION_SHORT=$(echo "$MESA_VERSION" | sed -E 's/-.*$//')
-          echo "mesa version: $MESA_VERSION  (short: $MESA_VERSION_SHORT)"
-
           if [ ! -f mesa/meta.json ]; then
             echo "❌ meta.json not found at repo root (mesa/meta.json)"
             echo "--- contents of mesa/ ---"
             ls -A mesa | head -40
             exit 1
           fi
+
+          # Fixed output filename — no auto-detection.
+          OUT_NAME="panvcake_26.3.0.R2.zip"
+          echo "output zip: $OUT_NAME"
 
           # Flat staging dir — no subfolder inside the zip.
           STAGE="adreno-driver"
@@ -411,14 +405,13 @@ jobs:
 
           # zip from inside the staging dir so files land at top level.
           cd "$STAGE"
-          ZIP="../panvcake_${MESA_VERSION_SHORT}.R${{ github.run_number }}.zip"
-          zip -9 "$ZIP" meta.json libvulkan_panfrost.so
+          zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so
           cd ..
 
           echo "==== zip contents ===="
-          unzip -l "panvcake_${MESA_VERSION_SHORT}.R${{ github.run_number }}.zip"
+          unzip -l "${OUT_NAME}"
 
-          echo "ZIP_NAME=panvcake_${MESA_VERSION_SHORT}.R${{ github.run_number }}.zip" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=${OUT_NAME}" >> "$GITHUB_ENV"
 
       - name: Upload build logs
         if: always()
@@ -434,7 +427,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: panvcake-driver-zip
+          name: panVK-G57-driver-adrenotools-zip
           path: panvcake_*.zip
           if-no-files-found: error
 
@@ -472,11 +465,7 @@ jobs:
             - Built for Mali-G57 (Valhall JM) with the kbase kernel driver.
             - Workflow run: `${{ github.run_number }}`
 
-            ## Verify
-
-            ```bash
-            vulkaninfo --summary
-            ```
+            
 
             The driver name should read `panvcake` (PanVK fork) rather than
             the stock Mali Vulkan driver.
