@@ -1,6 +1,6 @@
 # Mesa PanVK Mali-G57 — kbase JM / Android
 
-Experimental Mesa PanVK work for **Mali-G57 / Valhall** using the Arm **kbase JM (Job Manager)** interface on Android/Termux.
+Experimental Mesa PanVK work for **Mali-G57 / Valhall** using the Arm **kbase JM (Job Manager)** interface on Android/Adrenotools/termux 
 
 > [!WARNING]
 > Experimental / WIP. Not currently a conformant or production-ready Vulkan implementation.
@@ -10,48 +10,31 @@ Experimental Mesa PanVK work for **Mali-G57 / Valhall** using the Arm **kbase JM
 - Architecture: Valhall
 - Backend: kbase JM
 - Tested uAPI: 11.46
-- Environment: Android / Termux
+- Environment: Android / Termux /adrenotools
 - Window system: Termux:X11
 - Driver: Mesa PanVK
 
-## Confirmed working
-- Mali-G57 MC2 detection and kbase JM initialization
-- Vulkan device/queue creation
-- Validated offscreen triangle, fragment shader and clear
-- Termux:X11 surface and swapchain
-- WSI software path and MIT-SHM
-- kbase USER_BUFFER import/GPU mapping
-- JM external resources
-- Fragment and compute/VTC jobs returning JD event `0x01`
-- `vkQueuePresentKHR()` returning `VK_SUCCESS`
-- Compute writes to WSI USER_BUFFER
+##l Mesa PanVK Mali-G57 — kbase JM / Android
 
-## Current WSI status
-Current visual result:
+Experimental Mesa PanVK Vulkan driver for **ARM Mali-G57 MC2 / Valhall** using the Arm **kbase JM (Job Manager)** interface on Android / Termux.
 
-    RED -> BLACK
+> [!NOTE]
+> This driver enables hardware-accelerated Vulkan on Mali-G57 inside Termux:X11 without requiring Linux mainline DRM/KMS `panfrost.ko`.
 
-Expected:
+---
 
-    RED -> BLUE
+## Target Hardware & Environment
+* **SoC:** MediaTek Dimensity 6300 (MT6835)
+* **GPU:** ARM Mali-G57 MC2 (Valhall v9?)
+* **Architecture:** Valhall v9? (Job Manager / JM)
+* **Kernel Driver:** ARM `kbase` (`/dev/mali0`, uAPI JM 11.38 / 11.46)
+* **Environment:** Android / Termux
+* **Display Server:** Termux:X11 (via MIT-SHM `userbuf` import)
+* **Driver:** Mesa panVcake (`libvulkan_panfrost.so`)
 
-The native swapchain image is rendered correctly (`d9 33 14 ff` observed).
-The destination side of the WSI meta-copy is validated, but the normal sampled
-source read currently produces zero.
+---
 
-Current investigation:
+## Confirmed Working & Benchmarks
 
-    native image -> sampled descriptor -> nir_txf -> conversion
-                 -> nir_store_global -> USER_BUFFER -> MIT-SHM -> X11
-
-The current primary suspect is the sampled texture read / `nir_txf` path.
-
-See [STATUS.md](STATUS.md), [BUILDING.md](BUILDING.md) and
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md).
-
-## Contributions
-Testing, traces, debugging, documentation and patches are welcome.
-
-## License
-Mesa source files retain their existing upstream licenses. New modifications
-should follow the applicable Mesa licensing requirements.
+* **Device & Queue:** Mali-G57 MC2 detection, device initialization, queue creation via `kbase` JM uAPI.
+* **WSI / Display:** Termux:X11 swapchain presentation via `userbuf` host import and MIT-SHM blit.
