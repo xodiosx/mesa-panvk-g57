@@ -1,7 +1,13 @@
-name: sync winlator-pan (AHB + Winlator + AdrenoTools only)
+name: sync winlator-pan (overlay reference, optional restore from main)
 
 on:
   workflow_dispatch:
+    inputs:
+      restore_from_main:
+        description: "Also restore non-AHB/non-Winlator files from the default branch after overlaying the reference. Default: OFF (overlay only)."
+        type: boolean
+        required: false
+        default: false
   push:
     branches: [winlator-pan]
 
@@ -15,7 +21,7 @@ jobs:
     env:
       # Branch being synced and pushed.
       BASE_BRANCH: "winlator-pan"
-      # Reference source for the AHB / Winlator / AdrenoTools changes.
+      # Reference source we pull FROM and overlay.
       REF_REPO:    "mexicanbr0auth/mesa-panvk-g57"
       REF_BRANCH:  "winlatormali-ci"
       # Set this if your repo's default branch is NOT `main`.
@@ -23,24 +29,33 @@ jobs:
       BASE_MAIN_OVERRIDE: ""
     steps:
       # ──────────────────────────────────────────────────────────
-      # 0) Print what we're about to do, so the log is self-explaining.
+      # 0) Print what we're about to do.
       # ──────────────────────────────────────────────────────────
       - name: Explain the sync plan
         run: |
-          cat <<'EOF'
+          RESTORE="${{ inputs.restore_from_main }}"
+          if [[ "$RESTORE" == "true" ]]; then
+            RESTORE_NOTE="ON  — non-keep files will be restored from the default branch"
+          else
+            RESTORE_NOTE="OFF — reference will be overlaid wholesale, nothing restored"
+          fi
+
+          cat <<EOF
           =================================================================
           Sync plan
           -----------------------------------------------------------------
-          1. Checkout          winlator-pan         (the branch we push back to)
-          2. Clone             <default branch>     (pristine base, latest)
-          3. Clone             mexicanbr0auth@winlatormali-ci  (reference)
-          4. Diff 1:           winlator-pan vs reference         -> artifact
-          5. Overlay reference into workspace
-          6. Restore every non-AHB/non-Winlator/non-AdrenoTools file
-             from the freshly cloned default branch
-          7. Diff 2:           restored workspace vs reference   -> artifact
-          8. Upload both diffs
-          9. Force-push workspace to winlator-pan
+          Branch to update        : $BASE_BRANCH
+          Reference repo / branch : $REF_REPO @ $REF_BRANCH
+          Restore from main       : $RESTORE_NOTE
+          -----------------------------------------------------------------
+          1. Checkout          $BASE_BRANCH
+          2. Clone             $REF_REPO @ $REF_BRANCH
+          3. Diff 1:           current vs reference     -> artifact
+          4. Overlay reference into workspace (wholesale)
+          5. Restore from main (only if enabled above)
+          6. Diff 2:           post-state vs reference  -> artifact
+          7. Upload both diffs
+          8. Force-push workspace to $BASE_BRANCH
           =================================================================
           EOF
 
@@ -66,8 +81,7 @@ jobs:
           git --no-pager log -1 --oneline
 
       # ──────────────────────────────────────────────────────────
-      # 2) Resolve the default branch of THIS repo.
-      #    Explicit, logged, exportable. Fails loudly if undetectable.
+      # 2) Resolve the default branch (name only — no clone yet).
       # ──────────────────────────────────────────────────────────
       - name: Resolve default branch of ${{ github.repository }}
         run: |
@@ -95,47 +109,7 @@ jobs:
           echo "BASE_MAIN=$DEFAULT" >> "$GITHUB_ENV"
 
       # ──────────────────────────────────────────────────────────
-      # 3) Clone the default branch fresh. This is the pristine
-      #    source of truth we restore files from. It's cloned on
-      #    every run so any push to main is picked up immediately.
-      # ──────────────────────────────────────────────────────────
-      - name: Clone ${{ env.BASE_MAIN }} from ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          rm -rf /tmp/base-main
-
-          echo "==== cloning ${{ github.repository }} @ $BASE_MAIN ===="
-          git clone --depth 1 --branch "$BASE_MAIN" \
-            "https://github.com/${{ github.repository }}.git" \
-            /tmp/base-main
-
-          # Snapshot the commit so the artifact is self-describing.
-          BASE_MAIN_SHA=$(git -C /tmp/base-main rev-parse HEAD)
-          echo "BASE_MAIN_SHA=$BASE_MAIN_SHA" >> "$GITHUB_ENV"
-          echo ">>> $BASE_MAIN @ $BASE_MAIN_SHA"
-
-          # Strip .git so diff / copy never walk into it.
-          rm -rf /tmp/base-main/.git
-
-          echo "==== base-main top-level ===="
-          ls -A /tmp/base-main | head -60
-
-          echo
-          echo "==== sanity: is this the base repo? ===="
-          for f in \
-            src/panfrost/vulkan/panvk_instance.c \
-            src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c \
-            src/vulkan/wsi/wsi_common.c
-          do
-            if [[ -f "/tmp/base-main/$f" ]]; then
-              echo "  OK   $f"
-            else
-              echo "  MISS $f  <- base main might be a different tree"
-            fi
-          done
-
-      # ──────────────────────────────────────────────────────────
-      # 4) Clone the reference (mexicanbr0auth).
+      # 3) Clone the reference (mexicanbr0auth).
       # ──────────────────────────────────────────────────────────
       - name: Clone reference (${{ env.REF_REPO }})
         run: |
@@ -175,9 +149,9 @@ jobs:
           ls -A /tmp/ref | head -60
 
       # ──────────────────────────────────────────────────────────
-      # 5) Pre-sync diff: current winlator-pan vs reference.
+      # 4) Pre-sync diff: current branch vs reference.
       # ──────────────────────────────────────────────────────────
-      - name: Pre-sync diff (winlator-pan vs reference)
+      - name: Pre-sync diff (current branch vs reference)
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/diff-out"
@@ -206,7 +180,8 @@ jobs:
           head -40 "$GITHUB_WORKSPACE/diff-out/01-pre-sync-summary.txt" || true
 
       # ──────────────────────────────────────────────────────────
-      # 6) Overlay reference into the workspace.
+      # 5) Overlay the reference wholesale into the workspace.
+      #    This is the only sync operation when restore is off.
       # ──────────────────────────────────────────────────────────
       - name: Overlay reference into workspace
         run: |
@@ -229,10 +204,45 @@ jobs:
           ls -A "$GITHUB_WORKSPACE" | head -60
 
       # ──────────────────────────────────────────────────────────
-      # 7) Restore everything NOT on the keep-list from
-      #    the freshly cloned base main.
+      # 6) OPTIONAL: clone base main and restore non-keep files.
+      #    Only runs when the checkbox was ticked.
       # ──────────────────────────────────────────────────────────
+      - name: Clone ${{ env.BASE_MAIN }} from ${{ github.repository }}
+        if: ${{ inputs.restore_from_main == true }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/base-main
+
+          echo "==== cloning ${{ github.repository }} @ $BASE_MAIN ===="
+          git clone --depth 1 --branch "$BASE_MAIN" \
+            "https://github.com/${{ github.repository }}.git" \
+            /tmp/base-main
+
+          BASE_MAIN_SHA=$(git -C /tmp/base-main rev-parse HEAD)
+          echo "BASE_MAIN_SHA=$BASE_MAIN_SHA" >> "$GITHUB_ENV"
+          echo ">>> $BASE_MAIN @ $BASE_MAIN_SHA"
+
+          rm -rf /tmp/base-main/.git
+
+          echo "==== base-main top-level ===="
+          ls -A /tmp/base-main | head -60
+
+          echo
+          echo "==== sanity: is this the base repo? ===="
+          for f in \
+            src/panfrost/vulkan/panvk_instance.c \
+            src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c \
+            src/vulkan/wsi/wsi_common.c
+          do
+            if [[ -f "/tmp/base-main/$f" ]]; then
+              echo "  OK   $f"
+            else
+              echo "  MISS $f  <- base main might be a different tree"
+            fi
+          done
+
       - name: Restore non-AHB/non-Winlator files from ${{ env.BASE_MAIN }}
+        if: ${{ inputs.restore_from_main == true }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
@@ -242,51 +252,30 @@ jobs:
           echo "Commit:         $BASE_MAIN_SHA"
           echo "================================================================"
 
-          # Whitelist: paths that stay at reference version.
-          # Everything else is restored from base main.
           KEEP=(
-            # ---- brand-new files only present in reference ----
             "src/vulkan/wsi/wsi_common_android.c"
             "src/util/u_gralloc/u_gralloc_panvk_test.h"
             "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h"
-
-            # ---- Android WSI wiring ----
             "src/vulkan/wsi/wsi_common.c"
             "src/vulkan/wsi/wsi_common.h"
             "src/vulkan/wsi/wsi_common_private.h"
             "src/vulkan/wsi/wsi_common_x11.c"
             "src/vulkan/wsi/meson.build"
-
-            # ---- Android native buffer header ----
             "include/vulkan/vk_android_native_buffer.h"
-
-            # ---- PanVK Android + gralloc plumbing ----
             "src/panfrost/vulkan/panvk_android.c"
             "src/panfrost/vulkan/panvk_android_hal_bridge.c"
             "src/util/u_gralloc/u_gralloc_fallback.c"
             "src/vulkan/runtime/vk_android.c"
-
-            # ---- PanVK physical device / extension advertisement ----
             "src/panfrost/vulkan/panvk_vX_physical_device.c"
             "src/panfrost/vulkan/panvk_physical_device.c"
             "src/panfrost/vulkan/panvk_physical_device.h"
             "src/panfrost/vulkan/panvk_device_memory.c"
-
-            # ---- PanVK WSI setup (blit_no_shm_import) ----
             "src/panfrost/vulkan/panvk_wsi.c"
             "src/panfrost/vulkan/panvk_instance.c"
-
-            # ---- kbase USER_BUFFER import fix ----
             "src/panfrost/lib/kmod/kbase_kmod.c"
-
-            # ---- JM submit/drain (Winlator JM path) ----
             "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c"
             "src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c"
-
-            # ---- PanVK build (HAL bridge guard) ----
             "src/panfrost/vulkan/meson.build"
-
-            # ---- pan_query_core_count() 2-arg refactor ----
             "src/panfrost/lib/pan_props.c"
             "src/panfrost/lib/pan_props.h"
             "src/panfrost/lib/kmod/panfrost_kmod.c"
@@ -306,7 +295,6 @@ jobs:
           RESTORED=0
           DELETED=0
           KEPT=0
-          MISSING_IN_MAIN=0
 
           while IFS= read -r -d '' f; do
             rel="${f#./}"
@@ -327,12 +315,10 @@ jobs:
             else
               rm -f "$rel"
               DELETED=$((DELETED + 1))
-              # Log once per file so we can tell what main didn't have.
               echo "  deleted (not in $BASE_MAIN): $rel"
             fi
           done < <(find . -type f -print0)
 
-          # Prune directories that became empty after deletions.
           find . -mindepth 1 -type d -empty \
             -not -path './.git/*' \
             -not -path './.github/*' \
@@ -348,10 +334,18 @@ jobs:
           echo "Deleted (not in main): $DELETED"
           echo "======================================================="
 
+      - name: Restore skipped
+        if: ${{ inputs.restore_from_main != true }}
+        run: |
+          echo "================================================================"
+          echo "Restore from main was NOT requested."
+          echo "The workspace is the reference tree overlaid wholesale."
+          echo "================================================================"
+
       # ──────────────────────────────────────────────────────────
-      # 8) Post-restore diff: what still differs from reference.
+      # 7) Post-state diff: workspace vs reference.
       # ──────────────────────────────────────────────────────────
-      - name: Post-restore diff (workspace vs reference)
+      - name: Post-sync diff (workspace vs reference)
         run: |
           set -euo pipefail
 
@@ -365,79 +359,55 @@ jobs:
           set +e
           diff -ruN "${EXCLUDES[@]}" \
             "$GITHUB_WORKSPACE" /tmp/ref \
-            > "$GITHUB_WORKSPACE/diff-out/02-post-restore.patch"
+            > "$GITHUB_WORKSPACE/diff-out/02-post-sync.patch"
           set -e
 
           set +e
           diff -rq "${EXCLUDES[@]}" \
             "$GITHUB_WORKSPACE" /tmp/ref \
-            > "$GITHUB_WORKSPACE/diff-out/02-post-restore-summary.txt" 2>&1
+            > "$GITHUB_WORKSPACE/diff-out/02-post-sync-summary.txt" 2>&1
           set -e
 
-          ls -lh "$GITHUB_WORKSPACE/diff-out/02-post-restore.patch"
+          ls -lh "$GITHUB_WORKSPACE/diff-out/02-post-sync.patch"
           echo "---- first 60 lines of summary ----"
-          head -60 "$GITHUB_WORKSPACE/diff-out/02-post-restore-summary.txt" || true
+          head -60 "$GITHUB_WORKSPACE/diff-out/02-post-sync-summary.txt" || true
           echo "---- line count ----"
-          wc -l "$GITHUB_WORKSPACE/diff-out/02-post-restore-summary.txt" || true
+          wc -l "$GITHUB_WORKSPACE/diff-out/02-post-sync-summary.txt" || true
 
       # ──────────────────────────────────────────────────────────
-      # 9) README for the artifact.
+      # 8) README for the diff bundle.
       # ──────────────────────────────────────────────────────────
       - name: Write diff README
         run: |
           set -euo pipefail
+          RESTORE="${{ inputs.restore_from_main }}"
+          if [[ "$RESTORE" == "true" ]]; then
+            RESTORE_LINE="**enabled** — non-keep files restored from \`$BASE_MAIN\`"
+          else
+            RESTORE_LINE="**disabled** — reference overlaid wholesale, nothing restored"
+          fi
+
           cat > "$GITHUB_WORKSPACE/diff-out/README.md" <<EOF
           # winlator-pan sync — diff bundle
 
           ## Repos and commits used in this run
           - Base branch : https://github.com/${{ github.repository }} @ $BASE_BRANCH @ ${{ github.sha }}
-          - Base main   : https://github.com/${{ github.repository }} @ $BASE_MAIN @ $BASE_MAIN_SHA
+          - Base main   : https://github.com/${{ github.repository }} @ $BASE_MAIN
           - Reference   : https://github.com/$REF_REPO @ $REF_BRANCH_USED @ $REF_SHA
 
+          ## Restore from main
+          $RESTORE_LINE
+
           ## Diffs
-          - \`01-pre-sync.patch\`      — \`$BASE_BRANCH\` vs reference *before* anything changes.
-          - \`02-post-restore.patch\` — after mirror + restore, what still differs from reference.
+          - \`01-pre-sync.patch\`  — $BASE_BRANCH vs reference *before* any changes.
+          - \`02-post-sync.patch\` — after overlay (and optional restore), what still differs from reference.
 
-          ## Restore policy
-          Workspace starts as a copy of the reference. Then every file is checked:
-          - If its path is on the keep-list, it keeps the reference version.
-          - Otherwise the file is restored from \`$BASE_MAIN\` (or deleted if \`$BASE_MAIN\` has no such file).
-
-          ## Keep-list (paths that stay at reference version)
-          - \`src/vulkan/wsi/wsi_common_android.c\` (new)
-          - \`src/util/u_gralloc/u_gralloc_panvk_test.h\` (new)
-          - \`src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h\` (new)
-          - \`src/vulkan/wsi/wsi_common.c\`
-          - \`src/vulkan/wsi/wsi_common.h\`
-          - \`src/vulkan/wsi/wsi_common_private.h\`
-          - \`src/vulkan/wsi/wsi_common_x11.c\`
-          - \`src/vulkan/wsi/meson.build\`
-          - \`include/vulkan/vk_android_native_buffer.h\`
-          - \`src/panfrost/vulkan/panvk_android.c\`
-          - \`src/panfrost/vulkan/panvk_android_hal_bridge.c\`
-          - \`src/util/u_gralloc/u_gralloc_fallback.c\`
-          - \`src/vulkan/runtime/vk_android.c\`
-          - \`src/panfrost/vulkan/panvk_vX_physical_device.c\`
-          - \`src/panfrost/vulkan/panvk_physical_device.c\`
-          - \`src/panfrost/vulkan/panvk_physical_device.h\`
-          - \`src/panfrost/vulkan/panvk_device_memory.c\`
-          - \`src/panfrost/vulkan/panvk_wsi.c\`
-          - \`src/panfrost/vulkan/panvk_instance.c\`
-          - \`src/panfrost/lib/kmod/kbase_kmod.c\`
-          - \`src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c\`
-          - \`src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c\`
-          - \`src/panfrost/vulkan/meson.build\`
-          - \`src/panfrost/lib/pan_props.c\`
-          - \`src/panfrost/lib/pan_props.h\`
-          - \`src/panfrost/lib/kmod/panfrost_kmod.c\`
-          - \`src/panfrost/perf/pan_perf.c\`
-          - \`src/gallium/drivers/panfrost/pan_device.c\`
-          - \`src/gallium/drivers/panfrost/pan_screen.c\`
+          When restore is off, the workspace is a byte-for-byte copy of the reference (modulo .github and *.md), so \`02-post-sync.patch\` should be empty.
           EOF
           cat "$GITHUB_WORKSPACE/diff-out/README.md"
 
       # ──────────────────────────────────────────────────────────
-      # 10) Upload both diffs.
+      # 9) Upload both diffs.
       # ──────────────────────────────────────────────────────────
       - name: Upload diff bundle (always)
         if: always()
@@ -448,7 +418,7 @@ jobs:
           if-no-files-found: warn
 
       # ──────────────────────────────────────────────────────────
-      # 11) Commit and force-push.
+      # 10) Commit and force-push.
       # ──────────────────────────────────────────────────────────
       - name: Commit and force-push to ${{ env.BASE_BRANCH }}
         run: |
@@ -469,7 +439,14 @@ jobs:
           git diff --cached --stat | tail -60
           echo "------------------------"
 
-          git commit -q -m "sync: reference AHB/Winlator/AdrenoTools + restore rest from $BASE_MAIN"
+          RESTORE="${{ inputs.restore_from_main }}"
+          if [[ "$RESTORE" == "true" ]]; then
+            MSG="sync: reference AHB/Winlator/AdrenoTools + restore rest from $BASE_MAIN"
+          else
+            MSG="sync: overlay reference ($REF_REPO @ $REF_BRANCH_USED) onto $BASE_BRANCH"
+          fi
+
+          git commit -q -m "$MSG"
           git --no-pager log -1 --oneline
 
           echo ">>> force-pushing to origin/$BASE_BRANCH"
