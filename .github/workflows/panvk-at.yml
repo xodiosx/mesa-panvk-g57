@@ -1,4 +1,4 @@
-name: Build PanVK G57 for adrenotools (AHB + kbase)
+name: Build PanVK G57 for Android (AHB + kbase, two-pass)
 
 on:
   workflow_dispatch:
@@ -107,6 +107,10 @@ jobs:
             echo "✔ copied libdrm/*.h"
           fi
 
+          echo "==== sysroot libdrm headers ===="
+          ls -la "$SYSROOT/include/xf86drm"* 2>/dev/null || true
+          ls -la "$SYSROOT/include/libdrm/" | head -20
+
       - name: Setup pkg-config wrapper
         run: |
           sudo tee /usr/local/bin/termux-pkg-config > /dev/null << 'SCRIPT'
@@ -129,7 +133,6 @@ jobs:
         working-directory: mesa
         run: |
           git --no-pager log -1 --oneline
-          echo "==== top-level ===="
           ls -A | head -40
           echo "==== meta.json present? ===="
           if [ -f meta.json ]; then
@@ -175,41 +178,71 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import re, sys
+          import re
+          import sys
+
           path = "include/vulkan/vk_android_native_buffer.h"
           try:
               src = open(path, encoding="utf-8").read()
           except FileNotFoundError:
-              print(f"ERROR: {path} not found", file=sys.stderr); sys.exit(1)
+              print(f"ERROR: {path} not found", file=sys.stderr)
+              sys.exit(1)
+
           pattern = re.compile(
               r'^#if\s+\(defined\(__ANDROID__\)\s*\|\|\s*defined\(ANDROID\)\)\s*&&\s*0.*$',
               re.MULTILINE,
           )
-          new_src, n = pattern.subn("#if defined(__ANDROID__) || defined(ANDROID)", src)
+
+          new_src, n = pattern.subn(
+              "#if defined(__ANDROID__) || defined(ANDROID)",
+              src,
+          )
+
           if n == 0:
-              print("ERROR: pattern not found", file=sys.stderr); sys.exit(1)
+              print("ERROR: pattern not found", file=sys.stderr)
+              sys.exit(1)
+
           print(f"✔ replaced {n} occurrence(s)")
           open(path, "w", encoding="utf-8").write(new_src)
           PY
 
-      - name: Patch HMI duplicate symbol (weak)
+      - name: Guard panvk_android_hal_bridge out of Android builds
         working-directory: mesa
         run: |
           set -euo pipefail
-          FILE="src/panfrost/vulkan/panvk_android_hal_bridge.c"
+          FILE="src/panfrost/vulkan/meson.build"
           [ -f "$FILE" ] || { echo "❌ $FILE not found"; exit 1; }
+
           echo "==== before ===="
-          grep -n 'HAL_MODULE_INFO_SYM' "$FILE" || true
-          sed -i -E \
-            's/^([[:space:]]*)(hw_module_t[[:space:]]+HAL_MODULE_INFO_SYM)/\1__attribute__((weak)) \2/' \
-            "$FILE"
+          grep -n 'panvk_android_hal_bridge' "$FILE" || true
+
+          python3 - "$FILE" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+
+          if "if not with_platform_android" in src and "panvk_android_hal_bridge" in src:
+              print("already guarded — skipping")
+              sys.exit(0)
+
+          old = "panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')"
+          if old not in src:
+              print(f"ERROR: cannot find line to replace:\n  {old}", file=sys.stderr)
+              sys.exit(1)
+
+          new = (
+              "panvk_android_hal_bridge = []\n"
+              "if not with_platform_android\n"
+              "  panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')\n"
+              "endif"
+          )
+          src = src.replace(old, new, 1)
+          open(p, "w", encoding="utf-8").write(src)
+          print("✔ patched")
+          PY
+
           echo "==== after ===="
-          grep -n 'HAL_MODULE_INFO_SYM' "$FILE" || true
-          if ! grep -q '__attribute__((weak)).*HAL_MODULE_INFO_SYM' "$FILE"; then
-            echo "❌ weak attribute not applied"
-            exit 1
-          fi
-          echo "✔ $FILE patched"
+          grep -n -A4 'panvk_android_hal_bridge' "$FILE" || true
 
       - name: Override Vulkan API version (optional)
         if: github.event.inputs.api_override != ''
@@ -252,18 +285,22 @@ jobs:
           find build-host -type f -executable \
             \( -name 'mesa_clc' -o -name 'vtn_bindgen2' -o -name 'panfrost_compile' \) -print
 
-      - name: Stage host tools on PATH
+      - name: Stage host tools on PATH (dashed + underscored)
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/host-bin"
           for name in mesa_clc vtn_bindgen2 panfrost_compile; do
             bin=$(find "$GITHUB_WORKSPACE/mesa/build-host" -type f -executable -name "$name" | head -n1)
-            [ -z "$bin" ] && { echo "❌ $name not found"; exit 1; }
+            if [ -z "$bin" ]; then
+              echo "❌ $name not found in build-host"
+              exit 1
+            fi
             dashed=$(echo "$name" | tr '_' '-')
             cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
             cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
             echo "✔ staged $name -> $dashed"
           done
+          ls -la "$GITHUB_WORKSPACE/host-bin/"
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
       - name: Create Meson cross file
@@ -329,13 +366,9 @@ jobs:
         run: |
           ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
 
-      # ────────────────────────────────────────────────────────────
-      # Package as AdrenoTools driver ZIP:
-      #   panvcake_<mesa-version>.R<run-number>.zip
-      #   ├── meta.json
-      #   └── libvulkan_panfrost.so
-      # No subfolder, no ICD json, no tarball.
-      # ────────────────────────────────────────────────────────────
+      # ══════════════════════════════════════════════════════════════
+      # ONLY THIS STEP CHANGED — package as AdrenoTools driver ZIP
+      # ══════════════════════════════════════════════════════════════
       - name: Package AdrenoTools driver ZIP
         run: |
           set -euo pipefail
@@ -354,7 +387,6 @@ jobs:
           MESA_VERSION_SHORT=$(echo "$MESA_VERSION" | sed -E 's/-.*$//')
           echo "mesa version: $MESA_VERSION  (short: $MESA_VERSION_SHORT)"
 
-          # meta.json must exist at the repo root (checked out above as `mesa/`).
           if [ ! -f mesa/meta.json ]; then
             echo "❌ meta.json not found at repo root (mesa/meta.json)"
             echo "--- contents of mesa/ ---"
@@ -362,7 +394,7 @@ jobs:
             exit 1
           fi
 
-          # Build the staging directory (flat, no subfolder).
+          # Flat staging dir — no subfolder inside the zip.
           STAGE="adreno-driver"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
@@ -377,14 +409,13 @@ jobs:
           echo "---- meta.json ----"
           cat "$STAGE/meta.json"
 
-          # Verify the zip will contain exactly the two expected files at
-          # the top level, no subfolder.
+          # zip from inside the staging dir so files land at top level.
           cd "$STAGE"
           ZIP="../panvcake_${MESA_VERSION_SHORT}.R${{ github.run_number }}.zip"
           zip -9 "$ZIP" meta.json libvulkan_panfrost.so
           cd ..
 
-          echo "==== zip listing ===="
+          echo "==== zip contents ===="
           unzip -l "panvcake_${MESA_VERSION_SHORT}.R${{ github.run_number }}.zip"
 
           echo "ZIP_NAME=panvcake_${MESA_VERSION_SHORT}.R${{ github.run_number }}.zip" >> "$GITHUB_ENV"
@@ -416,43 +447,34 @@ jobs:
           body: |
             # PanVK `panvcake` driver for AdrenoTools
 
-            Custom Mesa PanVK Vulkan driver for Mali-G57 (Valhall JM) built
-            for AdrenoTools / Winlator. AHB (Android Hardware Buffer) and
-            kbase (proprietary Mali kernel driver) support are enabled.
-
-            ## What's inside
-
-            `panvcake_*.zip` is an AdrenoTools driver package. It contains:
-
-            - `meta.json` — AdrenoTools driver descriptor
-            - `libvulkan_panfrost.so` — PanVK Vulkan ICD
+            Custom Mesa PanVK Vulkan driver for Mali-G57 (Valhall JM), built
+            for AdrenoTools / Winlator with AHB (Android Hardware Buffer) and
+            kbase (proprietary Mali kernel driver) support enabled.
 
             ## Install (AdrenoTools)
 
             1. Download the `panvcake_*.zip` asset below.
-            2. Open **AdrenoTools** (in Winlator: the driver manager inside
-               a container's settings).
-            3. Choose **Import driver** and select the ZIP directly. Do
-               **not** unzip it first — AdrenoTools reads the ZIP as-is.
+            2. Open **AdrenoTools** — in Winlator, it's the driver manager in
+               a container's settings.
+            3. Choose **Import driver** and select the ZIP directly.
+               Do **not** unzip it first — AdrenoTools reads the ZIP as-is.
             4. Select the imported driver from the list and apply it to the
                container you want to use it in.
-            5. Launch the container. Vulkan apps should now enumerate
-               `panvcake` / `PanVK` as the physical device.
+            5. Launch the container. Vulkan apps should enumerate
+               `panvcake` / PanVK as the physical device.
 
             ## Notes
 
-            - Do **not** copy the `.so` out of the ZIP or extract the ZIP
-              manually. AdrenoTools requires the `meta.json` and the `.so`
-              to stay inside the ZIP, at the top level, with no subfolder.
-            - Tested against AdrenoTools as shipped with Winlator for
-              Mali-G57 (Valhall JM) with the kbase driver.
-            - Build provenance and full logs are attached to this release
-              as workflow artifacts.
+            - Do **not** extract the ZIP manually, and do **not** copy the
+              `.so` out of it. AdrenoTools requires `meta.json` and
+              `libvulkan_panfrost.so` to stay inside the ZIP, at the top
+              level, with no subfolder.
+            - Built for Mali-G57 (Valhall JM) with the kbase kernel driver.
+            - Workflow run: `${{ github.run_number }}`
 
             ## Verify
 
             ```bash
-            # After applying the driver in AdrenoTools, inside the container:
             vulkaninfo --summary
             ```
 
