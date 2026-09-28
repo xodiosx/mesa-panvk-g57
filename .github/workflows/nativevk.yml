@@ -86,15 +86,12 @@ jobs:
           Source-tree transformations applied before compilation.
 
           1. Neutralize every `fprintf(stderr, "...PANVKDBG...")` statement
-             by replacing the call with `(void)0`. Matches any fprintf to
-             stderr whose argument list contains PANVKDBG.
+             by replacing the call with `(void)0`.
 
-          2. Rename the PanVK Vulkan driver name: every quoted string
+          2. Rename the PanVK Vulkan driver name. Every quoted string
              starting with "Mesa PanVK" / "PanVK" / "panvk" keeps its
-             suffix but replaces the prefix with "Mesa PanVCake" /
-             "PanVCake" / "panvcake" respectively. So
-             "Mesa PanVK Mali-G57 Vulkan HAL" becomes
-             "Mesa PanVCake Mali-G57 Vulkan HAL".
+             suffix but replaces the prefix. #include lines are skipped
+             so header paths are never touched.
 
           3. Change the Vulkan driver ID reported by PanVK from
              VK_DRIVER_ID_MESA_PANVK to a custom value.
@@ -119,13 +116,6 @@ jobs:
           CUSTOM_DRIVER_ID = "((VkDriverId)0x0000CAFE)"
           DRIVER_ID_RE = re.compile(r'\bVK_DRIVER_ID_MESA_PANVK\b')
 
-          # Preserve whatever suffix follows the original prefix. `\1`
-          # captures the tail of the string (everything up to the closing
-          # quote). So:
-          #   "Mesa PanVK Mali-G57 Vulkan HAL" -> "Mesa PanVCake Mali-G57 Vulkan HAL"
-          #   "Mesa PanVK"                     -> "Mesa PanVCake"
-          #   "PanVK"                          -> "PanVCake"
-          #   "panvk"                          -> "panvcake"
           DRIVER_NAME_PATTERNS = [
               (re.compile(r'"Mesa PanVK([^"]*)"'), r'"Mesa PanVCake\1"'),
               (re.compile(r'"PanVK([^"]*)"'),      r'"PanVCake\1"'),
@@ -202,14 +192,25 @@ jobs:
 
 
           def rename_driver(src):
+              """
+              Rename driver-name strings on a per-line basis, skipping
+              #include directives. This prevents header paths like
+              `#include "panvk_buffer.h"` from being rewritten.
+              """
               n_name = 0
               n_id = 0
-              for pat, repl in DRIVER_NAME_PATTERNS:
-                  src, k = pat.subn(repl, src)
-                  n_name += k
-              src, k = DRIVER_ID_RE.subn(CUSTOM_DRIVER_ID, src)
-              n_id += k
-              return src, n_name, n_id
+              out = []
+              for line in src.split("\n"):
+                  if line.lstrip().startswith("#include"):
+                      out.append(line)
+                      continue
+                  for pat, repl in DRIVER_NAME_PATTERNS:
+                      line, k = pat.subn(repl, line)
+                      n_name += k
+                  line, k = DRIVER_ID_RE.subn(CUSTOM_DRIVER_ID, line)
+                  n_id += k
+                  out.append(line)
+              return "\n".join(out), n_name, n_id
 
 
           def patch_zink(src):
@@ -626,13 +627,12 @@ jobs:
             ### Customizations
             - PANVKDBG debug statements are neutralized at the source
               level before compilation.
-            - PanVK driver name strings become `Mesa PanVCake Mali-G57
-              Vulkan HAL` (suffix preserved).
+            - PanVK driver name strings become `Mesa PanVCake ...`
+              (suffix preserved).
             - PanVK driver ID changed from `VK_DRIVER_ID_MESA_PANVK` to
               `(VkDriverId)0x0000CAFE`.
             - Zink's `zink_set_driver_strings()` fallback string is
-              replaced so `glxinfo` reports
-              `zink Vulkan 1.3(Mali-G57 MC2 (panvcake))` instead of
+              replaced so `glxinfo` reports the friendly name instead of
               `Driver Unknown`.
 
             ### Files
@@ -646,15 +646,6 @@ jobs:
             ### Install (Termux)
 
             ```bash
-            pkg install x11-repo tur-repo -y 
-            pkg install \
-              libx11 xorgproto libdrm libpixman libjpeg-turbo xtrans libxxf86vm xorg-xrandr \
-                xorg-font-util xorg-util-macros libxfont2 libxkbfile libpciaccess \
-                xcb-util-renderutil xcb-util-image xcb-util-keysyms xcb-util-wm \
-                xorg-xkbcomp xkeyboard-config libxdamage libxinerama libxshmfence \
-                libxcb libxcomposite mesa-demos  libxfixes libxrender curl Vulkan-tools mesa virglrenderer vulkan-loader-generic  glmark2  vkmark termux-x11-night -y
-
-                
             RELEASE_TAG="${{ needs.prepare.outputs.tag }}"
             RELEASE_STAMP="${{ needs.prepare.outputs.stamp }}"
             RELEASE_REPO="${{ github.repository }}"
