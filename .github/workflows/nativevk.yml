@@ -6,6 +6,11 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      update_from_upstream:
+        description: "Clone and sync source from xodiosx/mesa-panvk-mali-g57 (patches + force-push to this repo)"
+        type: boolean
+        required: true
+        default: false
       build_type:
         description: "Build type"
         type: choice
@@ -32,6 +37,7 @@ jobs:
       stamp: ${{ steps.ts.outputs.stamp }}
       tag:   ${{ steps.ts.outputs.tag }}
       types: ${{ steps.ts.outputs.types }}
+      update_from_upstream: ${{ steps.ts.outputs.update_from_upstream }}
     steps:
       - name: Compute build timestamp and tag
         id: ts
@@ -61,6 +67,12 @@ jobs:
             *)              TYPES='["debugoptimized","release"]' ;;
           esac
           echo "types=$TYPES" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event.inputs.update_from_upstream }}" == "true" ]]; then
+            echo "update_from_upstream=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "update_from_upstream=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     needs: prepare
@@ -98,7 +110,10 @@ jobs:
           4. Teach Zink's zink_set_driver_strings() to display "panvcake"
              for that custom ID.
 
-          5. Enlarge any stack buffer that was sized for the old
+          5. Replace the literal, case-sensitive string "Driver Unknown"
+             with "panVcake" (extra override requested on top of #4).
+
+          6. Enlarge any stack buffer that was sized for the old
              "panvk_0x%016" prefix but now holds "panvcake_0x%016".
           """
           import re
@@ -124,6 +139,11 @@ jobs:
           ]
 
           ZINK_SCREEN = Path("src/gallium/drivers/zink/zink_screen.c")
+
+          # Literal, case-sensitive replacement for the Zink "Driver Unknown"
+          # fallback text.
+          DRIVER_UNKNOWN_OLD = "Driver Unknown"
+          DRIVER_UNKNOWN_NEW = "panVcake"
 
 
           def _find_close_paren(src, open_paren_idx):
@@ -208,13 +228,21 @@ jobs:
               return "\n".join(out), n_name, n_id
 
 
+          def rename_driver_unknown(src):
+              """Literal, case-sensitive 'Driver Unknown' -> 'panVcake'."""
+              n = src.count(DRIVER_UNKNOWN_OLD)
+              if n:
+                  src = src.replace(DRIVER_UNKNOWN_OLD, DRIVER_UNKNOWN_NEW)
+              return src, n
+
+
           def patch_renderer_buffers(src):
               """
               After renaming, a stack buffer sized for "panvk_0x%016"
               (25 bytes) is too small for "panvcake_0x%016" (28 bytes)
               and triggers -Werror=format-truncation.
 
-              Find every `snprintf(NAME, sizeof(NAME), "panvcake_0x%016"...)`
+              Find every `snprintf(NAME, sizeof(NAME), "panvcake_0x%016"...)
               call and enlarge NAME's declaration to 32 bytes.
               """
               changed = 0
@@ -278,6 +306,7 @@ jobs:
               total_ids = 0
               total_zink = 0
               total_buffers = 0
+              total_du = 0
               files_modified = 0
 
               for root in ROOTS:
@@ -319,26 +348,39 @@ jobs:
 
               if ZINK_SCREEN.exists():
                   src = ZINK_SCREEN.read_text()
-                  src2, n = patch_zink(src)
+                  orig = src
+
+                  src, n = patch_zink(src)
                   if n == -1:
                       print(f"WARNING: {ZINK_SCREEN}: expected pattern not found")
                   elif n == 0:
                       print(f"{ZINK_SCREEN}: zink already patched (skipped)")
                   else:
-                      ZINK_SCREEN.write_text(src2)
                       print(f"{ZINK_SCREEN}: zink driver-name override added")
                       total_zink = 1
+
+                  # NEW: literal 'Driver Unknown' -> 'panVcake'
+                  src, n_du = rename_driver_unknown(src)
+                  if n_du:
+                      print(f"{ZINK_SCREEN}: replaced {n_du} "
+                            f"'{DRIVER_UNKNOWN_OLD}' -> "
+                            f"'{DRIVER_UNKNOWN_NEW}'")
+                      total_du += n_du
+
+                  if src != orig:
+                      ZINK_SCREEN.write_text(src)
                       files_modified += 1
               else:
                   print(f"WARNING: {ZINK_SCREEN} not found")
 
               print()
-              print(f"Files modified:                   {files_modified}")
-              print(f"PANVKDBG calls neutralized:       {total_neutralized}")
-              print(f"Driver-name strings renamed:      {total_names}")
-              print(f"Driver-ID occurrences replaced:   {total_ids}")
-              print(f"Zink driver-name overrides added: {total_zink}")
-              print(f"Renderer buffers enlarged:        {total_buffers}")
+              print(f"Files modified:                        {files_modified}")
+              print(f"PANVKDBG calls neutralized:            {total_neutralized}")
+              print(f"Driver-name strings renamed:           {total_names}")
+              print(f"Driver-ID occurrences replaced:        {total_ids}")
+              print(f"Zink driver-name overrides added:      {total_zink}")
+              print(f"'Driver Unknown' -> 'panVcake' hits:   {total_du}")
+              print(f"Renderer buffers enlarged:             {total_buffers}")
 
               return 0
 
@@ -350,7 +392,8 @@ jobs:
           echo "--- wrote ci-scripts/patch_panvkdbg.py ---"
           wc -l "${{ github.workspace }}/ci-scripts/patch_panvkdbg.py"
 
-      - name: Clone source repo and apply patcher
+      - name: Clone source repo and apply patcher (host sync)
+        if: ${{ needs.prepare.outputs.update_from_upstream == 'true' }}
         run: |
           set -euo pipefail
           SRC="${{ github.workspace }}/_src"
@@ -371,6 +414,7 @@ jobs:
           git --no-pager diff --stat || true
 
       - name: Overlay source repo into workspace
+        if: ${{ needs.prepare.outputs.update_from_upstream == 'true' }}
         run: |
           set -euo pipefail
           SRC="${{ github.workspace }}/_src"
@@ -398,6 +442,7 @@ jobs:
           ls -A "$DST" | head -40
 
       - name: Commit and push synced source to current repo
+        if: ${{ needs.prepare.outputs.update_from_upstream == 'true' }}
         run: |
           set -euo pipefail
           cd "${{ github.workspace }}"
@@ -431,20 +476,27 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Build PanVK + Zink (${{ matrix.build-type }}) inside Termux container
+        env:
+          UPDATE_FROM_UPSTREAM: ${{ needs.prepare.outputs.update_from_upstream }}
         run: |
           set -euo pipefail
 
           mkdir -p "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
           chmod 777 "${{ github.workspace }}/termux-out-${{ matrix.build-type }}"
 
+          echo ">>> UPDATE_FROM_UPSTREAM = ${UPDATE_FROM_UPSTREAM}"
+
           docker run --rm \
             -v "${{ github.workspace }}/termux-out-${{ matrix.build-type }}:/termux-out" \
             -v "${{ github.workspace }}/ci-scripts:/ci-scripts:ro" \
+            -v "${{ github.workspace }}:/workspace-src:ro" \
+            -e UPDATE_FROM_UPSTREAM="${UPDATE_FROM_UPSTREAM}" \
             termux/termux-docker:aarch64 \
             bash -c '
               set -euo pipefail
               export TMPDIR="${TMPDIR:-$PREFIX/tmp}"
               export BUILD_TYPE="'"${{ matrix.build-type }}"'"
+              export UPDATE_FROM_UPSTREAM="${UPDATE_FROM_UPSTREAM:-false}"
 
               mkdir -p "$PREFIX/etc/apt/sources.list.d"
               echo "deb https://packages.termux.dev/apt/termux-main stable main" \
@@ -484,13 +536,40 @@ jobs:
               mkdir -p "$TMPDIR"
               cd "$TMPDIR"
               rm -rf mesa-panvk mesa-panvk-pristine
-              git clone --depth 1 https://github.com/xodiosx/mesa-panvk-mali-g57.git mesa-panvk
 
-              echo "=============================================="
-              echo "Snapshotting pristine clone for diff ..."
-              echo "=============================================="
-              cp -a mesa-panvk mesa-panvk-pristine
-              du -sh mesa-panvk-pristine
+              if [[ "${UPDATE_FROM_UPSTREAM}" == "true" ]]; then
+                echo "=============================================="
+                echo "Cloning upstream: xodiosx/mesa-panvk-mali-g57"
+                echo "=============================================="
+                git clone --depth 1 https://github.com/xodiosx/mesa-panvk-mali-g57.git mesa-panvk
+
+                echo "=============================================="
+                echo "Snapshotting pristine clone for diff ..."
+                echo "=============================================="
+                cp -a mesa-panvk mesa-panvk-pristine
+                du -sh mesa-panvk-pristine
+                HAVE_PRISTINE=1
+              else
+                echo "=============================================="
+                echo "Using existing workspace source (no upstream sync)"
+                echo "=============================================="
+                mkdir -p mesa-panvk
+                ( cd /workspace-src && tar \
+                    --exclude=.git \
+                    --exclude=ci-scripts \
+                    --exclude=_src \
+                    --exclude="termux-out-*" \
+                    --exclude="build-*" \
+                    --exclude="*.tar.gz" \
+                    --exclude="*.tar.xz" \
+                    --exclude="*.zip" \
+                    --exclude="*.jpg" \
+                    --exclude="*.png" \
+                    -cf - . ) | ( cd mesa-panvk && tar -xf - )
+                echo "--- workspace source tree top-level ---"
+                ls -A mesa-panvk | head -40
+                HAVE_PRISTINE=0
+              fi
 
               cd mesa-panvk
 
@@ -499,32 +578,39 @@ jobs:
               echo "=============================================="
               python3 /ci-scripts/patch_panvkdbg.py
 
-              echo "=============================================="
-              echo "Generating patcher diff (pristine -> patched) ..."
-              echo "=============================================="
               cd "$TMPDIR"
 
-              set +e
-              diff -ruN \
-                --exclude=.git \
-                --exclude=.github \
-                --exclude=build-bionic \
-                --exclude=build-host \
-                mesa-panvk-pristine mesa-panvk \
-                > /termux-out/panvk-patcher-diff.patch
-              DIFF_RC=$?
-              set -e
-              echo "diff exit code: $DIFF_RC  (0=identical, 1=differences, 2=error)"
+              if [[ "$HAVE_PRISTINE" == "1" ]]; then
+                echo "=============================================="
+                echo "Generating patcher diff (pristine -> patched) ..."
+                echo "=============================================="
 
-              set +e
-              diff -rq \
-                --exclude=.git \
-                --exclude=.github \
-                --exclude=build-bionic \
-                --exclude=build-host \
-                mesa-panvk-pristine mesa-panvk \
-                > /termux-out/panvk-patcher-diff-summary.txt 2>&1
-              set -e
+                set +e
+                diff -ruN \
+                  --exclude=.git \
+                  --exclude=.github \
+                  --exclude=build-bionic \
+                  --exclude=build-host \
+                  mesa-panvk-pristine mesa-panvk \
+                  > /termux-out/panvk-patcher-diff.patch
+                DIFF_RC=$?
+                set -e
+                echo "diff exit code: $DIFF_RC  (0=identical, 1=differences, 2=error)"
+
+                set +e
+                diff -rq \
+                  --exclude=.git \
+                  --exclude=.github \
+                  --exclude=build-bionic \
+                  --exclude=build-host \
+                  mesa-panvk-pristine mesa-panvk \
+                  > /termux-out/panvk-patcher-diff-summary.txt 2>&1
+                set -e
+              else
+                echo "Upstream sync disabled — diff vs pristine not available." \
+                  > /termux-out/panvk-patcher-diff-summary.txt
+                : > /termux-out/panvk-patcher-diff.patch
+              fi
 
               ls -lh /termux-out/panvk-patcher-diff.patch \
                      /termux-out/panvk-patcher-diff-summary.txt
@@ -678,11 +764,22 @@ jobs:
             **Build time (UTC):** `${{ needs.prepare.outputs.time }}`
             **Commit:** `${{ github.sha }}`
             **Build types:** `${{ needs.prepare.outputs.types }}`
+            **Upstream sync:** `${{ needs.prepare.outputs.update_from_upstream }}`
 
             ### What is included
             - **PanVK** — Vulkan driver for Mali-G57 (Valhall JM) via kbase
             - **Zink** — Gallium driver that provides OpenGL/GLES on top of
               Vulkan.
+
+            ### Source origin
+            - If **Upstream sync** is `true`, the workflow cloned
+              `xodiosx/mesa-panvk-mali-g57`, applied the patcher on the host,
+              overlaid the result into this repo, force-pushed, and then the
+              container built from a fresh clone of the same upstream.
+              A `pristine -> patched` diff is attached.
+            - If **Upstream sync** is `false`, the workflow built whatever
+              source is committed in this repository as-is (no clone, no
+              overlay, no force-push). No pristine diff is available.
 
             ### Customizations
             - PANVKDBG debug statements are neutralized at the source
@@ -695,6 +792,9 @@ jobs:
               that ID so `glxinfo` reports
               `zink Vulkan 1.3(Mali-G57 MC2 (panvcake))` instead of
               `Driver Unknown`.
+            - The literal, case-sensitive string `Driver Unknown` is
+              replaced with `panVcake` wherever it appears in the Zink
+              source.
             - Renderer-name stack buffers enlarged to fit the longer
               prefix.
 
@@ -704,7 +804,7 @@ jobs:
             - `libvulkan_panfrost.so` — PanVK Vulkan driver
             - `libgallium_dri.so` — contains the Zink Gallium driver
             - `panfrost_icd.aarch64.json` — ICD manifest
-            - `panvk-patcher-diff.patch` — source diff (pristine → patched)
+            - `panvk-patcher-diff.patch` — source diff (only when upstream sync enabled)
 
             ### Install (Termux)
 
