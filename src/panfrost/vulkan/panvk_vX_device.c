@@ -365,9 +365,7 @@ panvk_queue_create(struct panvk_device *dev,
                    uint32_t queue_idx,
                    struct vk_queue **out_queue)
 {
-   fprintf(stderr, "PANVKDBG panvk_queue_create: family=%u, idx=%u, count=%u, kbase_stub=%d\n",
-           create_info->queueFamilyIndex, queue_idx, create_info->queueCount,
-           panvk_kbase_stub_queues(dev));
+   (void)0;
 #ifdef HAVE_PAN_KMOD_KBASE
    if (panvk_kbase_stub_queues(dev) &&
        create_info->queueFamilyIndex == PANVK_QUEUE_FAMILY_BIND)
@@ -457,25 +455,18 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                              &wsi_device_entrypoints, false);
 
-   fprintf(stderr,
-           "PANVKDBG CREATE_DEVICE BEFORE_INIT enabledExtensionCount=%u\\n",
-           pCreateInfo->enabledExtensionCount);
+   (void)0;
    for (uint32_t panvkdbg_i = 0;
         panvkdbg_i < pCreateInfo->enabledExtensionCount;
         panvkdbg_i++) {
-      fprintf(stderr,
-              "PANVKDBG CREATE_DEVICE EXT[%u]=%s\\n",
-              panvkdbg_i,
-              pCreateInfo->ppEnabledExtensionNames[panvkdbg_i]);
+      (void)0;
    }
    fflush(stderr);
 
    result = vk_device_init(&device->vk, &physical_device->vk, &dispatch_table,
                            pCreateInfo, pAllocator);
 
-   fprintf(stderr,
-           "PANVKDBG CREATE_DEVICE AFTER_INIT result=%d KHR_swapchain=%d\\n",
-           result, device->vk.enabled_extensions.KHR_swapchain);
+   (void)0;
    fflush(stderr);
 
    if (result != VK_SUCCESS)
@@ -716,7 +707,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 
       result = check_global_priority(physical_device, queue_create);
       if (result != VK_SUCCESS) {
-         fprintf(stderr, "PANVKDBG check_global_priority failed: result=%d\n", result);
+         (void)0;
          goto err_finish_queues;
       }
 
@@ -725,6 +716,11 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
          result = panvk_queue_create(device, queue_create, q, &queue);
          if (result != VK_SUCCESS) {
             (void)0;
+            goto err_finish_queues;
+         }
+      }
+   }
+   (void)0;
 
    result = panvk_per_arch(utrace_context_init)(device);
    if (result != VK_SUCCESS)

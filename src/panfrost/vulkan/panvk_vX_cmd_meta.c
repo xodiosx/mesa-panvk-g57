@@ -531,22 +531,7 @@ panvk_per_arch(CmdCopyImageToBuffer2)(
       const VkImageSubresourceLayers *sub =
          &pCopyImageToBufferInfo->pRegions[0].imageSubresource;
       unsigned plane = panvk_plane_index(img, sub->aspectMask);
-      fprintf(stderr,
-              "PANVKDBG WSI_COPY image=%p plane=%u SRC=%016llx "
-              "dst_buffer=%p DST=%016llx regions=%u extent=%ux%ux%u "
-              "bufferOffset=%llu rowLength=%u imageHeight=%u\n",
-              (void *)img, plane,
-              (unsigned long long)img->planes[plane].plane.base,
-              (void *)dst,
-              (unsigned long long)panvk_buffer_gpu_ptr(
-                 dst, pCopyImageToBufferInfo->pRegions[0].bufferOffset),
-              pCopyImageToBufferInfo->regionCount,
-              pCopyImageToBufferInfo->pRegions[0].imageExtent.width,
-              pCopyImageToBufferInfo->pRegions[0].imageExtent.height,
-              pCopyImageToBufferInfo->pRegions[0].imageExtent.depth,
-              (unsigned long long)pCopyImageToBufferInfo->pRegions[0].bufferOffset,
-              pCopyImageToBufferInfo->pRegions[0].bufferRowLength,
-              pCopyImageToBufferInfo->pRegions[0].bufferImageHeight);
+      (void)0;
    }
    if (getenv("PANVK_PROBE_USERBUF_FILL") &&
        pCopyImageToBufferInfo->regionCount) {
@@ -557,12 +542,7 @@ panvk_per_arch(CmdCopyImageToBuffer2)(
                            r->imageExtent.height *
                            r->imageExtent.depth * 4;
 
-      fprintf(stderr,
-              "PANVKDBG USERBUF_FILL_PROBE dst=%p offset=%llu "
-              "size=%llu pattern=a5a5a5a5\n",
-              (void *)(uintptr_t)pCopyImageToBufferInfo->dstBuffer,
-              (unsigned long long)r->bufferOffset,
-              (unsigned long long)fill_size);
+      (void)0;
 
       panvk_per_arch(CmdFillBuffer)(
          commandBuffer,
@@ -613,10 +593,7 @@ panvk_per_arch(CmdCopyImageToBuffer2)(
             .regionCount = 1, .pRegions = &region,
          };
          if (unlikely(getenv("PANVK_VERBOSE")))
-            fprintf(stderr, "PANVKDBG COPY_RAW SRC=%016llx DST=%016llx bytes=%llu\n",
-                    (unsigned long long)alias.vk.device_address,
-                    (unsigned long long)panvk_buffer_gpu_ptr(dst, r->bufferOffset),
-                    (unsigned long long)size);
+            (void)0;
          panvk_per_arch(CmdCopyBuffer2)(commandBuffer, &copy);
          vk_buffer_finish(&alias.vk);
          return;

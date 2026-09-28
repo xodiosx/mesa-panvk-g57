@@ -89,12 +89,7 @@ panvk_AllocateMemory(VkDevice _device,
                            IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
 
    if (unlikely(getenv("PANVK_VERBOSE"))) {
-      fprintf(stderr,
-              "PANVKDBG ALLOC size=%llu type=%u host_import=%d host_ptr=%p\n",
-              (unsigned long long)pAllocateInfo->allocationSize,
-              pAllocateInfo->memoryTypeIndex,
-              host_ptr_info != NULL,
-              host_ptr_info ? host_ptr_info->pHostPointer : NULL);
+      (void)0;
    }
 
    const VkMemoryType *type =
@@ -137,10 +132,7 @@ panvk_AllocateMemory(VkDevice _device,
       }
 
       if (unlikely(getenv("PANVK_VERBOSE"))) {
-         fprintf(stderr,
-                 "PANVKDBG HOST_IMPORT USER_BUFFER ptr=%p size=%llu\n",
-                 host_ptr_info->pHostPointer,
-                 (unsigned long long)pAllocateInfo->allocationSize);
+         (void)0;
       }
 
       mem->bo = kbase_kmod_import_user_buffer(

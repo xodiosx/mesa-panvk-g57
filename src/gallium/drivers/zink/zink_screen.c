@@ -189,11 +189,16 @@ zink_set_driver_strings(struct zink_screen *screen)
 {
    char buf[1000];
    const char *driver_name = vk_DriverId_to_str(zink_driverid(screen)) + strlen("VK_DRIVER_ID_");
+   const char *name_part;
+   if ((unsigned)zink_driverid(screen) == 0x0000CAFE)
+      name_part = "panvcake";
+   else
+      name_part = strstr(vk_DriverId_to_str(zink_driverid(screen)), "VK_DRIVER_ID_") ? driver_name : "Driver Unknown";
    int written = snprintf(buf, sizeof(buf), "zink Vulkan %d.%d(%s (%s))",
       VK_VERSION_MAJOR(screen->info.device_version),
       VK_VERSION_MINOR(screen->info.device_version),
       screen->info.props.deviceName,
-      strstr(vk_DriverId_to_str(zink_driverid(screen)), "VK_DRIVER_ID_") ? driver_name : "panvcake"
+      name_part
    );
    if (written < 0)
       return written;

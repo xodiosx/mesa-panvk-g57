@@ -76,11 +76,7 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
    assert(batch);
 
    if (unlikely(getenv("PANVK_VERBOSE"))) {
-      fprintf(stderr, "PANVKDBG close_batch: fb=%llx vtc=%llx frag=%llx jobs=%u\n",
-              (unsigned long long)batch->fb.desc.gpu,
-              (unsigned long long)batch->vtc_jc.first_job,
-              (unsigned long long)batch->frag_jc.first_job,
-              (unsigned)util_dynarray_num_elements(&batch->jobs, void));
+      (void)0;
    }
    if (!batch->fb.desc.gpu && !batch->vtc_jc.first_job) {
       if (util_dynarray_num_elements(&batch->event_ops,
@@ -215,20 +211,16 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
          if (unlikely(getenv("PANVK_VERBOSE"))) {
               const uint32_t *w = (const uint32_t *)fbd.cpu;
               (void)0;
-              fprintf(stderr,
-                      "PANVKDBG fs modes=%u,%u,%u dcd=%llx\n",
-                      fs.modes[0], fs.modes[1], fs.modes[2],
-                      (unsigned long long)fs.dcd_pointer);
+              (void)0;
+              (void)0;
+              (void)0;
               (void)0;
               const uint32_t *rtw = (const uint32_t *)fb_descs.rts;
               (void)0;
+              (void)0;
               const struct pan_fb_load *ld = fbd_info.load;
              for (unsigned rt = 0; rt < render->fb.layout.rt_count; rt++) {
-                fprintf(stderr,
-                        "PANVKDBG load rt%u always=%d ib=%d bd=%d clr=%08x%08x\n",
-                        rt, ld->rts[rt].always, ld->rts[rt].in_bounds_load,
-                        ld->rts[rt].border_load,
-                        ld->rts[rt].clear.color.ui[0], ld->rts[rt].clear.color.ui[1]);
+                (void)0;
              }
          }
 
