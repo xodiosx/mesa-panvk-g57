@@ -31,6 +31,7 @@ jobs:
     env:
       NDK_VERSION: 'r28c'
       ANDROID_API: '33'
+      CACHE_FILE: 'ci-cache/host-tools.tar.gz'
 
     steps:
       - name: Install host build tools
@@ -73,36 +74,34 @@ jobs:
           grep -n "shared_library" src/panfrost/vulkan/meson.build || true
 
       # =====================================================================
-      # HOST-TOOLS CACHE
+      # CACHE REPO (workflow's own repo)
       # =====================================================================
-      - name: Compute host-tools cache key
-        id: cachekey
-        working-directory: mesa
-        run: |
-          set -euo pipefail
-          MESA_SHA=$(git rev-parse HEAD)
-          LLVM_VER=$(llvm-config-19 --version 2>/dev/null || llvm-config --version)
-          KEY="v1-${MESA_SHA:0:12}-llvm${LLVM_VER}"
-          echo "key=$KEY" >> "$GITHUB_OUTPUT"
-          echo "file=ci-cache/host-tools-${KEY}.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "cache_key=$KEY"
+      - name: Checkout cache repo (this workflow's repo)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref_name }}
+          path: ci-repo
+          fetch-depth: 1
+          token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Try restore host-tools cache
+      - name: Try restore host-tools from cache repo
         id: cache
-        working-directory: mesa
         run: |
           set -euo pipefail
-          FILE="${{ steps.cachekey.outputs.file }}"
-          echo "looking for $FILE"
+          FILE="$GITHUB_WORKSPACE/ci-repo/${{ env.CACHE_FILE }}"
           if [ -f "$FILE" ]; then
-            echo "✔ cache hit — extracting"
+            echo "✔ cache found: $FILE"
+            ls -lh "$FILE"
             tar -xzf "$FILE" -C "$GITHUB_WORKSPACE"
+            chmod -R +x "$GITHUB_WORKSPACE/host-bin" 2>/dev/null || true
+            echo "==== host-bin after restore ===="
             ls -la "$GITHUB_WORKSPACE/host-bin" || true
+            echo "==== spirv-host/prefix after restore ===="
             ls -la "$GITHUB_WORKSPACE/spirv-host/prefix" || true
-            chmod +x "$GITHUB_WORKSPACE/host-bin/"* 2>/dev/null || true
             echo "hit=true" >> "$GITHUB_OUTPUT"
           else
-            echo "✗ cache miss — will build from source"
+            echo "✗ no cache at $FILE — will build from source"
             echo "hit=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -183,42 +182,37 @@ jobs:
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
           echo "HOST_DEPS=$GITHUB_WORKSPACE/spirv-host/prefix" >> "$GITHUB_ENV"
 
-      - name: Save host-tools cache to repo (on miss)
+      # =====================================================================
+      # UPLOAD HOST-TOOLS TO THE CACHE REPO (on miss only)
+      # =====================================================================
+      - name: Upload host-tools to cache repo
         if: steps.cache.outputs.hit != 'true'
-        working-directory: mesa
         run: |
           set -euo pipefail
-          mkdir -p ci-cache
-          FILE="${{ steps.cachekey.outputs.file }}"
-          echo "packing $FILE"
-          tar -czf "$FILE" \
-            -C "$GITHUB_WORKSPACE" \
+          cd "$GITHUB_WORKSPACE"
+
+          mkdir -p ci-repo/ci-cache
+          echo "packing ci-repo/${{ env.CACHE_FILE }}"
+          tar -czf "ci-repo/${{ env.CACHE_FILE }}" \
             spirv-host/prefix \
             host-bin
-          ls -lh "$FILE"
+          ls -lh "ci-repo/${{ env.CACHE_FILE }}"
 
+          cd ci-repo
           git config user.email "github-actions@users.noreply.github.com"
           git config user.name  "github-actions"
 
-          find ci-cache -maxdepth 1 -type f -name 'host-tools-*.tar.gz' -printf '%T@ %p\n' \
-            | sort -rn \
-            | tail -n +4 \
-            | awk '{ $1=""; print substr($0, 2) }' \
-            | while read -r old; do
-                [ -n "$old" ] && git rm -f --ignore-unmatch "$old" || true
-              done
-
-          git add ci-cache/
+          git add "${{ env.CACHE_FILE }}"
           if git diff --cached --quiet; then
             echo "no cache changes to commit"
+            exit 0
+          fi
+
+          git commit -m "ci: cache host-tools ($(date -u +%Y%m%d-%H%M%S))"
+          if git push origin "HEAD:${{ github.ref_name }}" 2>&1; then
+            echo "✔ cache pushed to ${{ github.ref_name }}"
           else
-            git commit -m "ci: cache host tools ${{ steps.cachekey.outputs.key }}"
-            BRANCH="${{ github.event.inputs.mesa_branch }}"
-            if git push origin "HEAD:${BRANCH}" 2>&1; then
-              echo "✔ cache pushed to ${BRANCH}"
-            else
-              echo "⚠️  push failed (non-fatal)"
-            fi
+            echo "⚠️  push failed (non-fatal) — cache saved locally only"
           fi
 
       # =====================================================================
@@ -457,7 +451,6 @@ jobs:
           EOF
           cat "$GITHUB_WORKSPACE/android-aarch64.ini"
 
-      # Introspection helper — written to a file to avoid quote hell.
       - name: Write meson-introspect helper
         run: |
           cat > "$GITHUB_WORKSPACE/inspect_targets.py" <<'PY'
