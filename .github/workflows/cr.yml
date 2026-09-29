@@ -6,15 +6,15 @@ on:
       tag:
         description: 'Release tag to create or update'
         required: true
-        default: 'panvk-'
+        default: 'panvk-test'
       mesa_branch:
         description: 'Branch to build from'
         type: choice
         required: true
         default: 'winlator-pan'
         options:
-          - main
           - winlator-pan
+          - main
       api_override:
         description: 'Vulkan API override (leave empty to keep as-is)'
         required: false
@@ -30,7 +30,7 @@ jobs:
 
     env:
       NDK_VERSION: 'r28c'
-      ANDROID_API: '29'
+      ANDROID_API: '33'
 
     steps:
       - name: Install host build tools
@@ -69,6 +69,10 @@ jobs:
         run: |
           git --no-pager log -1 --oneline
           ls -A | head -40
+
+      # =====================================================================
+      # SOURCE PATCHES
+      # =====================================================================
 
       - name: Revert vk_android_native_buffer.h to upstream guard
         working-directory: mesa
@@ -321,12 +325,62 @@ jobs:
           [ -f "$DEVFILE" ] || { echo "❌ $DEVFILE not found"; exit 1; }
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
 
+      # =====================================================================
+      # BUILD SPIRV-TOOLS FOR THE HOST
+      #
+      # Ubuntu's packaged SPIRV-Tools predates Mesa's >= 2024.1 requirement,
+      # so the host tools (mesa_clc, vtn_bindgen2, panfrost_compile) need a
+      # fresh build. This installs into $GITHUB_WORKSPACE/spirv-host/prefix,
+      # which is later exposed via PKG_CONFIG_PATH and LD_LIBRARY_PATH to the
+      # host-tool configure/build steps only. Nothing here leaks into the
+      # Android .so.
+      # =====================================================================
+      - name: Build SPIRV-Tools (host) for mesa_clc / vtn_bindgen2
+        run: |
+          set -euo pipefail
+          SDK_TAG=vulkan-sdk-1.4.309.0
+          WORK="$GITHUB_WORKSPACE/spirv-host"
+          HOST_DEPS="$WORK/prefix"
+          mkdir -p "$WORK"
+
+          git clone --depth 1 --branch "$SDK_TAG" \
+            https://github.com/KhronosGroup/SPIRV-Tools.git "$WORK/SPIRV-Tools"
+          git clone --depth 1 --branch "$SDK_TAG" \
+            https://github.com/KhronosGroup/SPIRV-Headers.git \
+            "$WORK/SPIRV-Tools/external/spirv-headers"
+
+          cmake -S "$WORK/SPIRV-Tools" -B "$WORK/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOST_DEPS" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DSPIRV_SKIP_TESTS=ON \
+            -DSPIRV_SKIP_EXECUTABLES=ON
+          cmake --build "$WORK/build" --parallel 2
+          cmake --install "$WORK/build"
+
+          echo "HOST_DEPS=$HOST_DEPS" >> "$GITHUB_ENV"
+          echo "==== installed pkg-config files ===="
+          ls -la "$HOST_DEPS/lib/pkgconfig/"
+          echo "==== SPIRV-Tools.pc ===="
+          cat "$HOST_DEPS/lib/pkgconfig/SPIRV-Tools.pc" || true
+
+      # =====================================================================
+      # HOST TOOLS (NATIVE)
+      #
+      # These binaries run on the GitHub runner and generate C code at
+      # Android build time. PKG_CONFIG_PATH and LD_LIBRARY_PATH point only
+      # at the freshly built SPIRV-Tools prefix + llvm-19's own pkgconfig,
+      # so no host libdrm/liblzma can slip in.
+      # =====================================================================
       - name: Configure host tools
         working-directory: mesa
         env:
           CC: clang-19
           CXX: clang++-19
           LLVM_CONFIG: /usr/lib/llvm-19/bin/llvm-config
+          PKG_CONFIG_PATH: ${{ env.HOST_DEPS }}/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig
+          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
         run: |
           meson setup build-host \
             --buildtype=release \
@@ -347,6 +401,8 @@ jobs:
           CC: clang-19
           CXX: clang++-19
           LLVM_CONFIG: /usr/lib/llvm-19/bin/llvm-config
+          PKG_CONFIG_PATH: ${{ env.HOST_DEPS }}/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig
+          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
         run: |
           ninja -C build-host \
             src/compiler/clc/mesa_clc \
@@ -369,6 +425,14 @@ jobs:
           done
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
+      # =====================================================================
+      # CROSS BUILD (PURE NDK)
+      #
+      # No host libraries, no Termux. Empty pkg-config dir forces Mesa to
+      # use the libdrm fallback subproject (static). zlib/zstd disabled,
+      # shader-cache disabled, libunwind disabled. -static-libstdc++ removes
+      # the libc++_shared NEEDED entry.
+      # =====================================================================
       - name: Create Meson cross file
         run: |
           set -euo pipefail
@@ -448,9 +512,13 @@ jobs:
         working-directory: mesa
         env:
           PATH: ${{ github.workspace }}/host-bin:/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
         run: |
           ninja -C build-android src/panfrost/vulkan/libvulkan_panfrost.so
 
+      # =====================================================================
+      # VERIFY
+      # =====================================================================
       - name: Verify driver links ONLY system libraries
         run: |
           set -euo pipefail
@@ -483,6 +551,9 @@ jobs:
           strings "$SO" | grep -i 'AHBFD' || \
             echo "⚠️  no AHBFD strings found"
 
+      # =====================================================================
+      # PACKAGE
+      # =====================================================================
       - name: Package AdrenoTools driver ZIP
         run: |
           set -euo pipefail
