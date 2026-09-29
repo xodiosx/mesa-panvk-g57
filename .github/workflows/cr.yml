@@ -42,7 +42,7 @@ jobs:
             ninja-build cmake pkgconf bison flex ripgrep \
             clang-19 llvm-19-dev libclang-19-dev libclang-cpp19-dev \
             libclc-19 libclc-19-dev libllvmspirvlib-19-dev \
-            libdrm-dev zlib1g-dev \
+            libdrm-dev zlib1g-dev libelf-dev \
             patchelf curl ca-certificates zip wget
           python3 -m venv .ci-python
           .ci-python/bin/pip install \
@@ -73,10 +73,7 @@ jobs:
           sha256sum src/panfrost/vulkan/meson.build
           grep -n "shared_library" src/panfrost/vulkan/meson.build || true
 
-      # =====================================================================
-      # CACHE REPO (workflow's own repo)
-      # =====================================================================
-      - name: Checkout cache repo (this workflow's repo)
+      - name: Checkout cache repo
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository }}
@@ -91,17 +88,13 @@ jobs:
           set -euo pipefail
           FILE="$GITHUB_WORKSPACE/ci-repo/${{ env.CACHE_FILE }}"
           if [ -f "$FILE" ]; then
-            echo "✔ cache found: $FILE"
-            ls -lh "$FILE"
+            echo "✔ cache found"
             tar -xzf "$FILE" -C "$GITHUB_WORKSPACE"
             chmod -R +x "$GITHUB_WORKSPACE/host-bin" 2>/dev/null || true
-            echo "==== host-bin after restore ===="
             ls -la "$GITHUB_WORKSPACE/host-bin" || true
-            echo "==== spirv-host/prefix after restore ===="
-            ls -la "$GITHUB_WORKSPACE/spirv-host/prefix" || true
             echo "hit=true" >> "$GITHUB_OUTPUT"
           else
-            echo "✗ no cache at $FILE — will build from source"
+            echo "✗ no cache — will build host tools from source"
             echo "hit=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -125,10 +118,8 @@ jobs:
             https://github.com/KhronosGroup/SPIRV-Headers.git \
             "$WORK/SPIRV-Tools/external/spirv-headers"
           cmake -S "$WORK/SPIRV-Tools" -B "$WORK/build" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$HOST_DEPS" \
-            -DCMAKE_INSTALL_LIBDIR=lib \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOST_DEPS" \
+            -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON
           cmake --build "$WORK/build" --parallel 2
           cmake --install "$WORK/build"
@@ -147,9 +138,9 @@ jobs:
           meson setup build-host \
             --buildtype=release -Dbuild-tests=false \
             -Dplatforms=[] -Dgallium-drivers=[] -Dvulkan-drivers=[] \
-            -Dtools=panfrost \
-            -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true \
-            -Dllvm=enabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true
+            -Dtools=panfrost -Dprecomp-compiler=enabled \
+            -Dinstall-precomp-compiler=true -Dllvm=enabled \
+            -Dmesa-clc=enabled -Dinstall-mesa-clc=true
 
       - name: Build host tools
         if: steps.cache.outputs.hit != 'true'
@@ -166,7 +157,7 @@ jobs:
             src/compiler/spirv/vtn_bindgen2 \
             src/panfrost/clc/panfrost_compile
 
-      - name: Stage host tools on PATH
+      - name: Stage host tools
         if: steps.cache.outputs.hit != 'true'
         run: |
           set -euo pipefail
@@ -177,43 +168,28 @@ jobs:
             dashed=$(echo "$name" | tr '_' '-')
             cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
             cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
-            chmod +x "$GITHUB_WORKSPACE/host-bin/$name" "$GITHUB_WORKSPACE/host-bin/$dashed"
           done
+          chmod -R +x "$GITHUB_WORKSPACE/host-bin"
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
           echo "HOST_DEPS=$GITHUB_WORKSPACE/spirv-host/prefix" >> "$GITHUB_ENV"
 
-      # =====================================================================
-      # UPLOAD HOST-TOOLS TO THE CACHE REPO (on miss only)
-      # =====================================================================
       - name: Upload host-tools to cache repo
         if: steps.cache.outputs.hit != 'true'
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-
           mkdir -p ci-repo/ci-cache
-          echo "packing ci-repo/${{ env.CACHE_FILE }}"
-          tar -czf "ci-repo/${{ env.CACHE_FILE }}" \
-            spirv-host/prefix \
-            host-bin
+          tar -czf "ci-repo/${{ env.CACHE_FILE }}" spirv-host/prefix host-bin
           ls -lh "ci-repo/${{ env.CACHE_FILE }}"
-
           cd ci-repo
           git config user.email "github-actions@users.noreply.github.com"
           git config user.name  "github-actions"
-
           git add "${{ env.CACHE_FILE }}"
           if git diff --cached --quiet; then
-            echo "no cache changes to commit"
-            exit 0
+            echo "no cache change"; exit 0
           fi
-
           git commit -m "ci: cache host-tools ($(date -u +%Y%m%d-%H%M%S))"
-          if git push origin "HEAD:${{ github.ref_name }}" 2>&1; then
-            echo "✔ cache pushed to ${{ github.ref_name }}"
-          else
-            echo "⚠️  push failed (non-fatal) — cache saved locally only"
-          fi
+          git push origin "HEAD:${{ github.ref_name }}" && echo "✔ pushed" || echo "⚠️ push failed"
 
       # =====================================================================
       # SOURCE PATCHES
@@ -234,8 +210,7 @@ jobs:
           out = []
           for line in lines:
               stripped = line.lstrip()
-              if (patched == 0
-                      and stripped.startswith("#if")
+              if (patched == 0 and stripped.startswith("#if")
                       and "defined(__ANDROID__)" in line
                       and "defined(ANDROID)"    in line
                       and "&& 0"                in line):
@@ -246,15 +221,12 @@ jobs:
               else:
                   out.append(line)
           if patched:
-              with open(p, "w", encoding="utf-8", newline="") as f:
-                  f.write("".join(out))
+              open(p, "w", encoding="utf-8", newline="").write("".join(out))
               print(f"✔ reverted {patched} line(s)")
           else:
               print("✔ already clean")
           PY
-          if grep -nE '#if[^#]*#if' "$F"; then
-            echo "❌ concatenated #if"; exit 1
-          fi
+          grep -nE '#if[^#]*#if' "$F" && { echo "❌ concatenated #if"; exit 1; } || true
           echo "✔ no concatenated #if"
 
       - name: Force desktop vulkan.sym symbol scheme
@@ -268,8 +240,7 @@ jobs:
           fi
           sed -i \
             -e 's/vulkan-icd-android-symbols\.txt/vulkan-icd-symbols.txt/g' \
-            -e 's/vulkan-android\.sym/vulkan.sym/g' \
-            "$F"
+            -e 's/vulkan-android\.sym/vulkan.sym/g' "$F"
           ifs=$(grep -cE '^[[:space:]]*(if|elif)\b' "$F")
           endifs=$(grep -cE '^[[:space:]]*endif\b'   "$F")
           [ "$ifs" -eq "$endifs" ] || { echo "❌ if/endif mismatch"; exit 1; }
@@ -334,7 +305,7 @@ jobs:
           print("✔ patched vk_android.c fd probe")
           PY
 
-      - name: Patch u_gralloc_panvk_test.h for unconditional fd probing
+      - name: Patch u_gralloc_panvk_test.h
         working-directory: mesa
         run: |
           set -euo pipefail
@@ -353,8 +324,7 @@ jobs:
           static inline int
           u_gralloc_panvk_test_fd(const native_handle_t *handle, const char *where)
           {
-             if (!handle || handle->numFds < 1)
-                return -1;
+             if (!handle || handle->numFds < 1) return -1;
              int   best_fd   = -1;
              off_t best_size = 0;
              for (int i = 0; i < handle->numFds; i++) {
@@ -383,7 +353,7 @@ jobs:
           sed -i "s/has_header('libudev.h')/false/g" meson.build
           echo "✔ libudev optional"
 
-      - name: Guard panvk_android_hal_bridge out of Android builds
+      - name: Guard panvk_android_hal_bridge
         working-directory: mesa
         run: |
           set -euo pipefail
@@ -457,14 +427,16 @@ jobs:
           import json, sys
           with open(sys.argv[1], encoding="utf-8") as f:
               targets = json.load(f)
-          print(f"total targets: {len(targets)}")
+          print("total targets: {}".format(len(targets)))
+          found = False
           for t in targets:
               n = t.get("name", "") or ""
               if any(k in n.lower() for k in ("vulkan", "panvk", "panfrost")):
                   print("  name={!r} type={} filename={}".format(
                       n, t.get("type", "?"), t.get("filename", "")))
               if "vulkan_panfrost" in n.lower():
-                  print("FOUND_TARGET")
+                  found = True
+          print("FOUND_TARGET" if found else "NO_TARGET")
           PY
           cat "$GITHUB_WORKSPACE/inspect_targets.py"
 
@@ -487,15 +459,27 @@ jobs:
             -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled \
             -Dlibunwind=disabled -Dvalgrind=disabled \
             -Dzlib=disabled -Dzstd=disabled \
+            -Dlibelf=enabled \
             -Dvideo-codecs= -Dperfetto=false -Dstrip=true -Dcpp_rtti=false \
             --force-fallback-for=libdrm -Dallow-fallback-for=libdrm \
             -Dlibdrm:default_library=static
 
+          echo
+          echo "==== config check: was libelf found? ===="
+          grep -iE 'libelf|Library elf' \
+            build-android/meson-logs/meson-log.txt | tail -10 || true
+
+          echo
+          echo "==== config check: any target disabled? ===="
+          grep -iE 'disabling|disabled.*vulkan|vulkan.*disabled' \
+            build-android/meson-logs/meson-log.txt | tail -20 || true
+
+          echo
           echo "==== meson introspect: vulkan/panvk targets ===="
           meson introspect build-android --targets > /tmp/targets.json
           python3 "$GITHUB_WORKSPACE/inspect_targets.py" /tmp/targets.json
 
-      - name: Build PanVK driver via meson compile
+      - name: Build PanVK driver
         working-directory: mesa
         env:
           PATH: ${{ github.workspace }}/host-bin:/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -503,12 +487,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "==== meson compile -C build-android vulkan_panfrost ===="
+          echo "==== ninja targets matching libvulkan_panfrost ===="
+          ninja -C build-android -t targets all 2>/dev/null \
+            | grep -i 'libvulkan_panfrost' || echo "(none found)"
+
+          echo
+          echo "==== attempt 1: meson compile vulkan_panfrost ===="
           if ! meson compile -C build-android vulkan_panfrost; then
-            echo ">>> target name failed; trying libvulkan_panfrost.so"
+            echo "==== attempt 2: meson compile libvulkan_panfrost.so ===="
             if ! meson compile -C build-android libvulkan_panfrost.so; then
-              echo ">>> named targets failed; full build"
-              meson compile -C build-android
+              echo "==== attempt 3: ninja by discovered target ===="
+              T=$(ninja -C build-android -t targets all 2>/dev/null \
+                    | grep -oE '[^ :]*libvulkan_panfrost\.so[^ :]*' | head -1)
+              echo "discovered target: $T"
+              if [ -z "$T" ] || ! ninja -C build-android "$T"; then
+                echo "==== attempt 4: full tree build ===="
+                meson compile -C build-android
+              fi
             fi
           fi
 
@@ -525,9 +520,6 @@ jobs:
           ls -la "$REAL"
           echo "PANVK_SO=$REAL" >> "$GITHUB_ENV"
 
-      # =====================================================================
-      # VERIFY
-      # =====================================================================
       - name: Verify driver
         run: |
           set -euo pipefail
@@ -549,9 +541,6 @@ jobs:
           echo "==== AHBFD strings ===="
           strings "$SO" | grep -i AHBFD || echo "⚠️  none"
 
-      # =====================================================================
-      # PACKAGE
-      # =====================================================================
       - name: Package AdrenoTools driver ZIP
         run: |
           set -euo pipefail
@@ -565,7 +554,6 @@ jobs:
             --strip-unneeded -o "$STAGE/libvulkan_panfrost.so" "$SO"
           cp mesa/meta.json "$STAGE/meta.json"
           ls -la "$STAGE"
-          readelf -d "$STAGE/libvulkan_panfrost.so" | grep NEEDED || true
           cd "$STAGE"
           zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so
           cd ..
@@ -597,18 +585,7 @@ jobs:
           name: ${{ inputs.tag }}
           body: |
             # PanVK `panvcake` driver for AdrenoTools
-
             Pure-NDK cross-compile of Mesa PanVK for Mali-G57 (Valhall JM).
-
-            ## Install (AdrenoTools)
-
-            1. Download `panvcake_*.zip`.
-            2. Import driver → select the ZIP as-is.
-            3. Apply and launch.
-
-            - API level: ${{ env.ANDROID_API }}
-            - Source branch: `${{ github.event.inputs.mesa_branch }}`
-            - Workflow run: ${{ github.run_number }}
           files: |
             panvcake_*.zip
           overwrite_files: true
