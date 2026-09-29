@@ -69,7 +69,168 @@ jobs:
         working-directory: mesa
         run: |
           git --no-pager log -1 --oneline
-          ls -A | head -40
+          sha256sum src/panfrost/vulkan/meson.build
+          grep -n "shared_library" src/panfrost/vulkan/meson.build || true
+
+      # =====================================================================
+      # HOST-TOOLS CACHE
+      #
+      # The host tools (mesa_clc, vtn_bindgen2, panfrost_compile) and their
+      # SPIRV-Tools dependency take ~3-5 minutes to build. We tar them up,
+      # commit to ci-cache/host-tools-<KEY>.tar.gz in the repo, and reuse
+      # them next run when the cache key matches.
+      #
+      # Cache key = v1-<mesa-sha-12>-llvm<llvm-version>
+      # Bump the leading v1 if the recipe changes.
+      # =====================================================================
+      - name: Compute host-tools cache key
+        id: cachekey
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          MESA_SHA=$(git rev-parse HEAD)
+          LLVM_VER=$(llvm-config-19 --version 2>/dev/null || llvm-config --version)
+          KEY="v1-${MESA_SHA:0:12}-llvm${LLVM_VER}"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "file=ci-cache/host-tools-${KEY}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "cache_key=$KEY"
+
+      - name: Try restore host-tools cache
+        id: cache
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          FILE="${{ steps.cachekey.outputs.file }}"
+          echo "looking for $FILE"
+          if [ -f "$FILE" ]; then
+            echo "✔ cache hit — extracting"
+            tar -xzf "$FILE" -C "$GITHUB_WORKSPACE"
+            echo "==== restored host-bin ===="
+            ls -la "$GITHUB_WORKSPACE/host-bin" || true
+            echo "==== restored spirv-host/prefix ===="
+            ls -la "$GITHUB_WORKSPACE/spirv-host/prefix" || true
+            chmod +x "$GITHUB_WORKSPACE/host-bin/"* 2>/dev/null || true
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "✗ cache miss — will build from source"
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Export HOST_DEPS + PATH (cache hit)
+        if: steps.cache.outputs.hit == 'true'
+        run: |
+          echo "HOST_DEPS=$GITHUB_WORKSPACE/spirv-host/prefix" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
+
+      - name: Build SPIRV-Tools (host)
+        if: steps.cache.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          SDK_TAG=vulkan-sdk-1.4.309.0
+          WORK="$GITHUB_WORKSPACE/spirv-host"
+          HOST_DEPS="$WORK/prefix"
+          mkdir -p "$WORK"
+          git clone --depth 1 --branch "$SDK_TAG" \
+            https://github.com/KhronosGroup/SPIRV-Tools.git "$WORK/SPIRV-Tools"
+          git clone --depth 1 --branch "$SDK_TAG" \
+            https://github.com/KhronosGroup/SPIRV-Headers.git \
+            "$WORK/SPIRV-Tools/external/spirv-headers"
+          cmake -S "$WORK/SPIRV-Tools" -B "$WORK/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOST_DEPS" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON
+          cmake --build "$WORK/build" --parallel 2
+          cmake --install "$WORK/build"
+          echo "HOST_DEPS=$HOST_DEPS" >> "$GITHUB_ENV"
+
+      - name: Configure host tools
+        if: steps.cache.outputs.hit != 'true'
+        working-directory: mesa
+        env:
+          CC: clang-19
+          CXX: clang++-19
+          LLVM_CONFIG: /usr/lib/llvm-19/bin/llvm-config
+          PKG_CONFIG_PATH: ${{ env.HOST_DEPS }}/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig
+          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
+        run: |
+          meson setup build-host \
+            --buildtype=release -Dbuild-tests=false \
+            -Dplatforms=[] -Dgallium-drivers=[] -Dvulkan-drivers=[] \
+            -Dtools=panfrost \
+            -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true \
+            -Dllvm=enabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true
+
+      - name: Build host tools
+        if: steps.cache.outputs.hit != 'true'
+        working-directory: mesa
+        env:
+          CC: clang-19
+          CXX: clang++-19
+          LLVM_CONFIG: /usr/lib/llvm-19/bin/llvm-config
+          PKG_CONFIG_PATH: ${{ env.HOST_DEPS }}/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig
+          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
+        run: |
+          ninja -C build-host \
+            src/compiler/clc/mesa_clc \
+            src/compiler/spirv/vtn_bindgen2 \
+            src/panfrost/clc/panfrost_compile
+
+      - name: Stage host tools on PATH
+        if: steps.cache.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/host-bin"
+          for name in mesa_clc vtn_bindgen2 panfrost_compile; do
+            bin=$(find "$GITHUB_WORKSPACE/mesa/build-host" -type f -executable -name "$name" | head -n1)
+            [ -n "$bin" ] || { echo "❌ $name not found"; exit 1; }
+            dashed=$(echo "$name" | tr '_' '-')
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
+            chmod +x "$GITHUB_WORKSPACE/host-bin/$name" "$GITHUB_WORKSPACE/host-bin/$dashed"
+          done
+          echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
+          echo "HOST_DEPS=$GITHUB_WORKSPACE/spirv-host/prefix" >> "$GITHUB_ENV"
+
+      - name: Save host-tools cache to repo (on miss)
+        if: steps.cache.outputs.hit != 'true'
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          mkdir -p ci-cache
+          FILE="${{ steps.cachekey.outputs.file }}"
+          echo "packing $FILE"
+          tar -czf "$FILE" \
+            -C "$GITHUB_WORKSPACE" \
+            spirv-host/prefix \
+            host-bin
+          ls -lh "$FILE"
+
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name  "github-actions"
+
+          # Prune old caches, keep this one + 2 most recent.
+          find ci-cache -maxdepth 1 -type f -name 'host-tools-*.tar.gz' -printf '%T@ %p\n' \
+            | sort -rn \
+            | tail -n +4 \
+            | awk '{ $1=""; print substr($0, 2) }' \
+            | while read -r old; do
+                [ -n "$old" ] && git rm -f --ignore-unmatch "$old" || true
+              done
+
+          git add ci-cache/
+          if git diff --cached --quiet; then
+            echo "no cache changes to commit"
+          else
+            git commit -m "ci: cache host tools ${{ steps.cachekey.outputs.key }}"
+            BRANCH="${{ github.event.inputs.mesa_branch }}"
+            if git push origin "HEAD:${BRANCH}" 2>&1; then
+              echo "✔ cache pushed to ${BRANCH}"
+            else
+              echo "⚠️  push failed (non-fatal) — cache saved locally only"
+            fi
+          fi
 
       # =====================================================================
       # SOURCE PATCHES
@@ -273,76 +434,7 @@ jobs:
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
 
       # =====================================================================
-      # HOST SPIRV-TOOLS
-      # =====================================================================
-      - name: Build SPIRV-Tools (host)
-        run: |
-          set -euo pipefail
-          SDK_TAG=vulkan-sdk-1.4.309.0
-          WORK="$GITHUB_WORKSPACE/spirv-host"
-          HOST_DEPS="$WORK/prefix"
-          mkdir -p "$WORK"
-          git clone --depth 1 --branch "$SDK_TAG" \
-            https://github.com/KhronosGroup/SPIRV-Tools.git "$WORK/SPIRV-Tools"
-          git clone --depth 1 --branch "$SDK_TAG" \
-            https://github.com/KhronosGroup/SPIRV-Headers.git \
-            "$WORK/SPIRV-Tools/external/spirv-headers"
-          cmake -S "$WORK/SPIRV-Tools" -B "$WORK/build" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$HOST_DEPS" \
-            -DCMAKE_INSTALL_LIBDIR=lib \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON
-          cmake --build "$WORK/build" --parallel 2
-          cmake --install "$WORK/build"
-          echo "HOST_DEPS=$HOST_DEPS" >> "$GITHUB_ENV"
-
-      - name: Configure host tools
-        working-directory: mesa
-        env:
-          CC: clang-19
-          CXX: clang++-19
-          LLVM_CONFIG: /usr/lib/llvm-19/bin/llvm-config
-          PKG_CONFIG_PATH: ${{ env.HOST_DEPS }}/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig
-          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
-        run: |
-          meson setup build-host \
-            --buildtype=release -Dbuild-tests=false \
-            -Dplatforms=[] -Dgallium-drivers=[] -Dvulkan-drivers=[] \
-            -Dtools=panfrost \
-            -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true \
-            -Dllvm=enabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true
-
-      - name: Build host tools
-        working-directory: mesa
-        env:
-          CC: clang-19
-          CXX: clang++-19
-          LLVM_CONFIG: /usr/lib/llvm-19/bin/llvm-config
-          PKG_CONFIG_PATH: ${{ env.HOST_DEPS }}/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig
-          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
-        run: |
-          ninja -C build-host \
-            src/compiler/clc/mesa_clc \
-            src/compiler/spirv/vtn_bindgen2 \
-            src/panfrost/clc/panfrost_compile
-
-      - name: Stage host tools on PATH
-        run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/host-bin"
-          for name in mesa_clc vtn_bindgen2 panfrost_compile; do
-            bin=$(find "$GITHUB_WORKSPACE/mesa/build-host" -type f -executable -name "$name" | head -n1)
-            [ -n "$bin" ] || { echo "❌ $name not found"; exit 1; }
-            dashed=$(echo "$name" | tr '_' '-')
-            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
-            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
-            chmod +x "$GITHUB_WORKSPACE/host-bin/$name" "$GITHUB_WORKSPACE/host-bin/$dashed"
-          done
-          echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
-
-      # =====================================================================
-      # CROSS CONFIGURE + BUILD (no meson injection)
+      # CROSS CONFIGURE + BUILD
       # =====================================================================
       - name: Create Meson cross file
         run: |
@@ -399,117 +491,46 @@ jobs:
             --force-fallback-for=libdrm -Dallow-fallback-for=libdrm \
             -Dlibdrm:default_library=static
 
-      - name: Build whole tree
+          echo "==== meson introspect: vulkan/panvk targets ===="
+          meson introspect build-android --targets | python3 -c '
+          import json, sys
+          targets = json.load(sys.stdin)
+          for t in targets:
+              n = t.get("name","") or ""
+              if "vulkan" in n.lower() or "panvk" in n.lower():
+                  print(f"  name={n!r} type={t.get(\"type\",\"?\")} filename={t.get(\"filename\",\"\")}")
+          '
+
+      - name: Build PanVK driver via meson compile
         working-directory: mesa
         env:
           PATH: ${{ github.workspace }}/host-bin:/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
         run: |
-          ninja -C build-android
-
-      # =====================================================================
-      # MANUAL LINK
-      #
-      # The fork's meson.build never produces libvulkan_panfrost.so. Rather
-      # than guess variable names in a shared_library() injection, we compile
-      # the three generated .c files and link all static libraries ourselves
-      # using the exact compile flags meson already used.
-      # =====================================================================
-      - name: Manually link libvulkan_panfrost.so
-        working-directory: mesa
-        run: |
           set -euo pipefail
 
-          BUILD="build-android/src/panfrost/vulkan"
-
-          echo "==== files in $BUILD ===="
-          ls -la "$BUILD"
-
-          # --- extract CC + flags from an existing compile command ---
-          REF="$BUILD/libpanvk_v14.a.p/csf_panvk_vX_cmd_draw.c.o"
-          [ -f "$REF" ] || REF=$(find build-android/src/panfrost/vulkan -name '*.c.o' | head -1)
-          echo "reference object: $REF"
-
-          CMD=$(ninja -C build-android -t commands "$REF" | head -1)
-          echo "==== reference compile command ===="
-          echo "$CMD"
-
-          CC_AND_FLAGS=$(echo "$CMD" | awk '{
-            for (i=1; i<=NF; i++) {
-              if ($i == "-c" || $i == "-o") break
-              printf "%s ", $i
-            }
-          }')
-          echo "==== CC_AND_FLAGS ===="
-          echo "$CC_AND_FLAGS"
-
-          # --- compile the three generated .c files ---
-          for base in panvk_entrypoints panvk_drirc panvk_tracepoints; do
-            SRC="$BUILD/$base.c"
-            [ -f "$SRC" ] || { echo "⚠️  missing $SRC"; continue; }
-            echo "== compiling $base.c =="
-            $CC_AND_FLAGS -c "$SRC" -o "$BUILD/$base.o"
-          done
-
-          # --- collect static libraries ---
-          LIBS=""
-          for pattern in \
-              "$BUILD"/libpanvk_v*.a \
-              build-android/src/panfrost/lib/libpan-arch-v*.a \
-              build-android/src/panfrost/lib/libpan-format-v*.a \
-              build-android/src/panfrost/lib/libpanfrost_shared.a \
-              build-android/src/panfrost/model/libpanfrost_model_lib.a; do
-            for f in $pattern; do
-              [ -f "$f" ] && LIBS="$LIBS $f"
-            done
-          done
-          echo "==== static libs to link ===="
-          for f in $LIBS; do echo "  $f"; done
-
-          LIBDRM_STATIC=$(find build-android/subprojects -name 'libdrm.a' 2>/dev/null | head -1)
-          echo "libdrm static: $LIBDRM_STATIC"
-
-          OBJS="$BUILD/panvk_entrypoints.o $BUILD/panvk_drirc.o $BUILD/panvk_tracepoints.o"
-
-          OUT="$BUILD/libvulkan_panfrost.so"
-          echo "==== linking $OUT ===="
-
-          $CC_AND_FLAGS \
-            -shared -fPIC \
-            -Wl,-soname,libvulkan_panfrost.so \
-            -Wl,--allow-shlib-undefined \
-            -o "$OUT" \
-            -Wl,--start-group \
-              $OBJS \
-              $LIBS \
-              $LIBDRM_STATIC \
-            -Wl,--end-group \
-            -landroid -llog -ldl 2>&1 | tail -80 || true
-
-          if [ ! -f "$OUT" ]; then
-            echo "❌ manual link failed"
-            echo "==== retrying without --start-group (whole-archive) ===="
-            $CC_AND_FLAGS \
-              -shared -fPIC \
-              -Wl,-soname,libvulkan_panfrost.so \
-              -o "$OUT" \
-              $OBJS \
-              -Wl,--whole-archive $LIBS $LIBDRM_STATIC -Wl,--no-whole-archive \
-              -landroid -llog -ldl 2>&1 | tail -80 || true
+          echo "==== meson compile -C build-android vulkan_panfrost ===="
+          if ! meson compile -C build-android vulkan_panfrost; then
+            echo ">>> target name failed; trying libvulkan_panfrost.so"
+            if ! meson compile -C build-android libvulkan_panfrost.so; then
+              echo ">>> named targets failed; full build"
+              meson compile -C build-android
+            fi
           fi
 
-          if [ ! -f "$OUT" ]; then
-            echo "❌ still no .so"
+          echo
+          echo "==== locating .so ===="
+          SO=$(find build-android -name 'libvulkan_panfrost.so*' -print 2>/dev/null | head -n1 || true)
+          if [ -z "$SO" ]; then
+            echo "❌ libvulkan_panfrost.so not found"
+            echo "---- all .so under build-android ----"
+            find build-android -name '*.so*' -print | sort
             exit 1
           fi
-
-          echo "✔ linked: $OUT"
-          ls -la "$OUT"
-          echo "==== DT_NEEDED ===="
-          readelf -d "$OUT" | grep NEEDED || true
-          echo "==== exported dynamic symbols (vk_icd*) ===="
-          nm -D "$OUT" 2>/dev/null | grep -i 'vk_icd' || true
-          echo "PANVK_SO=$PWD/$OUT" >> "$GITHUB_ENV"
+          REAL=$(readlink -f "$SO")
+          echo "✔ $SO -> $REAL"
+          ls -la "$REAL"
+          echo "PANVK_SO=$REAL" >> "$GITHUB_ENV"
 
       # =====================================================================
       # VERIFY
@@ -522,8 +543,15 @@ jobs:
           echo "==== DT_NEEDED ===="
           readelf -d "$SO" | grep NEEDED || true
           echo
+          echo "==== forbidden Termux/host libs ===="
+          bad=0
+          for n in liblzma libzstd libunwind libc++_shared libdrm.so.2; do
+            strings "$SO" | grep -q "$n" && { echo "❌ references $n"; bad=1; }
+          done
+          [ "$bad" = "0" ] && echo "✔ clean"
+          echo
           echo "==== vk_icdGetInstanceProcAddr exported? ===="
-          nm -D "$SO" 2>/dev/null | grep -i 'vk_icdGetInstanceProcAddr' || echo "❌ NOT exported"
+          nm -D "$SO" 2>/dev/null | grep -i 'vk_icdGetInstanceProcAddr' || echo "❌ not exported"
           echo
           echo "==== AHBFD strings ===="
           strings "$SO" | grep -i AHBFD || echo "⚠️  none"
@@ -578,8 +606,6 @@ jobs:
             # PanVK `panvcake` driver for AdrenoTools
 
             Pure-NDK cross-compile of Mesa PanVK for Mali-G57 (Valhall JM).
-            The driver `.so` is linked manually in CI because the
-            `winlator-pan` branch ships static libraries only.
 
             ## Install (AdrenoTools)
 
