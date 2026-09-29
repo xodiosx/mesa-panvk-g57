@@ -1,4 +1,4 @@
-name: Build PanVK G57 for Android (pure NDK cross-compile)
+Name: Build PanV for Android (pure NDK cross-compile)
 
 on:
   workflow_dispatch:
@@ -344,9 +344,6 @@ jobs:
 
       # =====================================================================
       # ENSURE shared_library('vulkan_panfrost') EXISTS
-      #
-      # Build the appended block via string concatenation. No triple-quoted
-      # strings, no textwrap.dedent, no YAML indentation traps.
       # =====================================================================
       - name: Ensure shared_library('vulkan_panfrost') exists in meson.build
         working-directory: mesa
@@ -358,18 +355,20 @@ jobs:
           python3 - "$F" <<'PY'
           import re, sys
           p = sys.argv[1]
-          src = open(p, encoding="utf-8").read()
+          with open(p, "r", encoding="utf-8") as f:
+              src = f.read()
 
-          if re.search(r"shared_library\s*\(\s*['\"]vulkan_panfrost['\"]", src):
-              print("✔ shared_library('vulkan_panfrost') already present")
-              sys.exit(0)
+          # 1. Defeat early exits and neutralize disabled targets from the fork
+          src = re.sub(r"\bsubdir_done\s*\(\s*\)", "# subdir_done()", src)
+          src = re.sub(r"(?<!#)\bshared_library\s*\(\s*['\"]vulkan_panfrost['\"]", r"static_library('vulkan_panfrost_disabled'", src)
 
+          # 2. Extract internal variable names
           assigns = {}
           for m in re.finditer(r'^([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)', src, re.M):
               assigns[m.group(1)] = m.group(2)
 
           def pick(needles, fallback):
-              for name, kind in assigns.items():
+              for name in assigns.keys():
                   low = name.lower()
                   if all(n in low for n in needles):
                       return name
@@ -379,19 +378,21 @@ jobs:
           drirc       = pick(['drirc'],      'panvk_drirc')
           tracepoints = pick(['tracepoint'], 'panvk_tracepoints')
           per_arch    = pick(['per_arch'],   'libpanvk_per_arch')
+          
+          # NEW: Extract the core driver static library
+          core_lib    = pick(['panvk_lib'],  'panvk_lib')
 
-          print("auto-detected:")
+          print("auto-detected variables:")
           print(f"  entrypoints = {entrypoints}")
           print(f"  drirc       = {drirc}")
           print(f"  tracepoints = {tracepoints}")
           print(f"  per_arch    = {per_arch}")
+          print(f"  core_lib    = {core_lib}")
 
-          # Build the block line by line. No multi-line literals.
+          # 3. Inject the shared_library block with the core driver included
           b = []
           b.append("")
-          b.append("# =====================================================================")
-          b.append("# PATCH: re-add shared_library target (fork ships static-only)")
-          b.append("# =====================================================================")
+          b.append("# === FORCED BY CI ===")
           b.append("libvulkan_panfrost = shared_library(")
           b.append("  'vulkan_panfrost',")
           b.append(f"  [{entrypoints}, {drirc}, {tracepoints}],")
@@ -400,18 +401,20 @@ jobs:
           b.append("    inc_panfrost, inc_panfrost_vulkan,")
           b.append("    inc_vulkan_util, inc_vulkan_wsi,")
           b.append("  ],")
-          b.append("  link_args : vulkan_icd_link_args,")
-          b.append(f"  link_with : [{per_arch}],")
+          # Handle vulkan_icd_link_args which might be undefined at this parse stage
+          b.append("  link_args : ['-Wl,-Bsymbolic', '-Wl,--build-id=sha1'] + (is_variable('vulkan_icd_link_args') ? vulkan_icd_link_args : []),")
+          b.append(f"  link_with : [{core_lib}, {per_arch}],")
           b.append("  dependencies : [dep_libdrm],")
           b.append("  gnu_symbol_visibility : 'hidden',")
           b.append("  install : true,")
           b.append(")")
           b.append("")
 
-          with open(p, "a", encoding="utf-8") as f:
-              f.write("\n".join(b))
+          # Overwrite the file with patched src + injection
+          with open(p, "w", encoding="utf-8") as f:
+              f.write(src + "\n" + "\n".join(b))
 
-          print("✔ appended shared_library block")
+          print("✔ Patched and injected shared_library block")
           PY
 
           echo "==== tail of $F ===="
@@ -492,7 +495,7 @@ jobs:
             src/compiler/spirv/vtn_bindgen2 \
             src/panfrost/clc/panfrost_compile
           find build-host -type f -executable \
-            \( -name 'mesa_clc' -o -name 'vtn_bindgen2' -o -name 'panfrost_compile' \) -print
+            \(-name 'mesa_clc' -o -name 'vtn_bindgen2' -o -name 'panfrost_compile'\) -print
 
       - name: Stage host tools on PATH
         run: |
@@ -504,7 +507,7 @@ jobs:
             dashed=$(echo "$name" | tr '_' '-')
             cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
             cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
-            echo "✔ staged $name -> $dashed"
+            echo "✔ staged $name ->$dashed"
           done
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
@@ -612,11 +615,11 @@ jobs:
 
           echo
           echo "==== locating .so ===="
-          SO=$(find build-android \( -type f -o -type l \) -name 'libvulkan_panfrost.so*' -print | head -n1 || true)
+          SO=$(find build-android \(-type f -o -type l\) -name 'libvulkan_panfrost.so*' -print | head -n1 || true)
           if [ -z "$SO" ]; then
             echo "❌ libvulkan_panfrost.so not found"
             echo "---- all .so under build-android ----"
-            find build-android \( -type f -o -type l \) -name '*.so*' -print
+            find build-android \(-type f -o -type l\) -name '*.so*' -print
             exit 1
           fi
           REAL=$(readlink -f "$SO")
@@ -641,8 +644,8 @@ jobs:
           echo "==== forbidden Termux/host libs ===="
           bad=0
           for bad_name in liblzma libzstd libunwind libc++_shared libdrm.so.2; do
-            if strings "$SO" | grep -q "$bad_name"; then
-              echo "❌ $SO references $bad_name"
+            if strings "$SO" \vert{} grep -q "$bad_name"; then
+              echo "❌ $SO references$bad_name"
               bad=1
             fi
           done
@@ -673,7 +676,7 @@ jobs:
           set -euo pipefail
 
           SO="$PANVK_SO"
-          [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
+          [ -f "$SO" ] \vert{}\vert{} { echo "❌ $SO not found"; exit 1; }
 
           if [ ! -f mesa/meta.json ]; then
             echo "❌ meta.json not found at mesa/meta.json"
