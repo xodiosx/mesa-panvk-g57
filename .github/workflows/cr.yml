@@ -345,10 +345,8 @@ jobs:
       # =====================================================================
       # ENSURE shared_library('vulkan_panfrost') EXISTS
       #
-      # The winlator-pan branch ships static libraries only; the ICD JSONs
-      # are generated but nothing produces libvulkan_panfrost.so. This step
-      # appends a shared_library block if one is missing, using variable
-      # names auto-detected from the file.
+      # Build the appended block via string concatenation. No triple-quoted
+      # strings, no textwrap.dedent, no YAML indentation traps.
       # =====================================================================
       - name: Ensure shared_library('vulkan_panfrost') exists in meson.build
         working-directory: mesa
@@ -362,12 +360,10 @@ jobs:
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
 
-          # Already has one?
           if re.search(r"shared_library\s*\(\s*['\"]vulkan_panfrost['\"]", src):
-              print("✔ shared_library('vulkan_panfrost') already present — skipping")
+              print("✔ shared_library('vulkan_panfrost') already present")
               sys.exit(0)
 
-          # Collect every assignment: name = kind
           assigns = {}
           for m in re.finditer(r'^([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)', src, re.M):
               assigns[m.group(1)] = m.group(2)
@@ -390,28 +386,31 @@ jobs:
           print(f"  tracepoints = {tracepoints}")
           print(f"  per_arch    = {per_arch}")
 
-          block = f"""
+          # Build the block line by line. No multi-line literals.
+          b = []
+          b.append("")
+          b.append("# =====================================================================")
+          b.append("# PATCH: re-add shared_library target (fork ships static-only)")
+          b.append("# =====================================================================")
+          b.append("libvulkan_panfrost = shared_library(")
+          b.append("  'vulkan_panfrost',")
+          b.append(f"  [{entrypoints}, {drirc}, {tracepoints}],")
+          b.append("  include_directories : [")
+          b.append("    inc_include, inc_src, inc_util,")
+          b.append("    inc_panfrost, inc_panfrost_vulkan,")
+          b.append("    inc_vulkan_util, inc_vulkan_wsi,")
+          b.append("  ],")
+          b.append("  link_args : vulkan_icd_link_args,")
+          b.append(f"  link_with : [{per_arch}],")
+          b.append("  dependencies : [dep_libdrm],")
+          b.append("  gnu_symbol_visibility : 'hidden',")
+          b.append("  install : true,")
+          b.append(")")
+          b.append("")
 
-# =====================================================================
-# PATCH: re-add shared_library target (fork ships static-only)
-# =====================================================================
-libvulkan_panfrost = shared_library(
-  'vulkan_panfrost',
-  [{entrypoints}, {drirc}, {tracepoints}],
-  include_directories : [
-    inc_include, inc_src, inc_util,
-    inc_panfrost, inc_panfrost_vulkan,
-    inc_vulkan_util, inc_vulkan_wsi,
-  ],
-  link_args : vulkan_icd_link_args,
-  link_with : [{per_arch}],
-  dependencies : [dep_libdrm],
-  gnu_symbol_visibility : 'hidden',
-  install : true,
-)
-"""
-          with open(p, 'a', encoding='utf-8') as f:
-              f.write(block)
+          with open(p, "a", encoding="utf-8") as f:
+              f.write("\n".join(b))
+
           print("✔ appended shared_library block")
           PY
 
@@ -455,6 +454,7 @@ libvulkan_panfrost = shared_library(
           cmake --install "$WORK/build"
 
           echo "HOST_DEPS=$HOST_DEPS" >> "$GITHUB_ENV"
+          ls -la "$HOST_DEPS/lib/pkgconfig/"
 
       - name: Configure host tools
         working-directory: mesa
@@ -612,8 +612,7 @@ libvulkan_panfrost = shared_library(
 
           echo
           echo "==== locating .so ===="
-          SO=$(find build-android -type f -o -type l \
-                 | grep -E 'libvulkan_panfrost\.so(\.|$)' | head -n1 || true)
+          SO=$(find build-android \( -type f -o -type l \) -name 'libvulkan_panfrost.so*' -print | head -n1 || true)
           if [ -z "$SO" ]; then
             echo "❌ libvulkan_panfrost.so not found"
             echo "---- all .so under build-android ----"
