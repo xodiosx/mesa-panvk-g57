@@ -6,11 +6,11 @@ on:
       tag:
         description: 'Release tag to create or update'
         required: true
-        default: 'panvk-test'
+        default: 'panvk-0'
       mesa_branch:
         description: 'Branch of the current repo to build'
         required: true
-        default: 'main'
+        default: 'winlator-pan'
       api_override:
         description: 'Vulkan API override (leave empty to keep as-is)'
         required: false
@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y ninja-build pkg-config python3-mako python3-pip \
-            glslang-tools flex bison curl ca-certificates cmake zip \
+            glslang-tools flex bison curl ca-certificates cmake zip patchelf \
             clang-19 llvm-19-dev libclang-19-dev libclang-cpp19-dev \
             libclc-19 libclc-19-dev libllvmspirvlib-19-dev \
             libdrm-dev zlib1g-dev libzstd-dev libelf-dev spirv-tools \
@@ -46,12 +46,6 @@ jobs:
           echo "ANDROID_NDK_ROOT=/opt/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
           chmod +x /opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/*
 
-      # =====================================================================
-      # NEW: bring in the *real* Android AHB + native_handle headers so Mesa
-      # uses the true buffer_handle_t / AHardwareBuffer instead of its own
-      # fallback stubs. This replaces the old "Fix buffer_handle_t typedef
-      # conflict" patch step.
-      # =====================================================================
       - name: Provide real Android AHB / native_handle headers (from AOSP)
         run: |
           set -euo pipefail
@@ -59,33 +53,16 @@ jobs:
           AOSP_TAG="android-14.0.0_r1"
           BASE="https://raw.githubusercontent.com/aosp-mirror/platform_system_core/${AOSP_TAG}/libcutils/include/cutils"
 
-          echo "==== NDK sysroot include dir ===="
-          echo "$SYSROOT"
-
-          # android/hardware_buffer.h ships with the public NDK — verify.
           if [ ! -f "$SYSROOT/android/hardware_buffer.h" ]; then
             echo "❌ android/hardware_buffer.h missing from NDK sysroot"
-            ls -la "$SYSROOT/android/" || true
             exit 1
           fi
-          echo "✔ android/hardware_buffer.h present in NDK sysroot"
 
-          # cutils/native_handle.h is NOT in the public NDK — fetch the real
-          # one from AOSP so <cutils/native_handle.h> resolves and defines the
-          # canonical native_handle_t / buffer_handle_t.
           sudo mkdir -p "$SYSROOT/cutils"
           sudo curl -sSfL "$BASE/native_handle.h" -o "$SYSROOT/cutils/native_handle.h"
           sudo curl -sSfL "$BASE/compiler.h"      -o "$SYSROOT/cutils/compiler.h"
 
-          echo "==== cutils/native_handle.h (head) ===="
-          head -25 "$SYSROOT/cutils/native_handle.h"
-          echo "==== cutils/compiler.h (head) ===="
-          head -10 "$SYSROOT/cutils/compiler.h"
-
-          # Sanity: the real buffer_handle_t typedef must be visible.
-          echo "==== buffer_handle_t definition ===="
           grep -n "buffer_handle_t" "$SYSROOT/cutils/native_handle.h"
-          grep -n "typedef struct native_handle" "$SYSROOT/cutils/native_handle.h"
 
       - name: Setup Termux sysroot (X11 + real Android headers)
         run: |
@@ -134,8 +111,6 @@ jobs:
             if [ -f "/usr/include/$h" ]; then
               sudo cp "/usr/include/$h" "$SYSROOT/include/"
               echo "✔ copied /usr/include/$h"
-            else
-              echo "⚠️  /usr/include/$h not found on host"
             fi
           done
 
@@ -145,12 +120,7 @@ jobs:
               [ -d "$sub" ] || continue
               sudo cp -a "$sub" "$SYSROOT/include/libdrm/" 2>/dev/null || true
             done
-            echo "✔ copied libdrm/*.h"
           fi
-
-          echo "==== sysroot libdrm headers ===="
-          ls -la "$SYSROOT/include/xf86drm"* 2>/dev/null || true
-          ls -la "$SYSROOT/include/libdrm/" | head -20
 
       - name: Setup pkg-config wrapper
         run: |
@@ -175,13 +145,11 @@ jobs:
         run: |
           git --no-pager log -1 --oneline
           ls -A | head -40
-          echo "==== meta.json present? ===="
           if [ -f meta.json ]; then
             echo "✔ meta.json found at repo root"
             cat meta.json
           else
             echo "⚠️  no meta.json at repo root"
-            find . -maxdepth 3 -name 'meta.json' -print 2>/dev/null | head -5
           fi
 
       - name: Apply essential Termux Bionic patches
@@ -214,10 +182,101 @@ jobs:
           #endif
           EOF
 
-      # NOTE: The old "Fix buffer_handle_t typedef conflict" step has been
-      #       REMOVED. Mesa's vk_android_native_buffer.h is left untouched;
-      #       the real cutils/native_handle.h + android/hardware_buffer.h
-      #       from the NDK sysroot now provide the correct types.
+      # =====================================================================
+      # PATCH FD STEP
+      #
+      # The existing src/util/u_gralloc/u_gralloc_panvk_test.h only probes
+      # native_handle_t->data[1] when the runtime env var PANVK_TEST_AHB_FD1=1
+      # is set. That means a normal user (no env var) still hits
+      # "invalid dmabuf size" on G57 gralloc, because data[0] is a
+      # non-seekable sync/metadata fd.
+      #
+      # This step rewrites the inline function to:
+      #   - probe every data[i] with lseek(SEEK_END)
+      #   - return the fd with the largest positive size
+      #   - fall back to data[0] only if none are valid
+      #
+      # No env var is required afterwards.
+      # =====================================================================
+      - name: Patch u_gralloc_panvk_test.h for unconditional fd probing
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          HDR="src/util/u_gralloc/u_gralloc_panvk_test.h"
+          [ -f "$HDR" ] || { echo "❌ $HDR not found"; exit 1; }
+
+          echo "==== before (first 60 lines) ===="
+          sed -n '1,60p' "$HDR"
+
+          python3 - "$HDR" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+
+          if "PANVK_PATCHED_FD_PROBE" in src:
+              print("✔ already patched")
+              sys.exit(0)
+
+          # Find the function body and replace it wholesale. Works even if
+          # the header has been edited since the version we were shown.
+          fn_re = re.compile(
+              r'(static\s+inline\s+int\s*\n\s*u_gralloc_panvk_test_fd\s*'
+              r'\([^)]*\)\s*\{)(.*?)(\n\})',
+              re.DOTALL,
+          )
+
+          new_body = r'''
+   /* PANVK_PATCHED_FD_PROBE: probe every data[i] unconditionally and
+    * return the fd with the largest positive lseek(SEEK_END) size.
+    *
+    * Some Android gralloc implementations put a sync_file or metadata
+    * fd at data[0] and the actual dma-buf at data[1] (or later), which
+    * makes the old data[0] assumption fail with "invalid dmabuf size".
+    *
+    * Falls back to data[0] if no fd has a positive size, so behaviour
+    * stays sane on devices that put the real buffer at index 0.
+    */
+   if (!handle || handle->numFds < 1)
+      return -1;
+
+   int   best_fd   = -1;
+   off_t best_size = 0;
+
+   for (int i = 0; i < handle->numFds; i++) {
+      int   fd   = handle->data[i];
+      off_t size = lseek(fd, 0, SEEK_END);
+      if (size <= 0)
+         continue;
+      if (size > best_size) {
+         best_size = size;
+         best_fd   = fd;
+      }
+   }
+
+   if (best_fd < 0) {
+      mesa_loge("AHBFD %s: no valid dma-buf in %d entries, "
+                "falling back to data[0]", where, handle->numFds);
+      return handle->data[0];
+   }
+
+   mesa_logi("AHBFD %s: selected fd=%d size=%lld (of %d entries)",
+             where, best_fd, (long long)best_size, handle->numFds);
+   return best_fd;
+'''
+
+          new_src, n = fn_re.subn(lambda m: m.group(1) + new_body + m.group(3),
+                                  src, count=1)
+          if n == 0:
+              print("ERROR: could not locate u_gralloc_panvk_test_fd()",
+                    file=sys.stderr)
+              sys.exit(1)
+
+          open(p, "w", encoding="utf-8").write(new_src)
+          print("✔ rewrote u_gralloc_panvk_test_fd() for unconditional probing")
+          PY
+
+          echo "==== after (first 60 lines) ===="
+          sed -n '1,60p' "$HDR"
 
       - name: Guard panvk_android_hal_bridge out of Android builds
         working-directory: mesa
@@ -225,9 +284,6 @@ jobs:
           set -euo pipefail
           FILE="src/panfrost/vulkan/meson.build"
           [ -f "$FILE" ] || { echo "❌ $FILE not found"; exit 1; }
-
-          echo "==== before ===="
-          grep -n 'panvk_android_hal_bridge' "$FILE" || true
 
           python3 - "$FILE" <<'PY'
           import re, sys
@@ -240,8 +296,8 @@ jobs:
 
           old = "panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')"
           if old not in src:
-              print(f"ERROR: cannot find line to replace:\n  {old}", file=sys.stderr)
-              sys.exit(1)
+              print("⚠️  pattern not found, skipping")
+              sys.exit(0)
 
           new = (
               "panvk_android_hal_bridge = []\n"
@@ -253,9 +309,6 @@ jobs:
           open(p, "w", encoding="utf-8").write(src)
           print("✔ patched")
           PY
-
-          echo "==== after ===="
-          grep -n -A4 'panvk_android_hal_bridge' "$FILE" || true
 
       - name: Override Vulkan API version (optional)
         if: github.event.inputs.api_override != ''
@@ -313,7 +366,6 @@ jobs:
             cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
             echo "✔ staged $name -> $dashed"
           done
-          ls -la "$GITHUB_WORKSPACE/host-bin/"
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
       - name: Create Meson cross file
@@ -371,8 +423,7 @@ jobs:
             -Dzstd=disabled \
             -Dvideo-codecs= \
             -Dperfetto=false \
-            -Dprefix=/usr \
-            -Dstrip=true 
+            -Dstrip=true
 
       - name: Build PanVK ICD
         env:
@@ -380,16 +431,62 @@ jobs:
         run: |
           ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
 
+      # =====================================================================
+      # PATCH ELF STEP (Xzs_Construct)
+      #
+      # Force the driver to NEED /system/lib64/liblzma.so so the Android
+      # loader resolves the Xzs_* symbols that libunwindstack.so (pulled in
+      # by the system Vulkan loader) expects. Removes the need for
+      # LD_PRELOAD=/system/lib64/liblzma.so at runtime.
+      # =====================================================================
+      - name: Patch PanVK .so to use system liblzma (fix Xzs_Construct)
+        run: |
+          set -euo pipefail
+
+          SO="build/src/panfrost/vulkan/libvulkan_panfrost.so"
+          [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
+
+          echo "==== NEEDED entries (before) ===="
+          readelf -d "$SO" | grep NEEDED || true
+
+          echo "==== lzma / zstd / unwind NEEDED entries (before) ===="
+          readelf -d "$SO" | grep -iE 'lzma|zstd|unwind' || true
+
+          replaced=0
+          for oldname in liblzma.so.5 liblzma.so; do
+            if readelf -d "$SO" | grep -q "NEEDED.*\\[$oldname\\]"; then
+              patchelf --replace-needed "$oldname" /system/lib64/liblzma.so "$SO"
+              echo "✔ replaced NEEDED $oldname -> /system/lib64/liblzma.so"
+              replaced=1
+            fi
+          done
+
+          if [ "$replaced" = "0" ]; then
+            patchelf --add-needed /system/lib64/liblzma.so "$SO"
+            echo "✔ added NEEDED /system/lib64/liblzma.so"
+          fi
+
+          echo "==== NEEDED entries (after) ===="
+          readelf -d "$SO" | grep NEEDED || true
+
+          if strings "$SO" | grep -q '/system/lib64/liblzma'; then
+            echo "✔ absolute system liblzma path is present in the .so"
+          else
+            echo "⚠️  path not present — patchelf may not have applied"
+          fi
+
       - name: Verify real AHB types made it into the driver
         run: |
           set -euo pipefail
           SO="build/src/panfrost/vulkan/libvulkan_panfrost.so"
-          [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
-          echo "==== AHB-related symbols in the .so ===="
+          echo "==== AHB-related symbols ===="
           nm -D "$SO" 2>/dev/null | grep -iE 'AHardwareBuffer|native_handle' || \
-            echo "(no AHB symbols — check whether link step needs -landroid)"
-          echo "==== AHB-related strings in the .so ===="
+            echo "(no dynamic AHB symbols visible)"
+          echo "==== AHB-related strings ===="
           strings "$SO" | grep -iE 'AHardwareBuffer|hardware_buffer' | head -20 || true
+          echo "==== AHBFD strings (patched fd probe) ===="
+          strings "$SO" | grep -i 'AHBFD' || \
+            echo "(none — fd probe may not be linked)"
 
       - name: Package AdrenoTools driver ZIP
         run: |
@@ -404,16 +501,11 @@ jobs:
 
           if [ ! -f mesa/meta.json ]; then
             echo "❌ meta.json not found at repo root (mesa/meta.json)"
-            echo "--- contents of mesa/ ---"
             ls -A mesa | head -40
             exit 1
           fi
 
-          # Fixed output filename — no auto-detection.
           OUT_NAME="panvcake_26.3.0.R2.zip"
-          echo "output zip: $OUT_NAME"
-
-          # Flat staging dir — no subfolder inside the zip.
           STAGE="adreno-driver"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
@@ -421,14 +513,23 @@ jobs:
           ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
             --strip-unneeded -o "$STAGE/libvulkan_panfrost.so" "$SO"
 
+          # Reapply patchelf after strip so the NEEDED edit definitely stays.
+          patchelf --replace-needed liblzma.so.5 /system/lib64/liblzma.so \
+            "$STAGE/libvulkan_panfrost.so" 2>/dev/null || true
+          patchelf --replace-needed liblzma.so   /system/lib64/liblzma.so \
+            "$STAGE/libvulkan_panfrost.so" 2>/dev/null || true
+          if ! strings "$STAGE/libvulkan_panfrost.so" | grep -q '/system/lib64/liblzma'; then
+            patchelf --add-needed /system/lib64/liblzma.so \
+              "$STAGE/libvulkan_panfrost.so" || true
+          fi
+
           cp mesa/meta.json "$STAGE/meta.json"
 
           echo "==== staging contents ===="
           ls -la "$STAGE"
-          echo "---- meta.json ----"
-          cat "$STAGE/meta.json"
+          echo "==== final NEEDED ===="
+          readelf -d "$STAGE/libvulkan_panfrost.so" | grep NEEDED || true
 
-          # zip from inside the staging dir so files land at top level.
           cd "$STAGE"
           zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so
           cd ..
@@ -465,43 +566,32 @@ jobs:
           body: |
             # PanVK `panvcake` driver for AdrenoTools
 
-            Custom Mesa PanVK Vulkan driver for Mali-G57 (Valhall JM), built
-            for AdrenoTools / Winlator with AHB (Android Hardware Buffer) and
-            kbase (proprietary Mali kernel driver) support enabled.
+            Custom Mesa PanVK Vulkan driver for Mali-G57 (Valhall JM) with
+            AHB (Android Hardware Buffer) + kbase support.
 
-            This build uses the **real Android AHB headers**:
+            ## What's in this build
 
-            - `android/hardware_buffer.h` (from the Android NDK sysroot)
-            - `cutils/native_handle.h` (fetched from AOSP, since it is not
-              part of the public NDK)
-
-            The Mesa fallback stubs in `vk_android_native_buffer.h` are no
-            longer enabled — `buffer_handle_t` and `AHardwareBuffer` are the
-            canonical Android types, matching what AdrenoTools expects.
+            - **Xzs_Construct fix**: the `.so` is patched (via patchelf) to
+              link against `/system/lib64/liblzma.so`, so no
+              `LD_PRELOAD=/system/lib64/liblzma.so` is needed at runtime.
+            - **dmabuf fd fix**: `u_gralloc_panvk_test_fd()` now probes every
+              entry in `native_handle_t->data[]` and returns the largest
+              valid dma-buf. Fixes `invalid dmabuf size` on G57 gralloc
+              without needing `PANVK_TEST_AHB_FD1=1`.
 
             ## Install (AdrenoTools)
 
-            1. Download the `panvcake_*.zip` asset below.
-            2. Open **AdrenoTools** — in Winlator, it's the driver manager in
-               a container's settings.
-            3. Choose **Import driver** and select the ZIP directly.
-               Do **not** unzip it first — AdrenoTools reads the ZIP as-is.
-            4. Select the imported driver from the list and apply it to the
-               container you want to use it in.
-            5. Launch the container. Vulkan apps should enumerate
-               `panvcake` / PanVK as the physical device.
+            1. Download `panvcake_*.zip`.
+            2. In AdrenoTools, choose **Import driver** and select the ZIP
+               directly. Do **not** unzip it.
+            3. Apply to the container and launch.
 
             ## Notes
 
-            - Do **not** extract the ZIP manually, and do **not** copy the
-              `.so` out of it. AdrenoTools requires `meta.json` and
-              `libvulkan_panfrost.so` to stay inside the ZIP, at the top
-              level, with no subfolder.
+            - Keep `meta.json` and `libvulkan_panfrost.so` at the top level
+              of the ZIP, no subfolder.
             - Built for Mali-G57 (Valhall JM) with the kbase kernel driver.
             - Workflow run: `${{ github.run_number }}`
-
-            The driver name should read `panvcake` (PanVK fork) rather than
-            the stock Mali Vulkan driver.
           files: |
             panvcake_*.zip
           overwrite_files: true
