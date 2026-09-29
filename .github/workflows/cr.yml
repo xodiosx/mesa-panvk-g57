@@ -89,9 +89,6 @@ jobs:
           echo "==== after ===="
           sed -n '18,32p' "$F"
 
-      # Rewrite only the two filenames used by the with_platform_android
-      # branch of the ICD symbol selection. The if/else/endif structure is
-      # left intact so both branches point at the desktop symbol files.
       - name: Force desktop vulkan.sym symbol scheme
         working-directory: mesa
         run: |
@@ -107,7 +104,6 @@ jobs:
             exit 0
           fi
 
-          # Straight string replacements. No structural edits.
           sed -i \
             -e 's/vulkan-icd-android-symbols\.txt/vulkan-icd-symbols.txt/g' \
             -e 's/vulkan-android\.sym/vulkan.sym/g' \
@@ -116,8 +112,6 @@ jobs:
           echo "==== after ===="
           sed -n '1,40p' "$F"
 
-          # Sanity: the file must still parse. Check that no orphaned
-          # else/endif can exist by counting ifs and endifs.
           ifs=$(grep -cE '^[[:space:]]*(if|elif)\b' "$F")
           endifs=$(grep -cE '^[[:space:]]*endif\b'   "$F")
           echo "if/elif count: $ifs   endif count: $endifs"
@@ -494,13 +488,34 @@ jobs:
             -Dallow-fallback-for=libdrm \
             -Dlibdrm:default_library=static
 
-      - name: Build PanVK ICD
+      - name: Build PanVK Vulkan driver (.so)
         working-directory: mesa
         env:
           PATH: ${{ github.workspace }}/host-bin:/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
         run: |
-          ninja -C build-android src/panfrost/vulkan/libvulkan_panfrost.so
+          set -euo pipefail
+
+          echo "==== available panfrost-related ninja targets ===="
+          ninja -C build-android -t targets all 2>/dev/null \
+            | grep -iE 'panfrost|vulkan_panfrost' | head -40 || true
+
+          echo
+          echo "==== building target: vulkan_panfrost ===="
+          ninja -C build-android vulkan_panfrost
+
+          echo
+          echo "==== locating produced .so ===="
+          SO=$(find build-android -type f -name 'libvulkan_panfrost.so' -print -quit)
+          if [ -z "$SO" ]; then
+            echo "❌ libvulkan_panfrost.so not found after build"
+            echo "---- all .so files under build-android ----"
+            find build-android -type f -name '*.so' | head -40 || true
+            exit 1
+          fi
+          echo "✔ built: $SO"
+          ls -la "$SO"
+          echo "PANVK_SO=$PWD/$SO" >> "$GITHUB_ENV"
 
       # =====================================================================
       # VERIFY
@@ -508,7 +523,7 @@ jobs:
       - name: Verify driver links ONLY system libraries
         run: |
           set -euo pipefail
-          SO="mesa/build-android/src/panfrost/vulkan/libvulkan_panfrost.so"
+          SO="$PANVK_SO"
           [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
 
           echo "==== DT_NEEDED ===="
@@ -552,7 +567,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          SO="mesa/build-android/src/panfrost/vulkan/libvulkan_panfrost.so"
+          SO="$PANVK_SO"
           [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
 
           if [ ! -f mesa/meta.json ]; then
@@ -613,10 +628,6 @@ jobs:
             `/system/lib64/*`.
 
             ## Why this build is different
-
-            Previous builds linked against Termux's `libdrm.so`, which in
-            turn linked Termux's `liblzma.so`, breaking `dlopen` at runtime
-            (`Xzs_Construct`). This build eliminates the root cause:
 
             - `pkg-config` is isolated (empty libdir)
             - `libdrm` is built statically from Mesa's fallback subproject
