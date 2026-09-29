@@ -71,16 +71,28 @@ jobs:
           git --no-pager log -1 --oneline
           ls -A | head -40
 
+      # =====================================================================
+      # SOURCE PATCHES
+      # =====================================================================
+
+      - name: Dump panfrost/vulkan meson.build for reference
+        working-directory: mesa
+        run: |
+          F="src/panfrost/vulkan/meson.build"
+          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
+          echo "=========================================================="
+          echo "== FULL: $F"
+          echo "=========================================================="
+          cat -n "$F"
+
       - name: Revert vk_android_native_buffer.h to upstream guard
         working-directory: mesa
         run: |
           set -euo pipefail
           F="include/vulkan/vk_android_native_buffer.h"
           [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
-
           echo "==== before (lines 15-35) ===="
           awk 'NR>=15 && NR<=35 {printf "%4d| %s\n", NR, $0}' "$F"
-
           python3 - "$F" <<'PY'
           import sys
           p = sys.argv[1]
@@ -108,7 +120,6 @@ jobs:
           else:
               print("✔ already clean — nothing to revert")
           PY
-
           echo "==== after (lines 15-35) ===="
           awk 'NR>=15 && NR<=35 {printf "%4d| %s\n", NR, $0}' "$F"
           if grep -nE '#if[^#]*#if' "$F"; then
@@ -138,7 +149,7 @@ jobs:
           endifs=$(grep -cE '^[[:space:]]*endif\b'   "$F")
           echo "if/elif count: $ifs   endif count: $endifs"
           if [ "$ifs" -ne "$endifs" ]; then
-            echo "❌ if/endif mismatch in $F — refusing to continue"
+            echo "❌ if/endif mismatch in $F"
             exit 1
           fi
           echo "✔ if/endif balanced"
@@ -261,15 +272,7 @@ jobs:
           #include <unistd.h>
           #include "util/log.h"
 
-          /* PANVK_PATCHED_FD_PROBE
-           *
-           * Probe every native_handle_t->data[i] with lseek(SEEK_END) and
-           * return the fd with the largest positive size.
-           *
-           * Some Android gralloc implementations put a sync_file or metadata
-           * fd at data[0] and the actual dma-buf at data[1] or later.
-           * Falls back to data[0] if nothing probes valid.
-           */
+          /* PANVK_PATCHED_FD_PROBE */
           static inline int
           u_gralloc_panvk_test_fd(const native_handle_t *handle, const char *where)
           {
@@ -291,13 +294,13 @@ jobs:
              }
 
              if (best_fd < 0) {
-                mesa_loge("AHBFD %s: no valid dma-buf in %d entries, "
-                          "falling back to data[0]", where, handle->numFds);
+                mesa_loge("AHBFD %s: no valid dma-buf in %d entries",
+                          where, handle->numFds);
                 return handle->data[0];
              }
 
-             mesa_logi("AHBFD %s: selected fd=%d size=%lld (of %d entries)",
-                       where, best_fd, (long long)best_size, handle->numFds);
+             mesa_logi("AHBFD %s: selected fd=%d size=%lld",
+                       where, best_fd, (long long)best_size);
              return best_fd;
           }
 
@@ -320,7 +323,7 @@ jobs:
           FILE="src/panfrost/vulkan/meson.build"
           [ -f "$FILE" ] || { echo "⚠️  $FILE not found — skipping"; exit 0; }
           python3 - "$FILE" <<'PY'
-          import re, sys
+          import sys
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
           if "if not with_platform_android" in src and "panvk_android_hal_bridge" in src:
@@ -339,6 +342,82 @@ jobs:
           print("✔ patched")
           PY
 
+      # =====================================================================
+      # ENSURE shared_library('vulkan_panfrost') EXISTS
+      #
+      # The winlator-pan branch ships static libraries only; the ICD JSONs
+      # are generated but nothing produces libvulkan_panfrost.so. This step
+      # appends a shared_library block if one is missing, using variable
+      # names auto-detected from the file.
+      # =====================================================================
+      - name: Ensure shared_library('vulkan_panfrost') exists in meson.build
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          F="src/panfrost/vulkan/meson.build"
+          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
+
+          python3 - "$F" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+
+          # Already has one?
+          if re.search(r"shared_library\s*\(\s*['\"]vulkan_panfrost['\"]", src):
+              print("✔ shared_library('vulkan_panfrost') already present — skipping")
+              sys.exit(0)
+
+          # Collect every assignment: name = kind
+          assigns = {}
+          for m in re.finditer(r'^([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)', src, re.M):
+              assigns[m.group(1)] = m.group(2)
+
+          def pick(needles, fallback):
+              for name, kind in assigns.items():
+                  low = name.lower()
+                  if all(n in low for n in needles):
+                      return name
+              return fallback
+
+          entrypoints = pick(['entrypoint'], 'panvk_entrypoints')
+          drirc       = pick(['drirc'],      'panvk_drirc')
+          tracepoints = pick(['tracepoint'], 'panvk_tracepoints')
+          per_arch    = pick(['per_arch'],   'libpanvk_per_arch')
+
+          print("auto-detected:")
+          print(f"  entrypoints = {entrypoints}")
+          print(f"  drirc       = {drirc}")
+          print(f"  tracepoints = {tracepoints}")
+          print(f"  per_arch    = {per_arch}")
+
+          block = f"""
+
+# =====================================================================
+# PATCH: re-add shared_library target (fork ships static-only)
+# =====================================================================
+libvulkan_panfrost = shared_library(
+  'vulkan_panfrost',
+  [{entrypoints}, {drirc}, {tracepoints}],
+  include_directories : [
+    inc_include, inc_src, inc_util,
+    inc_panfrost, inc_panfrost_vulkan,
+    inc_vulkan_util, inc_vulkan_wsi,
+  ],
+  link_args : vulkan_icd_link_args,
+  link_with : [{per_arch}],
+  dependencies : [dep_libdrm],
+  gnu_symbol_visibility : 'hidden',
+  install : true,
+)
+"""
+          with open(p, 'a', encoding='utf-8') as f:
+              f.write(block)
+          print("✔ appended shared_library block")
+          PY
+
+          echo "==== tail of $F ===="
+          tail -n 30 "$F"
+
       - name: Override Vulkan API version (optional)
         if: github.event.inputs.api_override != ''
         working-directory: mesa
@@ -348,6 +427,9 @@ jobs:
           [ -f "$DEVFILE" ] || { echo "❌ $DEVFILE not found"; exit 1; }
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
 
+      # =====================================================================
+      # HOST SPIRV-TOOLS
+      # =====================================================================
       - name: Build SPIRV-Tools (host) for mesa_clc / vtn_bindgen2
         run: |
           set -euo pipefail
@@ -373,7 +455,6 @@ jobs:
           cmake --install "$WORK/build"
 
           echo "HOST_DEPS=$HOST_DEPS" >> "$GITHUB_ENV"
-          ls -la "$HOST_DEPS/lib/pkgconfig/"
 
       - name: Configure host tools
         working-directory: mesa
@@ -427,6 +508,9 @@ jobs:
           done
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
+      # =====================================================================
+      # CROSS CONFIGURE + BUILD
+      # =====================================================================
       - name: Create Meson cross file
         run: |
           set -euo pipefail
@@ -501,9 +585,6 @@ jobs:
             -Dallow-fallback-for=libdrm \
             -Dlibdrm:default_library=static
 
-      # =====================================================================
-      # BUILD + LOCATE (heavily instrumented)
-      # =====================================================================
       - name: Build PanVK Vulkan driver (.so)
         working-directory: mesa
         env:
@@ -512,76 +593,37 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "=========================================================="
-          echo "== Meson's authoritative target list (intro-targets)  =="
-          echo "=========================================================="
+          echo "==== Meson targets containing vulkan/panfrost/panvk ===="
           if [ -f build-android/meson-info/intro-targets.json ]; then
             python3 - <<'PY'
           import json
           with open('build-android/meson-info/intro-targets.json') as f:
               targets = json.load(f)
-          print(f"total meson targets: {len(targets)}")
           for t in targets:
               n = t.get('name', '') or ''
-              if 'vulkan' in n.lower() or 'panfrost' in n.lower() or 'panvk' in n.lower():
+              if any(k in n.lower() for k in ('vulkan', 'panfrost', 'panvk')):
                   print(f"  {n:55s} type={t.get('type','?'):22s} file={t.get('filename','')}")
           PY
-          else
-            echo "(no build-android/meson-info/intro-targets.json)"
           fi
 
           echo
-          echo "=========================================================="
-          echo "== ninja targets matching vulkan/panfrost/panvk      =="
-          echo "=========================================================="
-          ninja -C build-android -t targets all 2>&1 \
-            | grep -iE 'vulkan|panfrost|panvk' | sort -u || true
-
-          echo
-          echo "=========================================================="
-          echo "== building the whole tree                            =="
-          echo "=========================================================="
+          echo "==== building whole tree ===="
           ninja -C build-android
 
           echo
-          echo "=========================================================="
-          echo "== contents of build-android/src/panfrost/vulkan/     =="
-          echo "=========================================================="
-          if [ -d build-android/src/panfrost/vulkan ]; then
-            find build-android/src/panfrost/vulkan -maxdepth 1 \
-              \( -type f -o -type l \) \
-              -printf '%y  %p  ->  %l\n' | sort
-          else
-            echo "(directory not present)"
-          fi
-
-          echo
-          echo "=========================================================="
-          echo "== every .so / .so.* anywhere in build-android        =="
-          echo "=========================================================="
-          find build-android \( -name '*.so' -o -name '*.so.*' \) \
-            \( -type f -o -type l \) -printf '%y  %p  ->  %l\n' | sort || true
-
-          echo
-          echo "=========================================================="
-          echo "== locating the driver .so                            =="
-          echo "=========================================================="
-          SO=$(find build-android \
-                 \( -name 'libvulkan_panfrost.so' -o -name 'libvulkan_panfrost.so.*' \
-                    -o -name 'libvulkan_panvk.so'   -o -name 'libvulkan_panvk.so.*' \
-                    -o -name 'libpanvk.so'          -o -name 'libpanvk.so.*' \) \
-                 \( -type f -o -type l \) -print 2>/dev/null | head -n1)
+          echo "==== locating .so ===="
+          SO=$(find build-android -type f -o -type l \
+                 | grep -E 'libvulkan_panfrost\.so(\.|$)' | head -n1 || true)
           if [ -z "$SO" ]; then
-            echo "❌ no driver .so found anywhere under build-android"
-            echo "---- everything under build-android/src/panfrost ----"
-            find build-android/src/panfrost -maxdepth 3 \( -type f -o -type l \) \
-              -printf '%y  %p\n' 2>/dev/null | sort | head -80 || true
+            echo "❌ libvulkan_panfrost.so not found"
+            echo "---- all .so under build-android ----"
+            find build-android \( -type f -o -type l \) -name '*.so*' -print
             exit 1
           fi
-          echo "✔ found: $SO"
-          ls -la "$SO"
           REAL=$(readlink -f "$SO")
-          echo "resolved to: $REAL"
+          echo "✔ found: $SO"
+          echo "resolved: $REAL"
+          ls -la "$REAL"
           echo "PANVK_SO=$REAL" >> "$GITHUB_ENV"
 
       # =====================================================================
@@ -597,7 +639,7 @@ jobs:
           readelf -d "$SO" | grep NEEDED || true
 
           echo
-          echo "==== checking for forbidden Termux / host libs ===="
+          echo "==== forbidden Termux/host libs ===="
           bad=0
           for bad_name in liblzma libzstd libunwind libc++_shared libdrm.so.2; do
             if strings "$SO" | grep -q "$bad_name"; then
@@ -605,12 +647,10 @@ jobs:
               bad=1
             fi
           done
-          if [ "$bad" = "0" ]; then
-            echo "✔ no Termux/host library references found"
-          fi
+          [ "$bad" = "0" ] && echo "✔ no Termux/host library references found"
 
           echo
-          echo "==== confirming no host libdrm in output ===="
+          echo "==== host libdrm check ===="
           if readelf -d "$SO" | grep NEEDED | grep -qi drm; then
             echo "❌ host libdrm leaked in"
           else
@@ -623,9 +663,8 @@ jobs:
             echo "❌ vk_icdGetInstanceProcAddr NOT exported"
 
           echo
-          echo "==== AHBFD strings (fd probe compiled in)? ===="
-          strings "$SO" | grep -i 'AHBFD' || \
-            echo "⚠️  no AHBFD strings found"
+          echo "==== AHBFD strings ===="
+          strings "$SO" | grep -i 'AHBFD' || echo "⚠️  no AHBFD strings found"
 
       # =====================================================================
       # PACKAGE
@@ -638,7 +677,7 @@ jobs:
           [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
 
           if [ ! -f mesa/meta.json ]; then
-            echo "❌ meta.json not found at repo root (mesa/meta.json)"
+            echo "❌ meta.json not found at mesa/meta.json"
             ls -A mesa | head -40
             exit 1
           fi
@@ -659,7 +698,6 @@ jobs:
           cd "$STAGE"
           zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so
           cd ..
-
           unzip -l "${OUT_NAME}"
 
       - name: Upload build logs
@@ -690,37 +728,30 @@ jobs:
             # PanVK `panvcake` driver for AdrenoTools (pure NDK build)
 
             Custom Mesa PanVK Vulkan driver for Mali-G57 (Valhall JM),
-            cross-compiled with the Android NDK r28c. **No Termux, no host
-            libraries** — the resulting `.so` only references
-            `/system/lib64/*`.
+            cross-compiled with the Android NDK r28c.
 
-            ## Why this build is different
+            ## What's in this build
 
-            - `pkg-config` is isolated (empty libdir)
-            - `libdrm` is built statically from Mesa's fallback subproject
-            - `zlib` / `zstd` / `shader-cache` / `libunwind` are disabled
-            - `-static-libstdc++` removes the `libc++_shared` dependency
-
-            ## What's included
-
-            - Desktop `vulkan.sym` so `vk_icdGetInstanceProcAddr` is
-              exported (AdrenoTools needs it)
+            - Pure NDK build, no Termux, no host libraries
+            - Static libdrm via fallback subproject
+            - `-static-libstdc++`
+            - Desktop `vulkan.sym` for `vk_icdGetInstanceProcAddr`
             - Honest `hw_get_module()` stub
             - fd probing for gralloc handles
+            - **CI re-adds `shared_library('vulkan_panfrost')`** because the
+              winlator-pan branch ships static libraries only
 
             ## Install (AdrenoTools)
 
             1. Download `panvcake_*.zip`.
-            2. In AdrenoTools, choose **Import driver** and select the ZIP
-               directly. Do **not** unzip it.
-            3. Apply to the container and launch.
+            2. In AdrenoTools: Import driver → select the ZIP as-is.
+            3. Apply and launch.
 
             ## Notes
 
-            - Built for Mali-G57 (Valhall JM) with the kbase kernel driver.
             - API level: ${{ env.ANDROID_API }}
             - Source branch: `${{ github.event.inputs.mesa_branch }}`
-            - Workflow run: `${{ github.run_number }}`
+            - Workflow run: ${{ github.run_number }}
           files: |
             panvcake_*.zip
           overwrite_files: true
