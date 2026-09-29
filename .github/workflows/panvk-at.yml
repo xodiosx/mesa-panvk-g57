@@ -371,7 +371,8 @@ jobs:
             -Dzstd=disabled \
             -Dvideo-codecs= \
             -Dperfetto=false \
-            -Dstrip=true
+            -Dprefix=/usr \
+            -Dstrip=true 
 
       - name: Build PanVK ICD
         env:
