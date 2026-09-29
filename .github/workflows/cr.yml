@@ -198,6 +198,39 @@ jobs:
           HDR_EOF
           echo "✔ rewrote $HDR"
 
+      # Guard panvk_android_hal_bridge out of Android builds. Under
+      # -Dplatforms=android, both panvk_android_hal_bridge.c and
+      # vk_android.c (in libvulkan_lite_runtime.a) define `HMI`, which makes
+      # the final link fail with "duplicate symbol: HMI".
+      - name: Guard panvk_android_hal_bridge out of Android builds
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          FILE="src/panfrost/vulkan/meson.build"
+          [ -f "$FILE" ] || { echo "⚠️  $FILE not found"; exit 0; }
+          python3 - "$FILE" <<'PY'
+          import sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          if "if not with_platform_android" in src and "panvk_android_hal_bridge" in src:
+              print("✔ already guarded"); sys.exit(0)
+          old = "panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')"
+          if old not in src:
+              print("⚠️  pattern not found, skipping"); sys.exit(0)
+          src = src.replace(
+              old,
+              "panvk_android_hal_bridge = []\n"
+              "if not with_platform_android\n"
+              "  panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')\n"
+              "endif",
+              1,
+          )
+          open(p, "w", encoding="utf-8").write(src)
+          print("✔ guarded panvk_android_hal_bridge")
+          PY
+          echo "==== after ===="
+          grep -n -A4 'panvk_android_hal_bridge' "$FILE" | head -20
+
       # =====================================================================
       # BUILD — literally the reference build.sh, inline
       # =====================================================================
@@ -323,7 +356,7 @@ jobs:
           echo "=== DT_NEEDED ==="
           readelf -d "$GITHUB_WORKSPACE/out-winlatormali/libvulkan_panfrost.so" | grep NEEDED || true
           echo "=== vk_icdGetInstanceProcAddr ==="
-          nm -D "$GITHUB_WORKSPACE/out-winlatormali/libvulkan_panfrost.so 2>/dev/null | grep -i 'vk_icdGetInstanceProcAddr' || echo "(missing)"
+          nm -D "$GITHUB_WORKSPACE/out-winlatormali/libvulkan_panfrost.so" 2>/dev/null | grep -i 'vk_icdGetInstanceProcAddr' || echo "(missing)"
           echo "=== AHBFD strings ==="
           strings "$GITHUB_WORKSPACE/out-winlatormali/libvulkan_panfrost.so" | grep -i AHBFD || echo "(none)"
           ls -la "$GITHUB_WORKSPACE/out-winlatormali/"
@@ -334,7 +367,11 @@ jobs:
           STAGE=adreno-driver
           rm -rf "$STAGE"; mkdir -p "$STAGE"
           cp out-winlatormali/libvulkan_panfrost.so "$STAGE/"
-          [ -f mesa/meta.json ] && cp mesa/meta.json "$STAGE/" || echo "{}" > "$STAGE/meta.json"
+          if [ -f mesa/meta.json ]; then
+            cp mesa/meta.json "$STAGE/"
+          else
+            echo "{}" > "$STAGE/meta.json"
+          fi
           ( cd "$STAGE" && zip -9 ../panvcake.zip meta.json libvulkan_panfrost.so )
           unzip -l panvcake.zip
 
