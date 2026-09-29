@@ -74,14 +74,6 @@ jobs:
 
       # =====================================================================
       # HOST-TOOLS CACHE
-      #
-      # The host tools (mesa_clc, vtn_bindgen2, panfrost_compile) and their
-      # SPIRV-Tools dependency take ~3-5 minutes to build. We tar them up,
-      # commit to ci-cache/host-tools-<KEY>.tar.gz in the repo, and reuse
-      # them next run when the cache key matches.
-      #
-      # Cache key = v1-<mesa-sha-12>-llvm<llvm-version>
-      # Bump the leading v1 if the recipe changes.
       # =====================================================================
       - name: Compute host-tools cache key
         id: cachekey
@@ -105,9 +97,7 @@ jobs:
           if [ -f "$FILE" ]; then
             echo "✔ cache hit — extracting"
             tar -xzf "$FILE" -C "$GITHUB_WORKSPACE"
-            echo "==== restored host-bin ===="
             ls -la "$GITHUB_WORKSPACE/host-bin" || true
-            echo "==== restored spirv-host/prefix ===="
             ls -la "$GITHUB_WORKSPACE/spirv-host/prefix" || true
             chmod +x "$GITHUB_WORKSPACE/host-bin/"* 2>/dev/null || true
             echo "hit=true" >> "$GITHUB_OUTPUT"
@@ -210,7 +200,6 @@ jobs:
           git config user.email "github-actions@users.noreply.github.com"
           git config user.name  "github-actions"
 
-          # Prune old caches, keep this one + 2 most recent.
           find ci-cache -maxdepth 1 -type f -name 'host-tools-*.tar.gz' -printf '%T@ %p\n' \
             | sort -rn \
             | tail -n +4 \
@@ -228,7 +217,7 @@ jobs:
             if git push origin "HEAD:${BRANCH}" 2>&1; then
               echo "✔ cache pushed to ${BRANCH}"
             else
-              echo "⚠️  push failed (non-fatal) — cache saved locally only"
+              echo "⚠️  push failed (non-fatal)"
             fi
           fi
 
@@ -468,6 +457,24 @@ jobs:
           EOF
           cat "$GITHUB_WORKSPACE/android-aarch64.ini"
 
+      # Introspection helper — written to a file to avoid quote hell.
+      - name: Write meson-introspect helper
+        run: |
+          cat > "$GITHUB_WORKSPACE/inspect_targets.py" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as f:
+              targets = json.load(f)
+          print(f"total targets: {len(targets)}")
+          for t in targets:
+              n = t.get("name", "") or ""
+              if any(k in n.lower() for k in ("vulkan", "panvk", "panfrost")):
+                  print("  name={!r} type={} filename={}".format(
+                      n, t.get("type", "?"), t.get("filename", "")))
+              if "vulkan_panfrost" in n.lower():
+                  print("FOUND_TARGET")
+          PY
+          cat "$GITHUB_WORKSPACE/inspect_targets.py"
+
       - name: Configure PanVK (Android)
         working-directory: mesa
         run: |
@@ -492,14 +499,8 @@ jobs:
             -Dlibdrm:default_library=static
 
           echo "==== meson introspect: vulkan/panvk targets ===="
-          meson introspect build-android --targets | python3 -c '
-          import json, sys
-          targets = json.load(sys.stdin)
-          for t in targets:
-              n = t.get("name","") or ""
-              if "vulkan" in n.lower() or "panvk" in n.lower():
-                  print(f"  name={n!r} type={t.get(\"type\",\"?\")} filename={t.get(\"filename\",\"\")}")
-          '
+          meson introspect build-android --targets > /tmp/targets.json
+          python3 "$GITHUB_WORKSPACE/inspect_targets.py" /tmp/targets.json
 
       - name: Build PanVK driver via meson compile
         working-directory: mesa
@@ -523,7 +524,6 @@ jobs:
           SO=$(find build-android -name 'libvulkan_panfrost.so*' -print 2>/dev/null | head -n1 || true)
           if [ -z "$SO" ]; then
             echo "❌ libvulkan_panfrost.so not found"
-            echo "---- all .so under build-android ----"
             find build-android -name '*.so*' -print | sort
             exit 1
           fi
