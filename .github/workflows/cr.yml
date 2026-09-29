@@ -1,4 +1,4 @@
-Name: Build PanV for Android (pure NDK cross-compile)
+name: Build PanV for Android (pure NDK cross-compile)
 
 on:
   workflow_dispatch:
