@@ -3,7 +3,7 @@ name: PanVK G57 - WinlatorMali Android candidate
 on:
   workflow_dispatch:
   push:
-    branches: [winlatormali-ci]
+    branches: [winlator-pan]
 
 permissions:
   contents: read
