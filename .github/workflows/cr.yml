@@ -89,37 +89,43 @@ jobs:
           echo "==== after ===="
           sed -n '18,32p' "$F"
 
+      # Rewrite only the two filenames used by the with_platform_android
+      # branch of the ICD symbol selection. The if/else/endif structure is
+      # left intact so both branches point at the desktop symbol files.
       - name: Force desktop vulkan.sym symbol scheme
         working-directory: mesa
         run: |
           set -euo pipefail
           F="src/vulkan/meson.build"
-          [ -f "$F" ] || { echo "⚠️  $F not found — skipping"; exit 0; }
-          if grep -q "PATCH: force desktop vulkan.sym" "$F"; then
-            echo "✔ already patched"; exit 0
+          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
+
+          echo "==== before ===="
+          sed -n '1,40p' "$F"
+
+          if ! grep -q "vulkan-android.sym" "$F"; then
+            echo "✔ already using desktop vulkan.sym — skipping"
+            exit 0
           fi
-          python3 - "$F" <<'PY'
-          import re, sys
-          p = sys.argv[1]
-          src = open(p, encoding="utf-8").read()
-          pat = re.compile(r'if\s+with_platform_android\s*\n.*?endif\s*\n', re.DOTALL)
-          new = (
-              "# PATCH: force desktop vulkan.sym — AdrenoTools needs\n"
-              "# vk_icdGetInstanceProcAddr, not just the Android HMI symbol.\n"
-              "vulkan_icd_symbols = files('vulkan-icd-symbols.txt')\n"
-              "if with_ld_version_script\n"
-              "  vulkan_icd_link_args += ['-Wl,--version-script', "
-              "join_paths(meson.current_source_dir(), 'vulkan.sym')]\n"
-              "  vulkan_icd_link_depends += files('vulkan.sym')\n"
-              "endif\n"
-          )
-          new_src, n = pat.subn(new, src, count=1)
-          if n == 0:
-              print("⚠️  pattern not found — fork may already be patched")
-              sys.exit(0)
-          open(p, "w", encoding="utf-8").write(new_src)
-          print("✔ replaced Android HAL symbol block")
-          PY
+
+          # Straight string replacements. No structural edits.
+          sed -i \
+            -e 's/vulkan-icd-android-symbols\.txt/vulkan-icd-symbols.txt/g' \
+            -e 's/vulkan-android\.sym/vulkan.sym/g' \
+            "$F"
+
+          echo "==== after ===="
+          sed -n '1,40p' "$F"
+
+          # Sanity: the file must still parse. Check that no orphaned
+          # else/endif can exist by counting ifs and endifs.
+          ifs=$(grep -cE '^[[:space:]]*(if|elif)\b' "$F")
+          endifs=$(grep -cE '^[[:space:]]*endif\b'   "$F")
+          echo "if/elif count: $ifs   endif count: $endifs"
+          if [ "$ifs" -ne "$endifs" ]; then
+            echo "❌ if/endif mismatch in $F — refusing to continue"
+            exit 1
+          fi
+          echo "✔ if/endif balanced"
 
       - name: Make android_stub hw_get_module() return failure
         working-directory: mesa
@@ -328,13 +334,6 @@ jobs:
 
       # =====================================================================
       # BUILD SPIRV-TOOLS FOR THE HOST
-      #
-      # Ubuntu's packaged SPIRV-Tools predates Mesa's >= 2024.1 requirement,
-      # so the host tools (mesa_clc, vtn_bindgen2, panfrost_compile) need a
-      # fresh build. This installs into $GITHUB_WORKSPACE/spirv-host/prefix,
-      # which is later exposed via PKG_CONFIG_PATH and LD_LIBRARY_PATH to the
-      # host-tool configure/build steps only. Nothing here leaks into the
-      # Android .so.
       # =====================================================================
       - name: Build SPIRV-Tools (host) for mesa_clc / vtn_bindgen2
         run: |
@@ -361,18 +360,10 @@ jobs:
           cmake --install "$WORK/build"
 
           echo "HOST_DEPS=$HOST_DEPS" >> "$GITHUB_ENV"
-          echo "==== installed pkg-config files ===="
           ls -la "$HOST_DEPS/lib/pkgconfig/"
-          echo "==== SPIRV-Tools.pc ===="
-          cat "$HOST_DEPS/lib/pkgconfig/SPIRV-Tools.pc" || true
 
       # =====================================================================
       # HOST TOOLS (NATIVE)
-      #
-      # These binaries run on the GitHub runner and generate C code at
-      # Android build time. PKG_CONFIG_PATH and LD_LIBRARY_PATH point only
-      # at the freshly built SPIRV-Tools prefix + llvm-19's own pkgconfig,
-      # so no host libdrm/liblzma can slip in on this configuration.
       # =====================================================================
       - name: Configure host tools
         working-directory: mesa
@@ -428,11 +419,6 @@ jobs:
 
       # =====================================================================
       # CROSS BUILD (PURE NDK)
-      #
-      # No host libraries, no Termux. Empty pkg-config dir forces Mesa to
-      # use the libdrm fallback subproject (static). zlib/zstd disabled,
-      # shader-cache disabled, libunwind disabled. -static-libstdc++ removes
-      # the libc++_shared NEEDED entry.
       # =====================================================================
       - name: Create Meson cross file
         run: |
@@ -464,7 +450,6 @@ jobs:
           cpp_link_args = ['-static-libstdc++']
           pkg_config_path = []
           EOF
-          echo "==== cross file ===="
           cat "$GITHUB_WORKSPACE/android-aarch64.ini"
 
       - name: Configure PanVK (Android, static libdrm, no host libs)
@@ -586,16 +571,13 @@ jobs:
 
           cp mesa/meta.json "$STAGE/meta.json"
 
-          echo "==== staging contents ===="
           ls -la "$STAGE"
-          echo "==== final DT_NEEDED ===="
           readelf -d "$STAGE/libvulkan_panfrost.so" | grep NEEDED || true
 
           cd "$STAGE"
           zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so
           cd ..
 
-          echo "==== zip contents ===="
           unzip -l "${OUT_NAME}"
 
       - name: Upload build logs
@@ -633,30 +615,20 @@ jobs:
             ## Why this build is different
 
             Previous builds linked against Termux's `libdrm.so`, which in
-            turn linked Termux's `liblzma.so`. Termux's `liblzma` lacks the
-            `Xzs_*` symbols that Android's `libunwindstack.so` expects,
-            causing `dlopen` failures that required
-            `LD_PRELOAD=/system/lib64/liblzma.so`. This build eliminates
-            the root cause:
+            turn linked Termux's `liblzma.so`, breaking `dlopen` at runtime
+            (`Xzs_Construct`). This build eliminates the root cause:
 
-            - `pkg-config` is isolated (empty libdir), so Mesa cannot find
-              any host `liblzma` / `libzstd` / `libdrm` to link against
+            - `pkg-config` is isolated (empty libdir)
             - `libdrm` is built statically from Mesa's fallback subproject
-              and embedded into the driver
-            - `zlib` / `zstd` / `shader-cache` / `libunwind` are all
-              disabled
+            - `zlib` / `zstd` / `shader-cache` / `libunwind` are disabled
             - `-static-libstdc++` removes the `libc++_shared` dependency
-
-            Result: no `liblzma` reference in the ELF at all, so no symbol
-            clash.
 
             ## What's included
 
-            - Force desktop `vulkan.sym` so `vk_icdGetInstanceProcAddr` is
+            - Desktop `vulkan.sym` so `vk_icdGetInstanceProcAddr` is
               exported (AdrenoTools needs it)
-            - Honest `hw_get_module()` stub (returns -1, not fake success)
-            - fd probing for gralloc handles (`data[0]` isn't always the
-              dma-buf)
+            - Honest `hw_get_module()` stub
+            - fd probing for gralloc handles
 
             ## Install (AdrenoTools)
 
