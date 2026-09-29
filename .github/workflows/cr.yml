@@ -1,4 +1,4 @@
-Name: Build PanVK G57 for Android (pure NDK cross-compile)
+name: Build PanVK G57 for Android (pure NDK cross-compile)
 
 on:
   workflow_dispatch:
