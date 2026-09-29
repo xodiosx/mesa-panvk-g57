@@ -41,6 +41,7 @@ jobs:
             ninja-build cmake pkgconf bison flex ripgrep \
             clang-19 llvm-19-dev libclang-19-dev libclang-cpp19-dev \
             libclc-19 libclc-19-dev libllvmspirvlib-19-dev \
+            libdrm-dev zlib1g-dev \
             patchelf curl ca-certificates zip wget
           python3 -m venv .ci-python
           .ci-python/bin/pip install \
@@ -371,7 +372,7 @@ jobs:
       # These binaries run on the GitHub runner and generate C code at
       # Android build time. PKG_CONFIG_PATH and LD_LIBRARY_PATH point only
       # at the freshly built SPIRV-Tools prefix + llvm-19's own pkgconfig,
-      # so no host libdrm/liblzma can slip in.
+      # so no host libdrm/liblzma can slip in on this configuration.
       # =====================================================================
       - name: Configure host tools
         working-directory: mesa
@@ -539,6 +540,14 @@ jobs:
           done
           if [ "$bad" = "0" ]; then
             echo "✔ no Termux/host library references found"
+          fi
+
+          echo
+          echo "==== confirming no host libdrm in output ===="
+          if readelf -d "$SO" | grep NEEDED | grep -qi drm; then
+            echo "❌ host libdrm leaked in"
+          else
+            echo "✔ no libdrm NEEDED entry (static fallback used)"
           fi
 
           echo
