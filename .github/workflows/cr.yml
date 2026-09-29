@@ -71,13 +71,6 @@ jobs:
           git --no-pager log -1 --oneline
           ls -A | head -40
 
-      # =====================================================================
-      # SOURCE PATCHES
-      # =====================================================================
-
-      # Strict, line-scoped replacement done in Python. Only touches a line
-      # that contains all of: '#if', 'defined(__ANDROID__)', 'defined(ANDROID)'
-      # and '&& 0'. If not found, the file is left untouched. Never uses sed.
       - name: Revert vk_android_native_buffer.h to upstream guard
         working-directory: mesa
         run: |
@@ -93,12 +86,10 @@ jobs:
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
           lines = src.splitlines(keepends=True)
-
           patched = 0
           out = []
           for line in lines:
               stripped = line.lstrip()
-              # Require every marker on the same line.
               if (patched == 0
                       and stripped.startswith("#if")
                       and "defined(__ANDROID__)" in line
@@ -110,7 +101,6 @@ jobs:
                   patched += 1
               else:
                   out.append(line)
-
           if patched:
               with open(p, "w", encoding="utf-8", newline="") as f:
                   f.write("".join(out))
@@ -121,8 +111,6 @@ jobs:
 
           echo "==== after (lines 15-35) ===="
           awk 'NR>=15 && NR<=35 {printf "%4d| %s\n", NR, $0}' "$F"
-
-          # Sanity: no '#if #if' on any line.
           if grep -nE '#if[^#]*#if' "$F"; then
             echo "❌ file still contains concatenated #if directives"
             exit 1
@@ -136,9 +124,6 @@ jobs:
           F="src/vulkan/meson.build"
           [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
 
-          echo "==== before ===="
-          sed -n '1,40p' "$F"
-
           if ! grep -q "vulkan-android.sym" "$F"; then
             echo "✔ already using desktop vulkan.sym — skipping"
             exit 0
@@ -148,9 +133,6 @@ jobs:
             -e 's/vulkan-icd-android-symbols\.txt/vulkan-icd-symbols.txt/g' \
             -e 's/vulkan-android\.sym/vulkan.sym/g' \
             "$F"
-
-          echo "==== after ===="
-          sed -n '1,40p' "$F"
 
           ifs=$(grep -cE '^[[:space:]]*(if|elif)\b' "$F")
           endifs=$(grep -cE '^[[:space:]]*endif\b'   "$F")
@@ -366,9 +348,6 @@ jobs:
           [ -f "$DEVFILE" ] || { echo "❌ $DEVFILE not found"; exit 1; }
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
 
-      # =====================================================================
-      # BUILD SPIRV-TOOLS FOR THE HOST
-      # =====================================================================
       - name: Build SPIRV-Tools (host) for mesa_clc / vtn_bindgen2
         run: |
           set -euo pipefail
@@ -396,9 +375,6 @@ jobs:
           echo "HOST_DEPS=$HOST_DEPS" >> "$GITHUB_ENV"
           ls -la "$HOST_DEPS/lib/pkgconfig/"
 
-      # =====================================================================
-      # HOST TOOLS (NATIVE)
-      # =====================================================================
       - name: Configure host tools
         working-directory: mesa
         env:
@@ -451,9 +427,6 @@ jobs:
           done
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
-      # =====================================================================
-      # CROSS BUILD (PURE NDK)
-      # =====================================================================
       - name: Create Meson cross file
         run: |
           set -euo pipefail
@@ -528,6 +501,9 @@ jobs:
             -Dallow-fallback-for=libdrm \
             -Dlibdrm:default_library=static
 
+      # =====================================================================
+      # BUILD + LOCATE (heavily instrumented)
+      # =====================================================================
       - name: Build PanVK Vulkan driver (.so)
         working-directory: mesa
         env:
@@ -536,44 +512,77 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "==== vulkan / panfrost shared-library targets ===="
-          ninja -C build-android -t targets all > /tmp/all-targets.txt 2>/dev/null || true
-          grep -iE 'vulkan|panfrost.*\.so' /tmp/all-targets.txt || true
-
-          echo
-          echo "==== trying known target names ===="
-          candidates=(
-            "vulkan_panfrost"
-            "src/panfrost/vulkan/libvulkan_panfrost.so"
-            "libvulkan_panfrost.so"
-          )
-
-          built=0
-          for target in "${candidates[@]}"; do
-            if grep -qE "^${target//\//\\/}:" /tmp/all-targets.txt 2>/dev/null; then
-              echo ">>> found target: $target"
-              ninja -C build-android "$target"
-              built=1
-              break
-            fi
-          done
-
-          if [ "$built" = "0" ]; then
-            echo ">>> no known target matched — building the whole tree"
-            ninja -C build-android
+          echo "=========================================================="
+          echo "== Meson's authoritative target list (intro-targets)  =="
+          echo "=========================================================="
+          if [ -f build-android/meson-info/intro-targets.json ]; then
+            python3 - <<'PY'
+          import json
+          with open('build-android/meson-info/intro-targets.json') as f:
+              targets = json.load(f)
+          print(f"total meson targets: {len(targets)}")
+          for t in targets:
+              n = t.get('name', '') or ''
+              if 'vulkan' in n.lower() or 'panfrost' in n.lower() or 'panvk' in n.lower():
+                  print(f"  {n:55s} type={t.get('type','?'):22s} file={t.get('filename','')}")
+          PY
+          else
+            echo "(no build-android/meson-info/intro-targets.json)"
           fi
 
           echo
-          echo "==== locating produced .so ===="
-          SO=$(find build-android -type f -name 'libvulkan_panfrost.so' -print -quit)
+          echo "=========================================================="
+          echo "== ninja targets matching vulkan/panfrost/panvk      =="
+          echo "=========================================================="
+          ninja -C build-android -t targets all 2>&1 \
+            | grep -iE 'vulkan|panfrost|panvk' | sort -u || true
+
+          echo
+          echo "=========================================================="
+          echo "== building the whole tree                            =="
+          echo "=========================================================="
+          ninja -C build-android
+
+          echo
+          echo "=========================================================="
+          echo "== contents of build-android/src/panfrost/vulkan/     =="
+          echo "=========================================================="
+          if [ -d build-android/src/panfrost/vulkan ]; then
+            find build-android/src/panfrost/vulkan -maxdepth 1 \
+              \( -type f -o -type l \) \
+              -printf '%y  %p  ->  %l\n' | sort
+          else
+            echo "(directory not present)"
+          fi
+
+          echo
+          echo "=========================================================="
+          echo "== every .so / .so.* anywhere in build-android        =="
+          echo "=========================================================="
+          find build-android \( -name '*.so' -o -name '*.so.*' \) \
+            \( -type f -o -type l \) -printf '%y  %p  ->  %l\n' | sort || true
+
+          echo
+          echo "=========================================================="
+          echo "== locating the driver .so                            =="
+          echo "=========================================================="
+          SO=$(find build-android \
+                 \( -name 'libvulkan_panfrost.so' -o -name 'libvulkan_panfrost.so.*' \
+                    -o -name 'libvulkan_panvk.so'   -o -name 'libvulkan_panvk.so.*' \
+                    -o -name 'libpanvk.so'          -o -name 'libpanvk.so.*' \) \
+                 \( -type f -o -type l \) -print 2>/dev/null | head -n1)
           if [ -z "$SO" ]; then
-            echo "❌ libvulkan_panfrost.so not found after build"
-            find build-android -type f -name '*.so' | sort
+            echo "❌ no driver .so found anywhere under build-android"
+            echo "---- everything under build-android/src/panfrost ----"
+            find build-android/src/panfrost -maxdepth 3 \( -type f -o -type l \) \
+              -printf '%y  %p\n' 2>/dev/null | sort | head -80 || true
             exit 1
           fi
-          echo "✔ built: $SO"
+          echo "✔ found: $SO"
           ls -la "$SO"
-          echo "PANVK_SO=$PWD/$SO" >> "$GITHUB_ENV"
+          REAL=$(readlink -f "$SO")
+          echo "resolved to: $REAL"
+          echo "PANVK_SO=$REAL" >> "$GITHUB_ENV"
 
       # =====================================================================
       # VERIFY
