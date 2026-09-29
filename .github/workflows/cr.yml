@@ -75,19 +75,59 @@ jobs:
       # SOURCE PATCHES
       # =====================================================================
 
+      # Strict, line-scoped replacement done in Python. Only touches a line
+      # that contains all of: '#if', 'defined(__ANDROID__)', 'defined(ANDROID)'
+      # and '&& 0'. If not found, the file is left untouched. Never uses sed.
       - name: Revert vk_android_native_buffer.h to upstream guard
         working-directory: mesa
         run: |
           set -euo pipefail
           F="include/vulkan/vk_android_native_buffer.h"
           [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
-          echo "==== before ===="
-          sed -n '18,32p' "$F"
-          sed -i -E \
-            's|^#if\s+\(defined\(__ANDROID__\)\s*\|\|\s*defined\(ANDROID\)\)\s*&&\s*0.*$|#if defined(__ANDROID__) \|\| defined(ANDROID)|' \
-            "$F"
-          echo "==== after ===="
-          sed -n '18,32p' "$F"
+
+          echo "==== before (lines 15-35) ===="
+          awk 'NR>=15 && NR<=35 {printf "%4d| %s\n", NR, $0}' "$F"
+
+          python3 - "$F" <<'PY'
+          import sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          lines = src.splitlines(keepends=True)
+
+          patched = 0
+          out = []
+          for line in lines:
+              stripped = line.lstrip()
+              # Require every marker on the same line.
+              if (patched == 0
+                      and stripped.startswith("#if")
+                      and "defined(__ANDROID__)" in line
+                      and "defined(ANDROID)"    in line
+                      and "&& 0"                in line):
+                  indent = line[:len(line) - len(stripped)]
+                  nl = "\n" if line.endswith("\n") else ""
+                  out.append(f"{indent}#if defined(__ANDROID__) || defined(ANDROID){nl}")
+                  patched += 1
+              else:
+                  out.append(line)
+
+          if patched:
+              with open(p, "w", encoding="utf-8", newline="") as f:
+                  f.write("".join(out))
+              print(f"✔ reverted {patched} line(s)")
+          else:
+              print("✔ already clean — nothing to revert")
+          PY
+
+          echo "==== after (lines 15-35) ===="
+          awk 'NR>=15 && NR<=35 {printf "%4d| %s\n", NR, $0}' "$F"
+
+          # Sanity: no '#if #if' on any line.
+          if grep -nE '#if[^#]*#if' "$F"; then
+            echo "❌ file still contains concatenated #if directives"
+            exit 1
+          fi
+          echo "✔ no concatenated #if found"
 
       - name: Force desktop vulkan.sym symbol scheme
         working-directory: mesa
@@ -528,7 +568,6 @@ jobs:
           SO=$(find build-android -type f -name 'libvulkan_panfrost.so' -print -quit)
           if [ -z "$SO" ]; then
             echo "❌ libvulkan_panfrost.so not found after build"
-            echo "---- all .so files under build-android ----"
             find build-android -type f -name '*.so' | sort
             exit 1
           fi
