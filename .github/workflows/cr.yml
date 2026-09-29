@@ -496,13 +496,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "==== available panfrost-related ninja targets ===="
-          ninja -C build-android -t targets all 2>/dev/null \
-            | grep -iE 'panfrost|vulkan_panfrost' | head -40 || true
+          echo "==== vulkan / panfrost shared-library targets ===="
+          ninja -C build-android -t targets all > /tmp/all-targets.txt 2>/dev/null || true
+          grep -iE 'vulkan|panfrost.*\.so' /tmp/all-targets.txt || true
 
           echo
-          echo "==== building target: vulkan_panfrost ===="
-          ninja -C build-android vulkan_panfrost
+          echo "==== trying known target names ===="
+          candidates=(
+            "vulkan_panfrost"
+            "src/panfrost/vulkan/libvulkan_panfrost.so"
+            "libvulkan_panfrost.so"
+          )
+
+          built=0
+          for target in "${candidates[@]}"; do
+            if grep -qE "^${target//\//\\/}:" /tmp/all-targets.txt 2>/dev/null; then
+              echo ">>> found target: $target"
+              ninja -C build-android "$target"
+              built=1
+              break
+            fi
+          done
+
+          if [ "$built" = "0" ]; then
+            echo ">>> no known target matched — building the whole tree"
+            ninja -C build-android
+          fi
 
           echo
           echo "==== locating produced .so ===="
@@ -510,7 +529,7 @@ jobs:
           if [ -z "$SO" ]; then
             echo "❌ libvulkan_panfrost.so not found after build"
             echo "---- all .so files under build-android ----"
-            find build-android -type f -name '*.so' | head -40 || true
+            find build-android -type f -name '*.so' | sort
             exit 1
           fi
           echo "✔ built: $SO"
