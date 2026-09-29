@@ -387,6 +387,40 @@ jobs:
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
 
       # =====================================================================
+      # FALLBACK: strip disabler:true from dep_elf only if libelf is really
+      # missing for the host pkg-config. When libelf-dev is installed (it is,
+      # from the apt step), this is a no-op.
+      # =====================================================================
+      - name: Fallback — remove disabler from dep_elf if libelf missing
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+
+          if pkg-config --exists libelf 2>/dev/null; then
+            echo "✔ libelf-dev visible to host pkg-config — no patch needed"
+            exit 0
+          fi
+
+          echo "⚠️  libelf not visible to host pkg-config — patching meson.build"
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("meson.build")
+          src = p.read_text()
+          before = src
+          src = re.sub(
+              r"dep_elf\s*=\s*dependency\(\s*'libelf'\s*,\s*required\s*:\s*false\s*,\s*disabler\s*:\s*true\s*\)",
+              "dep_elf = dependency('libelf', required : false)",
+              src,
+          )
+          if src == before:
+              print("no disabler form found — leaving meson.build alone")
+          else:
+              p.write_text(src)
+              print("✔ removed disabler:true from dep_elf")
+          PY
+          grep -n "dep_elf" meson.build || true
+
+      # =====================================================================
       # CROSS CONFIGURE + BUILD
       # =====================================================================
       - name: Create Meson cross file
@@ -459,19 +493,18 @@ jobs:
             -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled \
             -Dlibunwind=disabled -Dvalgrind=disabled \
             -Dzlib=disabled -Dzstd=disabled \
-            -Dlibelf=enabled \
             -Dvideo-codecs= -Dperfetto=false -Dstrip=true -Dcpp_rtti=false \
             --force-fallback-for=libdrm -Dallow-fallback-for=libdrm \
             -Dlibdrm:default_library=static
 
           echo
-          echo "==== config check: was libelf found? ===="
+          echo "==== config check: libelf ===="
           grep -iE 'libelf|Library elf' \
             build-android/meson-logs/meson-log.txt | tail -10 || true
 
           echo
-          echo "==== config check: any target disabled? ===="
-          grep -iE 'disabling|disabled.*vulkan|vulkan.*disabled' \
+          echo "==== config check: any target disabling? ===="
+          grep -iE 'disabling|disabled.*(vulkan|panfrost)|vulkan.*disabled' \
             build-android/meson-logs/meson-log.txt | tail -20 || true
 
           echo
