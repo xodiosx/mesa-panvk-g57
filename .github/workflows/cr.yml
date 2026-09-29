@@ -8,9 +8,13 @@ on:
         required: true
         default: 'panvk-'
       mesa_branch:
-        description: 'Branch of the current repo to build'
+        description: 'Branch to build from'
+        type: choice
         required: true
         default: 'winlator-pan'
+        options:
+          - main
+          - winlator-pan
       api_override:
         description: 'Vulkan API override (leave empty to keep as-is)'
         required: false
@@ -26,21 +30,9 @@ jobs:
 
     env:
       NDK_VERSION: 'r28c'
-      ANDROID_API: '33'
+      ANDROID_API: '29'
 
     steps:
-      # =====================================================================
-      # 1. HOST TOOLS
-      #
-      # clang-19 + llvm-19 are used ONLY for the native host tools that
-      # generate C code at build time (mesa_clc, vtn_bindgen2,
-      # panfrost_compile). They are never linked into the Android .so.
-      #
-      # Note: we do NOT install libdrm-dev, zlib1g-dev, libzstd-dev, or
-      # anything else whose host .so could leak into the cross build.
-      # Mesa's libdrm fallback subproject provides a static libdrm, and we
-      # disable zlib/zstd entirely.
-      # =====================================================================
       - name: Install host build tools
         run: |
           set -euo pipefail
@@ -78,14 +70,6 @@ jobs:
           git --no-pager log -1 --oneline
           ls -A | head -40
 
-      # =====================================================================
-      # 2. SOURCE PATCHES
-      # =====================================================================
-
-      # 2a. Revert the old "&& 0" patch on vk_android_native_buffer.h.
-      #     The fork used to force buffer_handle_t to void* because Termux
-      #     lacked cutils/native_handle.h. With android-stub=true, Mesa's
-      #     own stub provides the real type, so the override must go.
       - name: Revert vk_android_native_buffer.h to upstream guard
         working-directory: mesa
         run: |
@@ -100,8 +84,6 @@ jobs:
           echo "==== after ===="
           sed -n '18,32p' "$F"
 
-      # 2b. Force desktop vulkan.sym so vk_icdGetInstanceProcAddr is
-      #     exported. Required for AdrenoTools / Winlator dlopen().
       - name: Force desktop vulkan.sym symbol scheme
         working-directory: mesa
         run: |
@@ -134,8 +116,6 @@ jobs:
           print("✔ replaced Android HAL symbol block")
           PY
 
-      # 2c. Make android_stub hw_get_module() honest (return -1 on failure,
-      #     never 0 without setting *module).
       - name: Make android_stub hw_get_module() return failure
         working-directory: mesa
         run: |
@@ -164,7 +144,6 @@ jobs:
           EOF
           echo "✔ rewrote $F"
 
-      # 2d. fd probing in vk_common_GetAndroidHardwareBufferPropertiesANDROID.
       - name: Probe all fds in vk_common_GetAndroidHardwareBufferPropertiesANDROID
         working-directory: mesa
         run: |
@@ -235,7 +214,6 @@ jobs:
           print("✔ patched vk_common_GetAndroidHardwareBufferPropertiesANDROID")
           PY
 
-      # 2e. u_gralloc_panvk_test.h — unconditional fd probing.
       - name: Patch u_gralloc_panvk_test.h for unconditional fd probing
         working-directory: mesa
         run: |
@@ -300,7 +278,6 @@ jobs:
           HDR_EOF
           echo "✔ rewrote $HDR"
 
-      # 2f. libudev optional (Mesa's default makes it required).
       - name: Make libudev optional in top-level meson.build
         working-directory: mesa
         run: |
@@ -309,7 +286,6 @@ jobs:
           sed -i "s/has_header('libudev.h')/false/g" meson.build
           echo "✔ libudev made optional"
 
-      # 2g. Guard panvk_android_hal_bridge out of Android builds.
       - name: Guard panvk_android_hal_bridge out of Android builds
         working-directory: mesa
         run: |
@@ -345,12 +321,6 @@ jobs:
           [ -f "$DEVFILE" ] || { echo "❌ $DEVFILE not found"; exit 1; }
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
 
-      # =====================================================================
-      # 3. HOST TOOLS (NATIVE)
-      #
-      # These binaries run on the GitHub runner. They are used at Android
-      # build time to generate C code. They never end up in the output .so.
-      # =====================================================================
       - name: Configure host tools
         working-directory: mesa
         env:
@@ -397,16 +367,8 @@ jobs:
             cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
             echo "✔ staged $name -> $dashed"
           done
-          ls -la "$GITHUB_WORKSPACE/host-bin/"
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
-      # =====================================================================
-      # 4. CROSS BUILD (PURE NDK)
-      #
-      # No host libraries, no Termux. Empty pkg-config dir forces Mesa to
-      # use the libdrm fallback subproject (static). zlib/zstd disabled
-      # entirely, so no liblzma / libzstd / libunwind dependency.
-      # =====================================================================
       - name: Create Meson cross file
         run: |
           set -euo pipefail
@@ -489,9 +451,6 @@ jobs:
         run: |
           ninja -C build-android src/panfrost/vulkan/libvulkan_panfrost.so
 
-      # =====================================================================
-      # 5. VERIFY
-      # =====================================================================
       - name: Verify driver links ONLY system libraries
         run: |
           set -euo pipefail
@@ -524,9 +483,6 @@ jobs:
           strings "$SO" | grep -i 'AHBFD' || \
             echo "⚠️  no AHBFD strings found"
 
-      # =====================================================================
-      # 6. PACKAGE
-      # =====================================================================
       - name: Package AdrenoTools driver ZIP
         run: |
           set -euo pipefail
@@ -596,18 +552,23 @@ jobs:
 
             ## Why this build is different
 
-            Previous builds linked against Termux's `liblzma`, which lacks
-            the `Xzs_*` symbols that Android's `libunwindstack.so` expects,
-            causing `dlopen` failures that needed
+            Previous builds linked against Termux's `libdrm.so`, which in
+            turn linked Termux's `liblzma.so`. Termux's `liblzma` lacks the
+            `Xzs_*` symbols that Android's `libunwindstack.so` expects,
+            causing `dlopen` failures that required
             `LD_PRELOAD=/system/lib64/liblzma.so`. This build eliminates
-            the root cause by not linking any Termux library at all:
+            the root cause:
 
-            - `pkg-config` is isolated (empty libdir), so no host `.so`
-              paths leak in
+            - `pkg-config` is isolated (empty libdir), so Mesa cannot find
+              any host `liblzma` / `libzstd` / `libdrm` to link against
             - `libdrm` is built statically from Mesa's fallback subproject
+              and embedded into the driver
             - `zlib` / `zstd` / `shader-cache` / `libunwind` are all
               disabled
-            - `-static-libstdc++` removes the libc++_shared dependency
+            - `-static-libstdc++` removes the `libc++_shared` dependency
+
+            Result: no `liblzma` reference in the ELF at all, so no symbol
+            clash.
 
             ## What's included
 
@@ -628,6 +589,7 @@ jobs:
 
             - Built for Mali-G57 (Valhall JM) with the kbase kernel driver.
             - API level: ${{ env.ANDROID_API }}
+            - Source branch: `${{ github.event.inputs.mesa_branch }}`
             - Workflow run: `${{ github.run_number }}`
           files: |
             panvcake_*.zip
