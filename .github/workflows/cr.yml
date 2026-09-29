@@ -481,7 +481,7 @@ jobs:
             -Dmesa-clc=enabled \
             -Dinstall-mesa-clc=true
 
-            - name: Stage host tools on PATH
+      - name: Stage host tools on PATH
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/host-bin"
