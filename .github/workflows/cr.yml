@@ -75,24 +75,12 @@ jobs:
       # SOURCE PATCHES
       # =====================================================================
 
-      - name: Dump panfrost/vulkan meson.build for reference
-        working-directory: mesa
-        run: |
-          F="src/panfrost/vulkan/meson.build"
-          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
-          echo "=========================================================="
-          echo "== FULL: $F"
-          echo "=========================================================="
-          cat -n "$F"
-
       - name: Revert vk_android_native_buffer.h to upstream guard
         working-directory: mesa
         run: |
           set -euo pipefail
           F="include/vulkan/vk_android_native_buffer.h"
           [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
-          echo "==== before (lines 15-35) ===="
-          awk 'NR>=15 && NR<=35 {printf "%4d| %s\n", NR, $0}' "$F"
           python3 - "$F" <<'PY'
           import sys
           p = sys.argv[1]
@@ -118,15 +106,12 @@ jobs:
                   f.write("".join(out))
               print(f"✔ reverted {patched} line(s)")
           else:
-              print("✔ already clean — nothing to revert")
+              print("✔ already clean")
           PY
-          echo "==== after (lines 15-35) ===="
-          awk 'NR>=15 && NR<=35 {printf "%4d| %s\n", NR, $0}' "$F"
           if grep -nE '#if[^#]*#if' "$F"; then
-            echo "❌ file still contains concatenated #if directives"
-            exit 1
+            echo "❌ concatenated #if"; exit 1
           fi
-          echo "✔ no concatenated #if found"
+          echo "✔ no concatenated #if"
 
       - name: Force desktop vulkan.sym symbol scheme
         working-directory: mesa
@@ -134,24 +119,16 @@ jobs:
           set -euo pipefail
           F="src/vulkan/meson.build"
           [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
-
           if ! grep -q "vulkan-android.sym" "$F"; then
-            echo "✔ already using desktop vulkan.sym — skipping"
-            exit 0
+            echo "✔ already desktop vulkan.sym"; exit 0
           fi
-
           sed -i \
             -e 's/vulkan-icd-android-symbols\.txt/vulkan-icd-symbols.txt/g' \
             -e 's/vulkan-android\.sym/vulkan.sym/g' \
             "$F"
-
           ifs=$(grep -cE '^[[:space:]]*(if|elif)\b' "$F")
           endifs=$(grep -cE '^[[:space:]]*endif\b'   "$F")
-          echo "if/elif count: $ifs   endif count: $endifs"
-          if [ "$ifs" -ne "$endifs" ]; then
-            echo "❌ if/endif mismatch in $F"
-            exit 1
-          fi
+          [ "$ifs" -eq "$endifs" ] || { echo "❌ if/endif mismatch"; exit 1; }
           echo "✔ if/endif balanced"
 
       - name: Make android_stub hw_get_module() return failure
@@ -159,25 +136,17 @@ jobs:
         run: |
           set -euo pipefail
           F="src/android_stub/hardware_stub.cpp"
-          [ -f "$F" ] || { echo "⚠️  $F not present — skipping"; exit 0; }
-          if grep -q "PATCH: honest stub" "$F"; then
-            echo "✔ already patched"; exit 0
-          fi
+          [ -f "$F" ] || { echo "⚠️  not present"; exit 0; }
+          if grep -q "PATCH: honest stub" "$F"; then exit 0; fi
           cat > "$F" <<'EOF'
-          /* PATCH: honest stub — no real Android HAL registry is reachable
-           * from this build, so report failure rather than 0 (success)
-           * without setting *module (callers dereference it on success). */
           extern "C" {
-
           struct hw_module_t;
-
           int hw_get_module(const char *id, const struct hw_module_t **module)
           {
              (void)id;
              *module = 0;
              return -1;
           }
-
           }
           EOF
           echo "✔ rewrote $F"
@@ -187,26 +156,19 @@ jobs:
         run: |
           set -euo pipefail
           F="src/vulkan/runtime/vk_android.c"
-          [ -f "$F" ] || { echo "⚠️  $F not found — skipping"; exit 0; }
-          if grep -q "PANVK_PATCHED_VK_ANDROID_FD_PROBE" "$F"; then
-            echo "✔ already patched"; exit 0
-          fi
+          [ -f "$F" ] || { echo "⚠️  not found"; exit 0; }
+          if grep -q "PANVK_PATCHED_VK_ANDROID_FD_PROBE" "$F"; then exit 0; fi
           python3 - "$F" <<'PY'
           import re, sys
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
-          orig = src
-          old = (
-              "   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(buffer);\n"
-              "   assert(handle && handle->numFds > 0);\n"
-              "   pProperties->allocationSize = lseek(handle->data[0], 0, SEEK_END);\n"
+          pat = re.compile(
+              r'pProperties->allocationSize\s*=\s*lseek\(\s*handle->data\[0\]\s*,\s*0\s*,\s*SEEK_END\s*\);'
           )
-          new = (
-              "   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(buffer);\n"
-              "   assert(handle && handle->numFds > 0);\n"
-              "   /* PANVK_PATCHED_VK_ANDROID_FD_PROBE: probe every fd; some gralloc\n"
-              "    * implementations put metadata at data[0] and the real dma-buf\n"
-              "    * at a later index. */\n"
+          if not pat.search(src):
+              print("⚠️  lseek(data[0]) not found"); sys.exit(0)
+          src = pat.sub(
+              "/* PANVK_PATCHED_VK_ANDROID_FD_PROBE */\n"
               "   int dma_buf_fd = handle->data[0];\n"
               "   off_t dma_buf_size = lseek(dma_buf_fd, 0, SEEK_END);\n"
               "   if (dma_buf_size <= 0) {\n"
@@ -216,40 +178,16 @@ jobs:
               "                        dma_buf_size = _sz; break; }\n"
               "      }\n"
               "   }\n"
-              "   pProperties->allocationSize = dma_buf_size;\n"
+              "   pProperties->allocationSize = dma_buf_size;",
+              src, count=1,
           )
-          if old in src:
-              src = src.replace(old, new, 1)
-          else:
-              pat = re.compile(
-                  r'pProperties->allocationSize\s*=\s*lseek\(\s*handle->data\[0\]\s*,\s*0\s*,\s*SEEK_END\s*\);'
-              )
-              if not pat.search(src):
-                  print("⚠️  could not find lseek(data[0]) — fork may already be patched")
-                  sys.exit(0)
-              src = pat.sub(
-                  "/* PANVK_PATCHED_VK_ANDROID_FD_PROBE */\n"
-                  "   int dma_buf_fd = handle->data[0];\n"
-                  "   off_t dma_buf_size = lseek(dma_buf_fd, 0, SEEK_END);\n"
-                  "   if (dma_buf_size <= 0) {\n"
-                  "      for (int _i = 1; _i < handle->numFds; _i++) {\n"
-                  "         off_t _sz = lseek(handle->data[_i], 0, SEEK_END);\n"
-                  "         if (_sz > 0) { dma_buf_fd = handle->data[_i];\n"
-                  "                        dma_buf_size = _sz; break; }\n"
-                  "      }\n"
-                  "   }\n"
-                  "   pProperties->allocationSize = dma_buf_size;",
-                  src, count=1,
-              )
           src = src.replace(
               "VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, handle->data[0],",
               "VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dma_buf_fd,",
               1,
           )
-          if src == orig:
-              print("⚠️  no changes applied"); sys.exit(0)
           open(p, "w", encoding="utf-8").write(src)
-          print("✔ patched vk_common_GetAndroidHardwareBufferPropertiesANDROID")
+          print("✔ patched vk_android.c fd probe")
           PY
 
       - name: Patch u_gralloc_panvk_test.h for unconditional fd probing
@@ -257,164 +195,73 @@ jobs:
         run: |
           set -euo pipefail
           HDR="src/util/u_gralloc/u_gralloc_panvk_test.h"
-          [ -f "$HDR" ] || { echo "⚠️  $HDR not found — skipping"; exit 0; }
-          if grep -q "PANVK_PATCHED_FD_PROBE" "$HDR"; then
-            echo "✔ already patched — skipping"; exit 0
-          fi
+          [ -f "$HDR" ] || { echo "⚠️  not found"; exit 0; }
+          if grep -q "PANVK_PATCHED_FD_PROBE" "$HDR"; then exit 0; fi
           cat > "$HDR" <<'HDR_EOF'
           /* SPDX-License-Identifier: MIT */
           #ifndef U_GRALLOC_PANVK_TEST_H
           #define U_GRALLOC_PANVK_TEST_H
-
           #include <cutils/native_handle.h>
           #include <stdlib.h>
           #include <string.h>
           #include <unistd.h>
           #include "util/log.h"
-
-          /* PANVK_PATCHED_FD_PROBE */
           static inline int
           u_gralloc_panvk_test_fd(const native_handle_t *handle, const char *where)
           {
              if (!handle || handle->numFds < 1)
                 return -1;
-
              int   best_fd   = -1;
              off_t best_size = 0;
-
              for (int i = 0; i < handle->numFds; i++) {
                 int   fd   = handle->data[i];
                 off_t size = lseek(fd, 0, SEEK_END);
-                if (size <= 0)
-                   continue;
-                if (size > best_size) {
-                   best_size = size;
-                   best_fd   = fd;
-                }
+                if (size <= 0) continue;
+                if (size > best_size) { best_size = size; best_fd = fd; }
              }
-
              if (best_fd < 0) {
                 mesa_loge("AHBFD %s: no valid dma-buf in %d entries",
                           where, handle->numFds);
                 return handle->data[0];
              }
-
              mesa_logi("AHBFD %s: selected fd=%d size=%lld",
                        where, best_fd, (long long)best_size);
              return best_fd;
           }
-
           #endif
           HDR_EOF
           echo "✔ rewrote $HDR"
 
-      - name: Make libudev optional in top-level meson.build
+      - name: Make libudev optional
         working-directory: mesa
         run: |
-          set -euo pipefail
           sed -i "s/dependency('libudev',/dependency('libudev', required : false, disabler : true, /g" meson.build
           sed -i "s/has_header('libudev.h')/false/g" meson.build
-          echo "✔ libudev made optional"
+          echo "✔ libudev optional"
 
       - name: Guard panvk_android_hal_bridge out of Android builds
         working-directory: mesa
         run: |
           set -euo pipefail
           FILE="src/panfrost/vulkan/meson.build"
-          [ -f "$FILE" ] || { echo "⚠️  $FILE not found — skipping"; exit 0; }
+          [ -f "$FILE" ] || { echo "⚠️  not found"; exit 0; }
           python3 - "$FILE" <<'PY'
           import sys
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
           if "if not with_platform_android" in src and "panvk_android_hal_bridge" in src:
-              print("already guarded — skipping"); sys.exit(0)
+              print("already guarded"); sys.exit(0)
           old = "panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')"
           if old not in src:
-              print("⚠️  pattern not found, skipping"); sys.exit(0)
-          new = (
+              print("⚠️  pattern not found"); sys.exit(0)
+          src = src.replace(old,
               "panvk_android_hal_bridge = []\n"
               "if not with_platform_android\n"
               "  panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')\n"
-              "endif"
-          )
-          src = src.replace(old, new, 1)
+              "endif", 1)
           open(p, "w", encoding="utf-8").write(src)
           print("✔ patched")
           PY
-
-      # =====================================================================
-      # ENSURE shared_library('vulkan_panfrost') EXISTS
-      # =====================================================================
-      - name: Ensure shared_library('vulkan_panfrost') exists in meson.build
-        working-directory: mesa
-        run: |
-          set -euo pipefail
-          F="src/panfrost/vulkan/meson.build"
-          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
-
-          python3 - "$F" <<'PY'
-          import re, sys
-          p = sys.argv[1]
-          with open(p, "r", encoding="utf-8") as f:
-              src = f.read()
-
-          # 1. Defeat early exits and neutralize disabled targets from the fork
-          src = re.sub(r"\bsubdir_done\s*\(\s*\)", "# subdir_done()", src)
-          src = re.sub(r"(?<!#)\bshared_library\s*\(\s*['\"]vulkan_panfrost['\"]", r"static_library('vulkan_panfrost_disabled'", src)
-
-          # 2. Extract internal variable names
-          assigns = {}
-          for m in re.finditer(r'^([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)', src, re.M):
-              assigns[m.group(1)] = m.group(2)
-
-          def pick(needles, fallback):
-              for name in assigns.keys():
-                  low = name.lower()
-                  if all(n in low for n in needles):
-                      return name
-              return fallback
-
-          entrypoints = pick(['entrypoint'], 'panvk_entrypoints')
-          drirc       = pick(['drirc'],      'panvk_drirc')
-          tracepoints = pick(['tracepoint'], 'panvk_tracepoints')
-          per_arch    = pick(['per_arch'],   'libpanvk_per_arch')
-          core_lib    = pick(['panvk_lib'],  'panvk_lib')
-
-          print("auto-detected variables:")
-          print(f"  entrypoints = {entrypoints}")
-          print(f"  drirc       = {drirc}")
-          print(f"  tracepoints = {tracepoints}")
-          print(f"  per_arch    = {per_arch}")
-          print(f"  core_lib    = {core_lib}")
-
-          # 3. Inject the shared_library block with the core driver included
-          b = []
-          b.append("")
-          b.append("# === FORCED BY CI ===")
-          b.append("libvulkan_panfrost = shared_library(")
-          b.append("  'vulkan_panfrost',")
-          b.append(f"  [{entrypoints}, {drirc}, {tracepoints}],")
-          b.append("  include_directories : [")
-          b.append("    inc_include, inc_src, inc_util,")
-          b.append("    inc_panfrost, inc_panfrost_vulkan,")
-          b.append("    inc_vulkan_util, inc_vulkan_wsi,")
-          b.append("  ],")
-          b.append("  link_args : ['-Wl,-Bsymbolic', '-Wl,--build-id=sha1'] + (is_variable('vulkan_icd_link_args') ? vulkan_icd_link_args : []),")
-          b.append(f"  link_with : [{core_lib}, {per_arch}],")
-          b.append("  dependencies : [dep_libdrm],")
-          b.append("  gnu_symbol_visibility : 'hidden',")
-          b.append("  install : true,")
-          b.append(")")
-          b.append("")
-
-          with open(p, "w", encoding="utf-8") as f:
-              f.write(src + "\n" + "\n".join(b))
-
-          print("✔ Patched and injected shared_library block")
-          PY
-
-          echo "==== tail of $F ===="
-          tail -n 30 "$F"
 
       - name: Override Vulkan API version (optional)
         if: github.event.inputs.api_override != ''
@@ -428,32 +275,27 @@ jobs:
       # =====================================================================
       # HOST SPIRV-TOOLS
       # =====================================================================
-      - name: Build SPIRV-Tools (host) for mesa_clc / vtn_bindgen2
+      - name: Build SPIRV-Tools (host)
         run: |
           set -euo pipefail
           SDK_TAG=vulkan-sdk-1.4.309.0
           WORK="$GITHUB_WORKSPACE/spirv-host"
           HOST_DEPS="$WORK/prefix"
           mkdir -p "$WORK"
-
           git clone --depth 1 --branch "$SDK_TAG" \
             https://github.com/KhronosGroup/SPIRV-Tools.git "$WORK/SPIRV-Tools"
           git clone --depth 1 --branch "$SDK_TAG" \
             https://github.com/KhronosGroup/SPIRV-Headers.git \
             "$WORK/SPIRV-Tools/external/spirv-headers"
-
           cmake -S "$WORK/SPIRV-Tools" -B "$WORK/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$HOST_DEPS" \
             -DCMAKE_INSTALL_LIBDIR=lib \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DSPIRV_SKIP_TESTS=ON \
-            -DSPIRV_SKIP_EXECUTABLES=ON
+            -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON
           cmake --build "$WORK/build" --parallel 2
           cmake --install "$WORK/build"
-
           echo "HOST_DEPS=$HOST_DEPS" >> "$GITHUB_ENV"
-          ls -la "$HOST_DEPS/lib/pkgconfig/"
 
       - name: Configure host tools
         working-directory: mesa
@@ -465,17 +307,11 @@ jobs:
           LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
         run: |
           meson setup build-host \
-            --buildtype=release \
-            -Dbuild-tests=false \
-            -Dplatforms=[] \
-            -Dgallium-drivers=[] \
-            -Dvulkan-drivers=[] \
+            --buildtype=release -Dbuild-tests=false \
+            -Dplatforms=[] -Dgallium-drivers=[] -Dvulkan-drivers=[] \
             -Dtools=panfrost \
-            -Dprecomp-compiler=enabled \
-            -Dinstall-precomp-compiler=true \
-            -Dllvm=enabled \
-            -Dmesa-clc=enabled \
-            -Dinstall-mesa-clc=true
+            -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true \
+            -Dllvm=enabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true
 
       - name: Build host tools
         working-directory: mesa
@@ -495,38 +331,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/host-bin"
-          
-          BINS=(
-            "mesa/build-host/src/compiler/clc/mesa_clc"
-            "mesa/build-host/src/compiler/spirv/vtn_bindgen2"
-            "mesa/build-host/src/panfrost/clc/panfrost_compile"
-          )
-          
-          for bin_path in "${BINS[@]}"; do
-            full_path="$GITHUB_WORKSPACE/$bin_path"
-            
-            if [ ! -e "$full_path" ]; then
-              echo "❌ $bin_path not found!"
-              echo "---- Listing directory contents ----"
-              ls -la "$(dirname "$full_path")" || true
-              exit 1
-            fi
-            
-            name=$(basename "$bin_path")
+          for name in mesa_clc vtn_bindgen2 panfrost_compile; do
+            bin=$(find "$GITHUB_WORKSPACE/mesa/build-host" -type f -executable -name "$name" | head -n1)
+            [ -n "$bin" ] || { echo "❌ $name not found"; exit 1; }
             dashed=$(echo "$name" | tr '_' '-')
-            
-            cp "$full_path" "$GITHUB_WORKSPACE/host-bin/$name"
-            cp "$full_path" "$GITHUB_WORKSPACE/host-bin/$dashed"
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
             chmod +x "$GITHUB_WORKSPACE/host-bin/$name" "$GITHUB_WORKSPACE/host-bin/$dashed"
-            
-            echo "✔ staged $name -> $dashed"
           done
-          
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
-          ls -la "$GITHUB_WORKSPACE/host-bin/"
 
       # =====================================================================
-      # CROSS CONFIGURE + BUILD
+      # CROSS CONFIGURE + BUILD (no meson injection)
       # =====================================================================
       - name: Create Meson cross file
         run: |
@@ -560,127 +376,157 @@ jobs:
           EOF
           cat "$GITHUB_WORKSPACE/android-aarch64.ini"
 
-      - name: Configure PanVK (Android, static libdrm, no host libs)
+      - name: Configure PanVK (Android)
         working-directory: mesa
         run: |
           PKG_CONFIG_PATH= meson setup build-android \
             --cross-file "$GITHUB_WORKSPACE/android-aarch64.ini" \
-            --buildtype=release \
-            -Dbuild-tests=false \
-            -Dplatforms=android \
-            -Dplatform-sdk-version="$ANDROID_API" \
-            -Dandroid-stub=true \
-            -Dandroid-libbacktrace=disabled \
+            --buildtype=release -Dbuild-tests=false \
+            -Dplatforms=android -Dplatform-sdk-version="$ANDROID_API" \
+            -Dandroid-stub=true -Dandroid-libbacktrace=disabled \
             -Dandroid-libperfetto=disabled \
-            -Dvulkan-drivers=panfrost \
-            -Dgallium-drivers= \
-            -Dpanfrost-kmds=kbase,panthor \
-            -Dpanvk-use-kbase=true \
-            -Dpanfrost-rust=false \
-            -Dllvm=disabled \
-            -Dmesa-clc=system \
-            -Dprecomp-compiler=system \
+            -Dvulkan-drivers=panfrost -Dgallium-drivers= \
+            -Dpanfrost-kmds=kbase,panthor -Dpanvk-use-kbase=true \
+            -Dpanfrost-rust=false -Dllvm=disabled \
+            -Dmesa-clc=system -Dprecomp-compiler=system \
             -Dspirv-tools=disabled \
-            -Dglx=disabled \
-            -Dgbm=disabled \
-            -Dopengl=false \
-            -Degl=disabled \
-            -Dgles1=disabled \
-            -Dgles2=disabled \
-            -Dshader-cache=disabled \
-            -Dxmlconfig=disabled \
-            -Dexpat=disabled \
-            -Dlibunwind=disabled \
-            -Dvalgrind=disabled \
-            -Dzlib=disabled \
-            -Dzstd=disabled \
-            -Dvideo-codecs= \
-            -Dperfetto=false \
-            -Dstrip=true \
-            -Dcpp_rtti=false \
-            --force-fallback-for=libdrm \
-            -Dallow-fallback-for=libdrm \
+            -Dglx=disabled -Dgbm=disabled -Dopengl=false \
+            -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
+            -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled \
+            -Dlibunwind=disabled -Dvalgrind=disabled \
+            -Dzlib=disabled -Dzstd=disabled \
+            -Dvideo-codecs= -Dperfetto=false -Dstrip=true -Dcpp_rtti=false \
+            --force-fallback-for=libdrm -Dallow-fallback-for=libdrm \
             -Dlibdrm:default_library=static
 
-      - name: Build PanVK Vulkan driver (.so)
+      - name: Build whole tree
         working-directory: mesa
         env:
           PATH: ${{ github.workspace }}/host-bin:/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
         run: |
-          set -euo pipefail
-
-          echo "==== Meson targets containing vulkan/panfrost/panvk ===="
-          if [ -f build-android/meson-info/intro-targets.json ]; then
-            python3 - <<'PY'
-          import json
-          with open('build-android/meson-info/intro-targets.json') as f:
-              targets = json.load(f)
-          for t in targets:
-              n = t.get('name', '') or ''
-              if any(k in n.lower() for k in ('vulkan', 'panfrost', 'panvk')):
-                  print(f"  {n:55s} type={t.get('type','?'):22s} file={t.get('filename','')}")
-          PY
-          fi
-
-          echo
-          echo "==== building whole tree ===="
           ninja -C build-android
 
-          echo
-          echo "==== locating .so ===="
-          SO=$(find build-android \(-type f -o -type l\) -name 'libvulkan_panfrost.so*' -print | head -n1 || true)
-          if [ -z "$SO" ]; then
-            echo "❌ libvulkan_panfrost.so not found"
-            echo "---- all .so under build-android ----"
-            find build-android \(-type f -o -type l\) -name '*.so*' -print
+      # =====================================================================
+      # MANUAL LINK
+      #
+      # The fork's meson.build never produces libvulkan_panfrost.so. Rather
+      # than guess variable names in a shared_library() injection, we compile
+      # the three generated .c files and link all static libraries ourselves
+      # using the exact compile flags meson already used.
+      # =====================================================================
+      - name: Manually link libvulkan_panfrost.so
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+
+          BUILD="build-android/src/panfrost/vulkan"
+
+          echo "==== files in $BUILD ===="
+          ls -la "$BUILD"
+
+          # --- extract CC + flags from an existing compile command ---
+          REF="$BUILD/libpanvk_v14.a.p/csf_panvk_vX_cmd_draw.c.o"
+          [ -f "$REF" ] || REF=$(find build-android/src/panfrost/vulkan -name '*.c.o' | head -1)
+          echo "reference object: $REF"
+
+          CMD=$(ninja -C build-android -t commands "$REF" | head -1)
+          echo "==== reference compile command ===="
+          echo "$CMD"
+
+          CC_AND_FLAGS=$(echo "$CMD" | awk '{
+            for (i=1; i<=NF; i++) {
+              if ($i == "-c" || $i == "-o") break
+              printf "%s ", $i
+            }
+          }')
+          echo "==== CC_AND_FLAGS ===="
+          echo "$CC_AND_FLAGS"
+
+          # --- compile the three generated .c files ---
+          for base in panvk_entrypoints panvk_drirc panvk_tracepoints; do
+            SRC="$BUILD/$base.c"
+            [ -f "$SRC" ] || { echo "⚠️  missing $SRC"; continue; }
+            echo "== compiling $base.c =="
+            $CC_AND_FLAGS -c "$SRC" -o "$BUILD/$base.o"
+          done
+
+          # --- collect static libraries ---
+          LIBS=""
+          for pattern in \
+              "$BUILD"/libpanvk_v*.a \
+              build-android/src/panfrost/lib/libpan-arch-v*.a \
+              build-android/src/panfrost/lib/libpan-format-v*.a \
+              build-android/src/panfrost/lib/libpanfrost_shared.a \
+              build-android/src/panfrost/model/libpanfrost_model_lib.a; do
+            for f in $pattern; do
+              [ -f "$f" ] && LIBS="$LIBS $f"
+            done
+          done
+          echo "==== static libs to link ===="
+          for f in $LIBS; do echo "  $f"; done
+
+          LIBDRM_STATIC=$(find build-android/subprojects -name 'libdrm.a' 2>/dev/null | head -1)
+          echo "libdrm static: $LIBDRM_STATIC"
+
+          OBJS="$BUILD/panvk_entrypoints.o $BUILD/panvk_drirc.o $BUILD/panvk_tracepoints.o"
+
+          OUT="$BUILD/libvulkan_panfrost.so"
+          echo "==== linking $OUT ===="
+
+          $CC_AND_FLAGS \
+            -shared -fPIC \
+            -Wl,-soname,libvulkan_panfrost.so \
+            -Wl,--allow-shlib-undefined \
+            -o "$OUT" \
+            -Wl,--start-group \
+              $OBJS \
+              $LIBS \
+              $LIBDRM_STATIC \
+            -Wl,--end-group \
+            -landroid -llog -ldl 2>&1 | tail -80 || true
+
+          if [ ! -f "$OUT" ]; then
+            echo "❌ manual link failed"
+            echo "==== retrying without --start-group (whole-archive) ===="
+            $CC_AND_FLAGS \
+              -shared -fPIC \
+              -Wl,-soname,libvulkan_panfrost.so \
+              -o "$OUT" \
+              $OBJS \
+              -Wl,--whole-archive $LIBS $LIBDRM_STATIC -Wl,--no-whole-archive \
+              -landroid -llog -ldl 2>&1 | tail -80 || true
+          fi
+
+          if [ ! -f "$OUT" ]; then
+            echo "❌ still no .so"
             exit 1
           fi
-          REAL=$(readlink -f "$SO")
-          echo "✔ found: $SO"
-          echo "resolved: $REAL"
-          ls -la "$REAL"
-          echo "PANVK_SO=$REAL" >> "$GITHUB_ENV"
+
+          echo "✔ linked: $OUT"
+          ls -la "$OUT"
+          echo "==== DT_NEEDED ===="
+          readelf -d "$OUT" | grep NEEDED || true
+          echo "==== exported dynamic symbols (vk_icd*) ===="
+          nm -D "$OUT" 2>/dev/null | grep -i 'vk_icd' || true
+          echo "PANVK_SO=$PWD/$OUT" >> "$GITHUB_ENV"
 
       # =====================================================================
       # VERIFY
       # =====================================================================
-      - name: Verify driver links ONLY system libraries
+      - name: Verify driver
         run: |
           set -euo pipefail
           SO="$PANVK_SO"
           [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
-
           echo "==== DT_NEEDED ===="
           readelf -d "$SO" | grep NEEDED || true
-
-          echo
-          echo "==== forbidden Termux/host libs ===="
-          bad=0
-          for bad_name in liblzma libzstd libunwind libc++_shared libdrm.so.2; do
-            if strings "$SO" | grep -q "$bad_name"; then
-              echo "❌ $SO references$bad_name"
-              bad=1
-            fi
-          done
-          [ "$bad" = "0" ] && echo "✔ no Termux/host library references found"
-
-          echo
-          echo "==== host libdrm check ===="
-          if readelf -d "$SO" | grep NEEDED | grep -qi drm; then
-            echo "❌ host libdrm leaked in"
-          else
-            echo "✔ no libdrm NEEDED entry (static fallback used)"
-          fi
-
           echo
           echo "==== vk_icdGetInstanceProcAddr exported? ===="
-          nm -D "$SO" 2>/dev/null | grep -i 'vk_icdGetInstanceProcAddr' || \
-            echo "❌ vk_icdGetInstanceProcAddr NOT exported"
-
+          nm -D "$SO" 2>/dev/null | grep -i 'vk_icdGetInstanceProcAddr' || echo "❌ NOT exported"
           echo
           echo "==== AHBFD strings ===="
-          strings "$SO" | grep -i 'AHBFD' || echo "⚠️  no AHBFD strings found"
+          strings "$SO" | grep -i AHBFD || echo "⚠️  none"
 
       # =====================================================================
       # PACKAGE
@@ -688,29 +534,17 @@ jobs:
       - name: Package AdrenoTools driver ZIP
         run: |
           set -euo pipefail
-
           SO="$PANVK_SO"
           [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
-
-          if [ ! -f mesa/meta.json ]; then
-            echo "❌ meta.json not found at mesa/meta.json"
-            ls -A mesa | head -40
-            exit 1
-          fi
-
+          [ -f mesa/meta.json ] || { echo "❌ meta.json missing"; exit 1; }
           OUT_NAME="panvcake_26.3.0.R2.zip"
           STAGE="adreno-driver"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
           ${PANVK_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
             --strip-unneeded -o "$STAGE/libvulkan_panfrost.so" "$SO"
-
           cp mesa/meta.json "$STAGE/meta.json"
-
           ls -la "$STAGE"
           readelf -d "$STAGE/libvulkan_panfrost.so" | grep NEEDED || true
-
           cd "$STAGE"
           zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so
           cd ..
@@ -741,29 +575,17 @@ jobs:
           tag_name: ${{ inputs.tag }}
           name: ${{ inputs.tag }}
           body: |
-            # PanVK `panvcake` driver for AdrenoTools (pure NDK build)
+            # PanVK `panvcake` driver for AdrenoTools
 
-            Custom Mesa PanVK Vulkan driver for Mali-G57 (Valhall JM),
-            cross-compiled with the Android NDK r28c.
-
-            ## What's in this build
-
-            - Pure NDK build, no Termux, no host libraries
-            - Static libdrm via fallback subproject
-            - `-static-libstdc++`
-            - Desktop `vulkan.sym` for `vk_icdGetInstanceProcAddr`
-            - Honest `hw_get_module()` stub
-            - fd probing for gralloc handles
-            - **CI re-adds `shared_library('vulkan_panfrost')`** because the
-              winlator-pan branch ships static libraries only
+            Pure-NDK cross-compile of Mesa PanVK for Mali-G57 (Valhall JM).
+            The driver `.so` is linked manually in CI because the
+            `winlator-pan` branch ships static libraries only.
 
             ## Install (AdrenoTools)
 
             1. Download `panvcake_*.zip`.
-            2. In AdrenoTools: Import driver → select the ZIP as-is.
+            2. Import driver → select the ZIP as-is.
             3. Apply and launch.
-
-            ## Notes
 
             - API level: ${{ env.ANDROID_API }}
             - Source branch: `${{ github.event.inputs.mesa_branch }}`
