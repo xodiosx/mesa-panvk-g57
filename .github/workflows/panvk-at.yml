@@ -182,22 +182,6 @@ jobs:
           #endif
           EOF
 
-      # =====================================================================
-      # PATCH FD STEP
-      #
-      # The existing src/util/u_gralloc/u_gralloc_panvk_test.h only probes
-      # native_handle_t->data[1] when the runtime env var PANVK_TEST_AHB_FD1=1
-      # is set. That means a normal user (no env var) still hits
-      # "invalid dmabuf size" on G57 gralloc, because data[0] is a
-      # non-seekable sync/metadata fd.
-      #
-      # This step rewrites the inline function to:
-      #   - probe every data[i] with lseek(SEEK_END)
-      #   - return the fd with the largest positive size
-      #   - fall back to data[0] only if none are valid
-      #
-      # No env var is required afterwards.
-      # =====================================================================
       - name: Patch u_gralloc_panvk_test.h for unconditional fd probing
         working-directory: mesa
         run: |
@@ -205,78 +189,75 @@ jobs:
           HDR="src/util/u_gralloc/u_gralloc_panvk_test.h"
           [ -f "$HDR" ] || { echo "❌ $HDR not found"; exit 1; }
 
-          echo "==== before (first 60 lines) ===="
-          sed -n '1,60p' "$HDR"
+          if grep -q "PANVK_PATCHED_FD_PROBE" "$HDR"; then
+            echo "✔ already patched — skipping"
+            exit 0
+          fi
 
-          python3 - "$HDR" <<'PY'
-          import re, sys
-          p = sys.argv[1]
-          src = open(p, encoding="utf-8").read()
+          echo "==== before ===="
+          cat "$HDR"
 
-          if "PANVK_PATCHED_FD_PROBE" in src:
-              print("✔ already patched")
-              sys.exit(0)
+          cat > "$HDR" <<'HDR_EOF'
+          /* SPDX-License-Identifier: MIT */
+          #ifndef U_GRALLOC_PANVK_TEST_H
+          #define U_GRALLOC_PANVK_TEST_H
 
-          # Find the function body and replace it wholesale. Works even if
-          # the header has been edited since the version we were shown.
-          fn_re = re.compile(
-              r'(static\s+inline\s+int\s*\n\s*u_gralloc_panvk_test_fd\s*'
-              r'\([^)]*\)\s*\{)(.*?)(\n\})',
-              re.DOTALL,
-          )
+          #include <cutils/native_handle.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include "util/log.h"
 
-          new_body = r'''
-   /* PANVK_PATCHED_FD_PROBE: probe every data[i] unconditionally and
-    * return the fd with the largest positive lseek(SEEK_END) size.
-    *
-    * Some Android gralloc implementations put a sync_file or metadata
-    * fd at data[0] and the actual dma-buf at data[1] (or later), which
-    * makes the old data[0] assumption fail with "invalid dmabuf size".
-    *
-    * Falls back to data[0] if no fd has a positive size, so behaviour
-    * stays sane on devices that put the real buffer at index 0.
-    */
-   if (!handle || handle->numFds < 1)
-      return -1;
+          /* PANVK_PATCHED_FD_PROBE
+           *
+           * Probe every native_handle_t->data[i] with lseek(SEEK_END) and
+           * return the fd with the largest positive size.
+           *
+           * Some Android gralloc implementations put a sync_file or metadata
+           * fd at data[0] and the actual dma-buf at data[1] or later. The
+           * old code assumed data[0] was the dma-buf, which produced
+           * "invalid dmabuf size" on Mali-G57 (Valhall).
+           *
+           * Falls back to data[0] if no fd reports a positive size, so
+           * behaviour stays sane on devices that do put the real buffer at
+           * index 0. Never closes or reorders the handle's borrowed fds.
+           */
+          static inline int
+          u_gralloc_panvk_test_fd(const native_handle_t *handle, const char *where)
+          {
+             if (!handle || handle->numFds < 1)
+                return -1;
 
-   int   best_fd   = -1;
-   off_t best_size = 0;
+             int   best_fd   = -1;
+             off_t best_size = 0;
 
-   for (int i = 0; i < handle->numFds; i++) {
-      int   fd   = handle->data[i];
-      off_t size = lseek(fd, 0, SEEK_END);
-      if (size <= 0)
-         continue;
-      if (size > best_size) {
-         best_size = size;
-         best_fd   = fd;
-      }
-   }
+             for (int i = 0; i < handle->numFds; i++) {
+                int   fd   = handle->data[i];
+                off_t size = lseek(fd, 0, SEEK_END);
+                if (size <= 0)
+                   continue;
+                if (size > best_size) {
+                   best_size = size;
+                   best_fd   = fd;
+                }
+             }
 
-   if (best_fd < 0) {
-      mesa_loge("AHBFD %s: no valid dma-buf in %d entries, "
-                "falling back to data[0]", where, handle->numFds);
-      return handle->data[0];
-   }
+             if (best_fd < 0) {
+                mesa_loge("AHBFD %s: no valid dma-buf in %d entries, "
+                          "falling back to data[0]", where, handle->numFds);
+                return handle->data[0];
+             }
 
-   mesa_logi("AHBFD %s: selected fd=%d size=%lld (of %d entries)",
-             where, best_fd, (long long)best_size, handle->numFds);
-   return best_fd;
-'''
+             mesa_logi("AHBFD %s: selected fd=%d size=%lld (of %d entries)",
+                       where, best_fd, (long long)best_size, handle->numFds);
+             return best_fd;
+          }
 
-          new_src, n = fn_re.subn(lambda m: m.group(1) + new_body + m.group(3),
-                                  src, count=1)
-          if n == 0:
-              print("ERROR: could not locate u_gralloc_panvk_test_fd()",
-                    file=sys.stderr)
-              sys.exit(1)
+          #endif
+          HDR_EOF
 
-          open(p, "w", encoding="utf-8").write(new_src)
-          print("✔ rewrote u_gralloc_panvk_test_fd() for unconditional probing")
-          PY
-
-          echo "==== after (first 60 lines) ===="
-          sed -n '1,60p' "$HDR"
+          echo "==== after ===="
+          cat "$HDR"
 
       - name: Guard panvk_android_hal_bridge out of Android builds
         working-directory: mesa
@@ -431,14 +412,6 @@ jobs:
         run: |
           ninja -C build src/panfrost/vulkan/libvulkan_panfrost.so
 
-      # =====================================================================
-      # PATCH ELF STEP (Xzs_Construct)
-      #
-      # Force the driver to NEED /system/lib64/liblzma.so so the Android
-      # loader resolves the Xzs_* symbols that libunwindstack.so (pulled in
-      # by the system Vulkan loader) expects. Removes the need for
-      # LD_PRELOAD=/system/lib64/liblzma.so at runtime.
-      # =====================================================================
       - name: Patch PanVK .so to use system liblzma (fix Xzs_Construct)
         run: |
           set -euo pipefail
@@ -513,7 +486,6 @@ jobs:
           ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
             --strip-unneeded -o "$STAGE/libvulkan_panfrost.so" "$SO"
 
-          # Reapply patchelf after strip so the NEEDED edit definitely stays.
           patchelf --replace-needed liblzma.so.5 /system/lib64/liblzma.so \
             "$STAGE/libvulkan_panfrost.so" 2>/dev/null || true
           patchelf --replace-needed liblzma.so   /system/lib64/liblzma.so \
