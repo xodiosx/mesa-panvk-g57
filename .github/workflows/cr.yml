@@ -481,21 +481,19 @@ jobs:
             -Dmesa-clc=enabled \
             -Dinstall-mesa-clc=true
 
-      - name: Build host tools
-        working-directory: mesa
-        env:
-          CC: clang-19
-          CXX: clang++-19
-          LLVM_CONFIG: /usr/lib/llvm-19/bin/llvm-config
-          PKG_CONFIG_PATH: ${{ env.HOST_DEPS }}/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig
-          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
+            - name: Stage host tools on PATH
         run: |
-          ninja -C build-host \
-            src/compiler/clc/mesa_clc \
-            src/compiler/spirv/vtn_bindgen2 \
-            src/panfrost/clc/panfrost_compile
-          find build-host -type f -executable \
-            \(-name 'mesa_clc' -o -name 'vtn_bindgen2' -o -name 'panfrost_compile'\) -print
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/host-bin"
+          for name in mesa_clc vtn_bindgen2 panfrost_compile; do
+            bin=$(find "$GITHUB_WORKSPACE/mesa/build-host" -type f -name "$name" | head -n1)
+            [ -n "$bin" ] || { echo "❌ $name not found"; exit 1; }
+            dashed=$(echo "$name" | tr '_' '-')
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
+            echo "✔ staged $name -> $dashed"
+          done
+          echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
 
       - name: Stage host tools on PATH
         run: |
