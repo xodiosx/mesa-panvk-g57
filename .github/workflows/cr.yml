@@ -18,6 +18,7 @@ on:
         required: true
         default: 'winlator-pan'
         options:
+          - winlator-2
           - winlator-pan
           - main
       api_override:
