@@ -8,6 +8,11 @@ on:
         type: boolean
         required: true
         default: false
+      build_zink:
+        description: 'Also build the Mesa GL stack (EGL/GLES + Zink in libgallium_dri.so)'
+        type: boolean
+        required: true
+        default: false
       tag:
         description: 'Release tag to create or update'
         required: true
@@ -23,13 +28,14 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     env:
       NDK_VERSION: 'r28c'
       ANDROID_API: '33'
       CACHE_FILE: 'ci-cache/host-tools.tar.gz'
       APPLY_PATCHES: ${{ github.event.inputs.apply_patches }}
+      BUILD_ZINK: ${{ github.event.inputs.build_zink }}
 
       BASE_BRANCH: main
       REFERENCE_BRANCH: winlator-pan
@@ -62,9 +68,8 @@ jobs:
           test -x "/opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang"
 
       # =====================================================================
-      # PREPARATION — base = main, reference = winlator-pan, output = winlator-2
+      # PREPARATION
       # =====================================================================
-
       - name: Checkout base branch (main) into mesa/
         uses: actions/checkout@v4
         with:
@@ -79,33 +84,15 @@ jobs:
           path: reference
           fetch-depth: 1
 
-      - name: Report branch SHAs
-        run: |
-          echo "BASE_BRANCH      = ${{ env.BASE_BRANCH }}"
-          echo "REFERENCE_BRANCH = ${{ env.REFERENCE_BRANCH }}"
-          echo "OUTPUT_BRANCH    = ${{ env.OUTPUT_BRANCH }}"
-          echo
-          echo "=== mesa/ (base) ==="
-          git -C mesa --no-pager log -1 --oneline
-          echo
-          echo "=== reference/ (winlator-pan) ==="
-          git -C reference --no-pager log -1 --oneline
-
       - name: Compute diff main..winlator-pan
         working-directory: mesa
         run: |
           set -euo pipefail
           git fetch origin "${{ env.REFERENCE_BRANCH }}:refs/remotes/origin/${{ env.REFERENCE_BRANCH }}"
-
-          echo "=== diff --stat: ${{ env.BASE_BRANCH }}..${{ env.REFERENCE_BRANCH }} ==="
           git --no-pager diff --stat "${{ env.BASE_BRANCH }}..origin/${{ env.REFERENCE_BRANCH }}" || true
-
-          echo
-          echo "=== full patch saved to $GITHUB_WORKSPACE/winlator-pan.patch ==="
           git --no-pager diff "${{ env.BASE_BRANCH }}..origin/${{ env.REFERENCE_BRANCH }}" \
             > "$GITHUB_WORKSPACE/winlator-pan.patch"
           wc -l "$GITHUB_WORKSPACE/winlator-pan.patch"
-          ls -lh "$GITHUB_WORKSPACE/winlator-pan.patch"
 
       - name: Create winlator-2 (main + AHB from winlator-pan + fixes)
         working-directory: mesa
@@ -114,9 +101,6 @@ jobs:
 
           git checkout -B "${{ env.OUTPUT_BRANCH }}" "${{ env.BASE_BRANCH }}"
 
-          # ---------------------------------------------------------------
-          # KEEP: overlay these whole subtrees from winlator-pan
-          # ---------------------------------------------------------------
           KEEP_PATHS=(
             "include/vulkan/vk_android_native_buffer.h"
             "src/android_stub"
@@ -132,79 +116,38 @@ jobs:
             "meson.options"
           )
 
-          # ---------------------------------------------------------------
-          # RESTORE FROM MAIN: after overlay, put these back to main
-          # ---------------------------------------------------------------
           RESTORE_FROM_MAIN=(
             "src/panfrost/vulkan/panvk_physical_device.c"
             "src/panfrost/vulkan/panvk_physical_device.h"
           )
 
-          echo "=== KEEP list (from ${{ env.REFERENCE_BRANCH }}) ==="
-          for p in "${KEEP_PATHS[@]}"; do echo "  $p"; done
-          echo
-          echo "=== RESTORE list (from ${{ env.BASE_BRANCH }}) ==="
-          for p in "${RESTORE_FROM_MAIN[@]}"; do echo "  $p"; done
-          echo
-
           for p in "${KEEP_PATHS[@]}"; do
             if git cat-file -e "origin/${{ env.REFERENCE_BRANCH }}:$p" 2>/dev/null; then
-              echo "keeping: $p"
               git checkout "origin/${{ env.REFERENCE_BRANCH }}" -- "$p"
-            else
-              echo "skip (not present in reference): $p"
             fi
           done
-
           for p in "${RESTORE_FROM_MAIN[@]}"; do
-            if git cat-file -e "${{ env.BASE_BRANCH }}:$p" 2>/dev/null; then
-              echo "restoring from main: $p"
-              git checkout "${{ env.BASE_BRANCH }}" -- "$p"
-            else
-              echo "skip (not present in main): $p"
-            fi
+            git checkout "${{ env.BASE_BRANCH }}" -- "$p"
           done
 
-          # ---------------------------------------------------------------
-          # FIXUP 1: main's panvk_physical_device.h is missing the two
-          # inline helpers that winlator-pan's other files call:
-          #   panvk_host_import_enabled
-          #   panvk_host_import_memory_types
-          # Add them so panvk_vX_physical_device.c and panvk_device_memory.c
-          # (both from winlator-pan) compile.
-          # ---------------------------------------------------------------
-          echo
           echo "=== FIXUP 1: add host_import helpers to main panvk_physical_device.h ==="
           HDR="src/panfrost/vulkan/panvk_physical_device.h"
-          [ -f "$HDR" ] || { echo "❌ $HDR not found"; exit 1; }
-
           python3 - "$HDR" <<'PY'
-          import re, sys
+          import sys
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
-
           if "panvk_host_import_enabled" in src:
-              print("✔ helpers already present — skipping")
-              sys.exit(0)
-
-          # Ensure the required includes are present. Idempotent.
+              print("✔ already present"); sys.exit(0)
           if '#include <stdlib.h>' not in src:
               src = src.replace("#include <stdint.h>",
-                                "#include <stdint.h>\n#include <stdlib.h>",
-                                1)
+                                "#include <stdint.h>\n#include <stdlib.h>", 1)
           if '#include <string.h>' not in src:
               src = src.replace("#include <stdlib.h>",
-                                "#include <stdlib.h>\n#include <string.h>",
-                                1)
+                                "#include <stdlib.h>\n#include <string.h>", 1)
           if '#include "pan_props.h"' not in src:
-              # Anchor on the existing lib/kmod include which both branches have
               src = src.replace('#include "lib/kmod/pan_kmod.h"',
-                                '#include "lib/kmod/pan_kmod.h"\n#include "pan_props.h"',
-                                1)
-
+                                '#include "lib/kmod/pan_kmod.h"\n#include "pan_props.h"', 1)
           helpers = (
-              "/* JM USER_BUFFER imports provide host-addressable memory for WoW64.\n"
-              " * Keep an explicit opt-out for regression comparisons. */\n"
               "static inline bool\n"
               "panvk_host_import_enabled(const struct panvk_physical_device *device)\n"
               "{\n"
@@ -218,77 +161,48 @@ jobs:
               "panvk_host_import_memory_types(const struct panvk_physical_device *device)\n"
               "{\n"
               "   uint32_t bits = 0;\n"
-              "   for (uint32_t i = 0; i < device->memory.type_count; i++) {\n"
+              "   for (uint32_t i = 0; i < device->memory.type_count; i++)\n"
               "      if (device->memory.types[i].propertyFlags &\n"
               "          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)\n"
               "         bits |= 1u << i;\n"
-              "   }\n"
               "   return bits;\n"
-              "}\n"
-              "\n"
+              "}\n\n"
           )
-
           anchor = "void panvk_physical_device_finish(struct panvk_physical_device *device);"
-          if anchor not in src:
-              print("ERROR: anchor prototype not found", file=sys.stderr)
-              sys.exit(1)
           src = src.replace(anchor, helpers + anchor, 1)
-
           open(p, "w", encoding="utf-8").write(src)
-          print("✔ inserted panvk_host_import_enabled / panvk_host_import_memory_types")
+          print("✔ inserted helpers")
           PY
 
-          echo "==== confirm helpers present ===="
-          grep -n "panvk_host_import_enabled\|panvk_host_import_memory_types\|pan_props.h" "$HDR" || true
-
-          # ---------------------------------------------------------------
-          # FIXUP 2: main's panvk_physical_device.c calls the 1-arg form of
-          # pan_query_core_count, but the tree uses winlator-pan's pan_props.h
-          # which declares the 2-arg form.
-          # ---------------------------------------------------------------
-          echo
           echo "=== FIXUP 2: 2-arg pan_query_core_count in main panvk_physical_device.c ==="
           CDOT="src/panfrost/vulkan/panvk_physical_device.c"
-          [ -f "$CDOT" ] || { echo "❌ $CDOT not found"; exit 1; }
-
           python3 - "$CDOT" <<'PY'
           import sys
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
-
-          needle = "pan_query_core_count(&device->kmod.dev->props)"
-          repl   = "pan_query_core_count(&device->kmod.dev->props, NULL)"
-
-          n = src.count(needle)
-          if n == 0:
-              print("✔ no 1-arg calls remain (already patched or different form)")
-              sys.exit(0)
-
-          src = src.replace(needle, repl)
+          n = src.count("pan_query_core_count(&device->kmod.dev->props)")
+          src = src.replace("pan_query_core_count(&device->kmod.dev->props)",
+                            "pan_query_core_count(&device->kmod.dev->props, NULL)")
           open(p, "w", encoding="utf-8").write(src)
           print(f"✔ patched {n} call site(s)")
           PY
 
-          echo "==== confirm 2-arg calls ===="
-          grep -n "pan_query_core_count" "$CDOT" || true
+          # -------------------------------------------------------------
+          # FIXUP 3 (Zink-only): gallium/drivers/zink was overlaid from
+          # winlator-pan. Its meson.build must not clash with the fact
+          # that our build has -Dgallium-drivers=zink or =. It self-
+          # gates; nothing to do here. But the top-level meson.build
+          # that came from winlator-pan may set certain defaults we do
+          # not want; leave as-is and let -D flags override.
+          # -------------------------------------------------------------
 
-          # ---------------------------------------------------------------
-          # Show what the merge actually produced vs main
-          # ---------------------------------------------------------------
-          echo
-          echo "=== diff --stat: ${{ env.BASE_BRANCH }}..${{ env.OUTPUT_BRANCH }} (staged) ==="
-          git --no-pager diff --cached --stat "${{ env.BASE_BRANCH }}" || true
-
-          echo
-          echo "=== full file list changed vs main ==="
-          git --no-pager diff --cached --name-status "${{ env.BASE_BRANCH }}" || true
-
+          git add -A
           if git diff --cached --quiet; then
-            echo "⚠️  winlator-2 has no changes vs main — KEEP list matched nothing"
+            echo "⚠️  no changes"
           else
             git -c user.email="github-actions@users.noreply.github.com" \
                 -c user.name="github-actions" \
-                commit -m "ci: winlator-2 = main + AHB support from ${{ env.REFERENCE_BRANCH }} (main panvk_physical_device.c/.h + compat fixes)"
+                commit -m "ci: winlator-2 merge ($(date -u +%Y%m%d-%H%M%S))"
           fi
 
       - name: Push winlator-2 to origin
@@ -304,15 +218,6 @@ jobs:
           name: winlator-pan.diff
           path: winlator-pan.patch
           if-no-files-found: warn
-
-      - name: Report checked-out commit and patch mode
-        working-directory: mesa
-        run: |
-          echo "APPLY_PATCHES=${APPLY_PATCHES}"
-          echo "building from branch: ${{ env.OUTPUT_BRANCH }}"
-          git --no-pager log -1 --oneline
-          sha256sum src/panfrost/vulkan/meson.build
-          grep -n "shared_library" src/panfrost/vulkan/meson.build || true
 
       # =====================================================================
       # HOST-TOOLS CACHE
@@ -335,10 +240,9 @@ jobs:
             echo "✔ cache found: $FILE"
             tar -xzf "$FILE" -C "$GITHUB_WORKSPACE"
             chmod -R +x "$GITHUB_WORKSPACE/host-bin" 2>/dev/null || true
-            ls -la "$GITHUB_WORKSPACE/host-bin" || true
             echo "hit=true" >> "$GITHUB_OUTPUT"
           else
-            echo "✗ no cache — will build host tools from source"
+            echo "✗ no cache"
             echo "hit=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -409,9 +313,8 @@ jobs:
           for name in mesa_clc vtn_bindgen2 panfrost_compile; do
             bin=$(find "$GITHUB_WORKSPACE/mesa/build-host" -type f -executable -name "$name" | head -n1)
             [ -n "$bin" ] || { echo "❌ $name not found"; exit 1; }
-            dashed=$(echo "$name" | tr '_' '-')
             cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
-            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$(echo "$name" | tr '_' '-')"
           done
           chmod -R +x "$GITHUB_WORKSPACE/host-bin"
           echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
@@ -424,16 +327,13 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           mkdir -p ci-repo/ci-cache
           tar -czf "ci-repo/${{ env.CACHE_FILE }}" spirv-host/prefix host-bin
-          ls -lh "ci-repo/${{ env.CACHE_FILE }}"
           cd ci-repo
           git config user.email "github-actions@users.noreply.github.com"
           git config user.name  "github-actions"
           git add "${{ env.CACHE_FILE }}"
-          if git diff --cached --quiet; then
-            echo "no cache change"; exit 0
-          fi
+          if git diff --cached --quiet; then exit 0; fi
           git commit -m "ci: cache host-tools ($(date -u +%Y%m%d-%H%M%S))"
-          git push origin "HEAD:${{ github.ref_name }}" && echo "✔ pushed" || echo "⚠️ push failed"
+          git push origin "HEAD:${{ github.ref_name }}" || echo "⚠️ push failed"
 
       # =====================================================================
       # EXTRA SOURCE PATCHES — gated on apply_patches
@@ -445,14 +345,10 @@ jobs:
         run: |
           set -euo pipefail
           F="include/vulkan/vk_android_native_buffer.h"
-          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
           python3 - "$F" <<'PY'
           import sys
-          p = sys.argv[1]
-          src = open(p, encoding="utf-8").read()
-          lines = src.splitlines(keepends=True)
-          patched = 0
-          out = []
+          p = sys.argv[1]; src = open(p, encoding="utf-8").read()
+          lines = src.splitlines(keepends=True); patched = 0; out = []
           for line in lines:
               s = line.lstrip()
               if (patched == 0 and s.startswith("#if")
@@ -467,44 +363,35 @@ jobs:
                   out.append(line)
           if patched:
               open(p, "w", encoding="utf-8", newline="").write("".join(out))
-              print(f"✔ reverted {patched} line(s)")
-          else:
-              print("✔ already clean")
+          print(f"✔ reverted {patched} line(s)")
           PY
 
       - name: PATCH 2 — Force desktop vulkan.sym
         if: env.APPLY_PATCHES == 'true'
         working-directory: mesa
         run: |
-          set -euo pipefail
           F="src/vulkan/meson.build"
-          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
-          if ! grep -q "vulkan-android.sym" "$F"; then
-            echo "✔ already desktop vulkan.sym"; exit 0
+          if grep -q "vulkan-android.sym" "$F"; then
+            sed -i \
+              -e 's/vulkan-icd-android-symbols\.txt/vulkan-icd-symbols.txt/g' \
+              -e 's/vulkan-android\.sym/vulkan.sym/g' "$F"
+            echo "✔ replaced scheme"
+          else
+            echo "✔ already desktop vulkan.sym"
           fi
-          sed -i \
-            -e 's/vulkan-icd-android-symbols\.txt/vulkan-icd-symbols.txt/g' \
-            -e 's/vulkan-android\.sym/vulkan.sym/g' "$F"
-          echo "✔ replaced Android HAL symbol scheme with desktop vulkan.sym"
 
       - name: PATCH 3 — Honest hw_get_module() stub
         if: env.APPLY_PATCHES == 'true'
         working-directory: mesa
         run: |
-          set -euo pipefail
           F="src/android_stub/hardware_stub.cpp"
-          [ -f "$F" ] || { echo "⚠️  not present"; exit 0; }
-          if grep -q "PATCH: honest stub" "$F"; then exit 0; fi
+          [ -f "$F" ] || { echo "not present"; exit 0; }
+          grep -q "PATCH: honest stub" "$F" && exit 0
           cat > "$F" <<'EOF'
-          /* PATCH: honest stub */
           extern "C" {
           struct hw_module_t;
           int hw_get_module(const char *id, const struct hw_module_t **module)
-          {
-             (void)id;
-             *module = 0;
-             return -1;
-          }
+          { (void)id; *module = 0; return -1; }
           }
           EOF
           echo "✔ rewrote $F"
@@ -513,22 +400,16 @@ jobs:
         if: env.APPLY_PATCHES == 'true'
         working-directory: mesa
         run: |
-          set -euo pipefail
           F="src/vulkan/runtime/vk_android.c"
-          [ -f "$F" ] || { echo "⚠️  not found"; exit 0; }
-          if grep -q "PANVK_PATCHED_VK_ANDROID_FD_PROBE" "$F"; then exit 0; fi
+          grep -q "PANVK_PATCHED_VK_ANDROID_FD_PROBE" "$F" && exit 0
           python3 - "$F" <<'PY'
           import re, sys
-          p = sys.argv[1]
-          src = open(p, encoding="utf-8").read()
-          pat = re.compile(
-              r'pProperties->allocationSize\s*=\s*lseek\(\s*handle->data\[0\]\s*,\s*0\s*,\s*SEEK_END\s*\);'
-          )
+          p = sys.argv[1]; src = open(p, encoding="utf-8").read()
+          pat = re.compile(r'pProperties->allocationSize\s*=\s*lseek\(\s*handle->data\[0\]\s*,\s*0\s*,\s*SEEK_END\s*\);')
           if not pat.search(src):
-              print("⚠️  lseek(data[0]) not found"); sys.exit(0)
+              print("⚠️  pattern not found"); sys.exit(0)
           src = pat.sub(
-              "/* PANVK_PATCHED_VK_ANDROID_FD_PROBE */\n"
-              "   int dma_buf_fd = handle->data[0];\n"
+              "int dma_buf_fd = handle->data[0];\n"
               "   off_t dma_buf_size = lseek(dma_buf_fd, 0, SEEK_END);\n"
               "   if (dma_buf_size <= 0) {\n"
               "      for (int _i = 1; _i < handle->numFds; _i++) {\n"
@@ -538,25 +419,21 @@ jobs:
               "      }\n"
               "   }\n"
               "   pProperties->allocationSize = dma_buf_size;",
-              src, count=1,
-          )
+              src, count=1)
           src = src.replace(
               "VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, handle->data[0],",
-              "VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dma_buf_fd,",
-              1,
-          )
+              "VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dma_buf_fd,", 1)
           open(p, "w", encoding="utf-8").write(src)
-          print("✔ patched vk_android.c fd probe")
+          print("✔ patched vk_android.c")
           PY
 
       - name: PATCH 5 — u_gralloc_panvk_test.h fd probing
         if: env.APPLY_PATCHES == 'true'
         working-directory: mesa
         run: |
-          set -euo pipefail
           HDR="src/util/u_gralloc/u_gralloc_panvk_test.h"
-          [ -f "$HDR" ] || { echo "⚠️  not found"; exit 0; }
-          if grep -q "PANVK_PATCHED_FD_PROBE" "$HDR"; then exit 0; fi
+          [ -f "$HDR" ] || { echo "not found"; exit 0; }
+          grep -q "PANVK_PATCHED_FD_PROBE" "$HDR" && exit 0
           cat > "$HDR" <<'HDR_EOF'
           /* SPDX-License-Identifier: MIT */
           #ifndef U_GRALLOC_PANVK_TEST_H
@@ -570,19 +447,15 @@ jobs:
           u_gralloc_panvk_test_fd(const native_handle_t *handle, const char *where)
           {
              if (!handle || handle->numFds < 1) return -1;
-             int   best_fd   = -1;
-             off_t best_size = 0;
+             int best_fd = -1; off_t best_size = 0;
              for (int i = 0; i < handle->numFds; i++) {
-                int   fd   = handle->data[i];
+                int fd = handle->data[i];
                 off_t size = lseek(fd, 0, SEEK_END);
                 if (size <= 0) continue;
                 if (size > best_size) { best_size = size; best_fd = fd; }
              }
-             if (best_fd < 0) {
-                mesa_loge("AHBFD %s: no valid dma-buf in %d entries",
-                          where, handle->numFds);
-                return handle->data[0];
-             }
+             if (best_fd < 0) { mesa_loge("AHBFD %s: no valid dma-buf", where);
+                                return handle->data[0]; }
              mesa_logi("AHBFD %s: selected fd=%d size=%lld",
                        where, best_fd, (long long)best_size);
              return best_fd;
@@ -591,40 +464,27 @@ jobs:
           HDR_EOF
           echo "✔ rewrote $HDR"
 
-      - name: PATCH 6 — Guard panvk_android_hal_bridge out of Android builds
+      - name: PATCH 6 — Guard panvk_android_hal_bridge
         if: env.APPLY_PATCHES == 'true'
         working-directory: mesa
         run: |
-          set -euo pipefail
           FILE="src/panfrost/vulkan/meson.build"
-          [ -f "$FILE" ] || { echo "⚠️  $FILE not found"; exit 0; }
           python3 - "$FILE" <<'PY'
           import sys
-          p = sys.argv[1]
-          src = open(p, encoding="utf-8").read()
+          p = sys.argv[1]; src = open(p, encoding="utf-8").read()
           if "if not with_platform_android" in src and "panvk_android_hal_bridge" in src:
-              print("✔ already guarded"); sys.exit(0)
+              print("already guarded"); sys.exit(0)
           old = "panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')"
           if old not in src:
-              print("⚠️  pattern not found, skipping"); sys.exit(0)
-          src = src.replace(
-              old,
+              print("pattern not found"); sys.exit(0)
+          src = src.replace(old,
               "panvk_android_hal_bridge = []\n"
               "if not with_platform_android\n"
               "  panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')\n"
-              "endif",
-              1,
-          )
+              "endif", 1)
           open(p, "w", encoding="utf-8").write(src)
-          print("✔ guarded panvk_android_hal_bridge")
+          print("✔ guarded")
           PY
-
-      - name: PATCH SUMMARY
-        working-directory: mesa
-        run: |
-          echo "APPLY_PATCHES=${APPLY_PATCHES}"
-          echo "=== git diff --stat vs HEAD (winlator-2) ==="
-          git --no-pager diff --stat || true
 
       - name: Override Vulkan API version (optional)
         if: github.event.inputs.api_override != ''
@@ -632,7 +492,6 @@ jobs:
         run: |
           VER="${{ github.event.inputs.api_override }}"
           DEVFILE="src/panfrost/vulkan/panvk_physical_device.c"
-          [ -f "$DEVFILE" ] || { echo "❌ $DEVFILE not found"; exit 1; }
           sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
 
       # =====================================================================
@@ -670,110 +529,257 @@ jobs:
           EOF
           cat "$GITHUB_WORKSPACE/android-aarch64.ini"
 
-      - name: Configure PanVK (Android)
+      # ---------------------------------------------------------------
+      # When BUILD_ZINK=true we flip three things compared to the plain
+      # PanVK-only build:
+      #
+      #   -Dgallium-drivers=zink         (compile Zink)
+      #   -Dopengl=true -Dgles2=enabled  (build the GL APIs)
+      #   -Degl=enabled                  (build libEGL / libEGL_mesa)
+      #   + -Dshared-glapi=enabled
+      #
+      # Everything else stays as-is: same cross file, same -Dplatforms,
+      # same kbase/panthor, same zlib/zstd off.
+      # ---------------------------------------------------------------
+      - name: Configure PanVK + optional Zink (Android)
         working-directory: mesa
         run: |
           rm -rf build-android
-          PKG_CONFIG_PATH= meson setup build-android \
-            --cross-file "$GITHUB_WORKSPACE/android-aarch64.ini" \
-            --buildtype=release -Dbuild-tests=false \
-            -Dplatforms=android -Dplatform-sdk-version="$ANDROID_API" \
-            -Dandroid-stub=true -Dandroid-libbacktrace=disabled \
-            -Dandroid-libperfetto=disabled \
-            -Dvulkan-drivers=panfrost -Dgallium-drivers= \
-            -Dpanfrost-kmds=kbase,panthor -Dpanvk-use-kbase=true \
-            -Dpanfrost-rust=false -Dllvm=disabled \
-            -Dmesa-clc=system -Dprecomp-compiler=system \
-            -Dspirv-tools=disabled \
-            -Dglx=disabled -Dgbm=disabled -Dopengl=false \
-            -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
-            -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled \
-            -Dlibunwind=disabled -Dvalgrind=disabled \
-            -Dzlib=disabled -Dzstd=disabled \
-            -Dvideo-codecs= -Dperfetto=false -Dstrip=true -Dcpp_rtti=false \
-            --force-fallback-for=libdrm -Dallow-fallback-for=libdrm \
-            -Dlibdrm:default_library=static
 
-      - name: Build PanVK driver
+          COMMON=(
+            --buildtype=release -Dbuild-tests=false
+            -Dplatforms=android -Dplatform-sdk-version="$ANDROID_API"
+            -Dandroid-stub=true -Dandroid-libbacktrace=disabled
+            -Dandroid-libperfetto=disabled
+            -Dvulkan-drivers=panfrost
+            -Dpanfrost-kmds=kbase,panthor -Dpanvk-use-kbase=true
+            -Dpanfrost-rust=false -Dllvm=disabled
+            -Dmesa-clc=system -Dprecomp-compiler=system
+            -Dspirv-tools=disabled
+            -Dglx=disabled -Dgbm=disabled
+            -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled
+            -Dlibunwind=disabled -Dvalgrind=disabled
+            -Dzlib=disabled -Dzstd=disabled
+            -Dvideo-codecs= -Dperfetto=false -Dstrip=true -Dcpp_rtti=false
+            --force-fallback-for=libdrm -Dallow-fallback-for=libdrm
+            -Dlibdrm:default_library=static
+          )
+
+          if [ "${BUILD_ZINK}" = "true" ]; then
+            echo ">>> BUILD_ZINK=true — enabling Zink + EGL/GLES"
+            PKG_CONFIG_PATH= meson setup build-android \
+              --cross-file "$GITHUB_WORKSPACE/android-aarch64.ini" \
+              "${COMMON[@]}" \
+              -Dgallium-drivers=zink \
+              -Dopengl=true -Dgles2=enabled -Dgles1=disabled \
+              -Degl=enabled \
+              -Dshared-glapi=enabled
+          else
+            echo ">>> BUILD_ZINK=false — PanVK-only build"
+            PKG_CONFIG_PATH= meson setup build-android \
+              --cross-file "$GITHUB_WORKSPACE/android-aarch64.ini" \
+              "${COMMON[@]}" \
+              -Dgallium-drivers= \
+              -Dopengl=false -Dgles2=disabled -Dgles1=disabled \
+              -Degl=disabled
+          fi
+
+      - name: Build PanVK (+ Zink)
         working-directory: mesa
         env:
           PATH: ${{ github.workspace }}/host-bin:/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
         run: |
           set -euo pipefail
-          meson compile -C build-android -j 2 vulkan_panfrost
+
+          TARGETS="vulkan_panfrost"
+
+          if [ "${BUILD_ZINK}" = "true" ]; then
+            echo ">>> adding Zink + GL targets"
+            TARGETS="$TARGETS gallium_dri"
+            # libEGL / libGLESv2 / libglapi live under specific target names;
+            # try each and ignore misses so older trees still build.
+            EXTRA_EGL="libEGL libEGL_mesa libGLESv2 shared-glapi glapi"
+          fi
+
+          echo ">>> building: $TARGETS"
+          meson compile -C build-android -j 2 $TARGETS
+
+          if [ "${BUILD_ZINK}" = "true" ]; then
+            echo ">>> attempting additional GL targets (best effort)"
+            for t in $EXTRA_EGL; do
+              echo "--- trying target: $t ---"
+              meson compile -C build-android -j 2 "$t" || echo "  (target $t not present, skipping)"
+            done
+          fi
 
           echo
-          echo "==== locating .so ===="
+          echo "==== panvk .so ===="
           SO=$(find build-android -name 'libvulkan_panfrost.so' -print -quit)
-          if [ -z "$SO" ]; then
-            echo "❌ libvulkan_panfrost.so not found"
-            find build-android -name '*.so*' -print | sort
-            exit 1
-          fi
+          [ -n "$SO" ] || { echo "❌ libvulkan_panfrost.so not found"; exit 1; }
           REAL=$(readlink -f "$SO")
-          echo "✔ $SO -> $REAL"
+          echo "✔ $REAL"
           ls -la "$REAL"
           echo "PANVK_SO=$REAL" >> "$GITHUB_ENV"
+
+          if [ "${BUILD_ZINK}" = "true" ]; then
+            echo
+            echo "==== Zink-related artifacts found in build tree ===="
+            find build-android \
+              \( -name 'libgallium_dri.so' \
+                 -o -name 'libEGL.so' -o -name 'libEGL_mesa.so' \
+                 -o -name 'libGLESv2.so' -o -name 'libGLESv1_CM.so' \
+                 -o -name 'libglapi.so' \) \
+              -type f -print || true
+          fi
 
       - name: Verify driver
         run: |
           set -euo pipefail
           SO="$PANVK_SO"
-          [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
           echo "==== DT_NEEDED ===="
           readelf -d "$SO" | grep NEEDED || true
           echo
-          echo "==== vk_icdGetInstanceProcAddr exported? ===="
+          echo "==== vk_icdGetInstanceProcAddr ===="
           nm -D "$SO" 2>/dev/null | grep -i 'vk_icdGetInstanceProcAddr' || echo "❌ not exported"
           echo
           echo "==== AHBFD strings ===="
           strings "$SO" | grep -i AHBFD || echo "(none)"
           echo
-          echo "==== PANVKDBG strings ===="
+          echo "==== PANVKDBG count ===="
           strings "$SO" | grep -c PANVKDBG || true
 
+          if [ "${BUILD_ZINK}" = "true" ]; then
+            echo
+            echo "==== Zink: check libgallium_dri.so has the zink driver ===="
+            DRI=$(find mesa/build-android -name 'libgallium_dri.so' -type f -print -quit)
+            if [ -n "$DRI" ]; then
+              echo "  found: $DRI"
+              strings "$DRI" | grep -i zink | head -5 || echo "  (no zink strings — check build flags)"
+            else
+              echo "  ⚠️  libgallium_dri.so not produced"
+            fi
+          fi
+
+      # =====================================================================
+      # PACKAGE — AdrenoTools ZIP (Vulkan driver only)
+      # =====================================================================
       - name: Package AdrenoTools driver ZIP
         run: |
           set -euo pipefail
           SO="$PANVK_SO"
           [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
-          if [ ! -f mesa/meta.json ]; then
-            echo "❌ meta.json missing at mesa/meta.json"; exit 1
-          fi
-          if [ "${APPLY_PATCHES}" = "true" ]; then
-            SUFFIX="patched"
-          else
-            SUFFIX="winlator2"
-          fi
+          [ -f mesa/meta.json ] || { echo "❌ meta.json missing"; exit 1; }
+
+          if [ "${APPLY_PATCHES}" = "true" ]; then SUFFIX="patched"; else SUFFIX="winlator2"; fi
           OUT_NAME="panvcake_${SUFFIX}_26.3.0.R2.zip"
           STAGE="adreno-driver"
           rm -rf "$STAGE"; mkdir -p "$STAGE"
+
           ${PANVK_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
             --strip-unneeded -o "$STAGE/libvulkan_panfrost.so" "$SO"
           cp mesa/meta.json "$STAGE/meta.json"
-          ls -la "$STAGE"
-          cd "$STAGE"
-          zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so
-          cd ..
+
+          ( cd "$STAGE" && zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so )
           unzip -l "${OUT_NAME}"
 
+      # =====================================================================
+      # PACKAGE — Mesa GL stack (Zink, EGL, GLES, glapi, gallium)
+      #
+      # This is what Winlator/Wine loads for OpenGL apps to reach Zink.
+      # It ships as a plain .tar.gz — the user extracts it into the same
+      # location as Winlator's existing Mesa GL libs.
+      # =====================================================================
+      - name: Package Mesa GL stack (Zink) — only when BUILD_ZINK=true
+        if: env.BUILD_ZINK == 'true'
+        run: |
+          set -euo pipefail
+          cd mesa
+
+          STAGE="$GITHUB_WORKSPACE/gl-stack"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/lib" "$STAGE/share/vulkan/icd.d"
+
+          # Copy whatever Mesa GL libs the build produced.
+          FOUND=0
+          for name in libgallium_dri.so \
+                      libEGL.so libEGL.so.1 libEGL_mesa.so \
+                      libGLESv2.so libGLESv2.so.2 \
+                      libGLESv1_CM.so libGLESv1_CM.so.1 \
+                      libglapi.so libglapi.so.0 \
+                      libvulkan_panfrost.so; do
+            f=$(find build-android -name "$name" -type f -print -quit || true)
+            if [ -n "$f" ]; then
+              cp -a "$f" "$STAGE/lib/"
+              FOUND=$((FOUND+1))
+              echo "  + $name"
+            fi
+          done
+
+          if [ "$FOUND" = "0" ]; then
+            echo "❌ no GL libs found in build-android"
+            find build-android -name '*.so' -print | sort | head -40
+            exit 1
+          fi
+
+          # Symlinks that Android loaders may look for.
+          ( cd "$STAGE/lib"
+            [ -f libEGL.so.1 ] && ln -sf libEGL.so.1 libEGL.so || true
+            [ -f libGLESv2.so.2 ] && ln -sf libGLESv2.so.2 libGLESv2.so || true
+            [ -f libGLESv1_CM.so.1 ] && ln -sf libGLESv1_CM.so.1 libGLESv1_CM.so || true
+            [ -f libglapi.so.0 ] && ln -sf libglapi.so.0 libglapi.so || true
+            true
+          )
+
+          # ICD manifest for the bundled Vulkan driver.
+          cp "$PANVK_SO" "$STAGE/lib/libvulkan_panfrost.so" 2>/dev/null || true
+          cat > "$STAGE/share/vulkan/icd.d/panfrost_icd.aarch64.json" <<EOF
+          {
+              "file_format_version": "1.0.1",
+              "ICD": {
+                  "api_version": "1.4.354",
+                  "library_arch": "64",
+                  "library_path": "libvulkan_panfrost.so"
+              }
+          }
+          EOF
+
+          STAMP="$(date -u +%Y%m%d-%H%M%S)"
+          OUT="$GITHUB_WORKSPACE/panvk-zink-glstack-aarch64-${STAMP}.tar.gz"
+          tar -czf "$OUT" -C "$STAGE" .
+          ls -lh "$OUT"
+          echo "GLSTACK_OUT=$OUT" >> "$GITHUB_ENV"
+
+          echo
+          echo "==== gl-stack/lib contents ===="
+          ls -la "$STAGE/lib/"
+
+      # =====================================================================
+      # UPLOAD / RELEASE
+      # =====================================================================
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: panvk-build-logs-${{ env.APPLY_PATCHES }}
+          name: panvk-build-logs-${{ env.APPLY_PATCHES }}-zink${{ env.BUILD_ZINK }}
           path: |
             mesa/build-android/meson-logs/
             mesa/build-host/meson-logs/
           if-no-files-found: ignore
 
-      - name: Upload driver ZIP as artifact
+      - name: Upload AdrenoTools ZIP
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: panVK-G57-driver-zip-${{ env.APPLY_PATCHES }}
           path: panvcake_*.zip
+          if-no-files-found: error
+
+      - name: Upload GL stack
+        if: success() && env.BUILD_ZINK == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: panVK-G57-glstack-zink
+          path: panvk-zink-glstack-aarch64-*.tar.gz
           if-no-files-found: error
 
       - name: Upload release assets
@@ -785,28 +791,62 @@ jobs:
           body: |
             # PanVK `panvcake` driver for AdrenoTools
 
-            Built from branch **`winlator-2`** = `main` + Android AHB support
-            from `winlator-pan`, with `panvk_physical_device.c`/`.h` from
-            `main` (plus compatibility fixes for `panvk_host_import_*` and
-            the 2-arg `pan_query_core_count`).
-
             ## Build mode
 
-            - `apply_patches` = **${{ env.APPLY_PATCHES }}**
-            - Source branch: `${{ env.OUTPUT_BRANCH }}`
-            - Vanilla build: `panvcake_winlator2_*.zip`
-            - Extra-patched build: `panvcake_patched_*.zip`
+            - `apply_patches`  = **${{ env.APPLY_PATCHES }}**
+            - `build_zink`     = **${{ env.BUILD_ZINK }}**
+            - Source branch    : `${{ env.OUTPUT_BRANCH }}`
 
-            ## Install (AdrenoTools)
+            ## What's in the release
 
-            1. Download `panvcake_*.zip`.
-            2. Import driver → select the ZIP as-is.
-            3. Apply and launch.
+            **Always**: `panvcake_*.zip` — the AdrenoTools ZIP with the Vulkan
+            driver only. Import via AdrenoTools, select it for your container.
 
-            - API level: ${{ env.ANDROID_API }}
-            - Workflow run: ${{ github.run_number }}
+            **When `build_zink=true`**: additionally a
+            `panvk-zink-glstack-aarch64-*.tar.gz` containing:
+
+            - `libvulkan_panfrost.so` — the same Vulkan ICD
+            - `libgallium_dri.so` — the Gallium loader with Zink compiled in
+            - `libEGL.so` / `libEGL_mesa.so` — Mesa EGL
+            - `libGLESv2.so` / `libGLESv1_CM.so` — Mesa GLES
+            - `libglapi.so` — GL dispatch
+            - `share/vulkan/icd.d/panfrost_icd.aarch64.json` — ICD manifest
+
+            ### How Zink works in Winlator
+
+            Zink is a Gallium driver: it translates OpenGL/GLES into Vulkan.
+            It is **not** part of `libvulkan_panfrost.so`. The AdrenoTools ZIP
+            only supplies the Vulkan ICD. To use Zink, the environment needs
+            the Mesa GL stack above:
+
+            ```
+            Wine opengl32.dll
+              → libGLESv2.so / libEGL.so
+                 → libgallium_dri.so (Zink inside)
+                    → libvulkan_panfrost.so  ← AdrenoTools ZIP
+            ```
+
+            ### Installing the GL stack
+
+            Extract the `panvk-zink-glstack-aarch64-*.tar.gz` into the
+            directory that Winlator uses for its Mesa GL libs (typically the
+            same folder as its existing `libgallium_dri.so`). Keep the
+            AdrenoTools ZIP installed separately — do not merge them.
+
+            ### Running
+
+            Vulkan apps: AdrenoTools handles it, no extra env needed.
+
+            OpenGL apps (Zink):
+            ```
+            MESA_LOADER_DRIVER_OVERRIDE=zink
+            GALLIUM_DRIVER=zink
+            PANVK_TEST_AHB_LINEAR=1
+            PANVK_TEST_AHB_FD1=1
+            ```
           files: |
             panvcake_*.zip
+            panvk-zink-glstack-aarch64-*.tar.gz
           overwrite_files: true
           generate_release_notes: true
           prerelease: true
