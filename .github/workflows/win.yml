@@ -1,0 +1,721 @@
+name: Build PanVK hybrid
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_patches:
+        description: 'Apply extra PanVK/AHB patches on top (uncheck to build as-is)'
+        type: boolean
+        required: true
+        default: false
+      tag:
+        description: 'Release tag to create or update'
+        required: true
+        default: 'panvk-hyb'
+      api_override:
+        description: 'Vulkan API override (leave empty to keep as-is)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    env:
+      NDK_VERSION: 'r28c'
+      ANDROID_API: '33'
+      CACHE_FILE: 'ci-cache/host-tools.tar.gz'
+      APPLY_PATCHES: ${{ github.event.inputs.apply_patches }}
+
+      BASE_BRANCH: main
+      REFERENCE_BRANCH: winlator-pan
+      OUTPUT_BRANCH: winlator-2
+
+    steps:
+      - name: Install host build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build cmake pkgconf bison flex ripgrep \
+            clang-19 llvm-19-dev libclang-19-dev libclang-cpp19-dev \
+            libclc-19 libclc-19-dev libllvmspirvlib-19-dev \
+            libdrm-dev zlib1g-dev \
+            patchelf curl ca-certificates zip wget
+          python3 -m venv .ci-python
+          .ci-python/bin/pip install \
+            meson==1.8.3 Mako==1.3.10 packaging==25.0 PyYAML==6.0.2 ply==3.11
+          echo "$GITHUB_WORKSPACE/.ci-python/bin" >> "$GITHUB_PATH"
+          echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+
+      - name: Download Android NDK ${NDK_VERSION}
+        run: |
+          set -euo pipefail
+          NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+          wget -q "https://dl.google.com/android/repository/${NDK_ZIP}"
+          unzip -q "${NDK_ZIP}" -d /opt
+          echo "PANVK_NDK=/opt/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+          test -x "/opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang"
+
+      # =====================================================================
+      # PREPARATION
+      #
+      #   base      = this repo @ main
+      #   reference = this repo @ winlator-pan
+      #
+      # 1. Print diff main..winlator-pan (informational, saved as artifact).
+      # 2. Create branch winlator-2 starting from main.
+      # 3. Overlay only the AHB / Android-support paths from winlator-pan.
+      # 4. Commit winlator-2 and push it.
+      #
+      # Result: winlator-2 = main + Android AHB support files, nothing else.
+      # =====================================================================
+
+      - name: Checkout base branch (main) into mesa/
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          path: mesa
+          fetch-depth: 0
+
+      - name: Checkout reference branch (winlator-pan) into reference/
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REFERENCE_BRANCH }}
+          path: reference
+          fetch-depth: 1
+
+      - name: Report branch SHAs
+        run: |
+          echo "BASE_BRANCH      = ${{ env.BASE_BRANCH }}"
+          echo "REFERENCE_BRANCH = ${{ env.REFERENCE_BRANCH }}"
+          echo "OUTPUT_BRANCH    = ${{ env.OUTPUT_BRANCH }}"
+          echo
+          echo "=== mesa/ (base) ==="
+          git -C mesa --no-pager log -1 --oneline
+          echo
+          echo "=== reference/ (winlator-pan) ==="
+          git -C reference --no-pager log -1 --oneline
+
+      - name: Compute diff main..winlator-pan
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+
+          # Fetch the winlator-pan branch into this repo so we can diff / checkout by ref
+          git fetch origin "${{ env.REFERENCE_BRANCH }}:refs/remotes/origin/${{ env.REFERENCE_BRANCH }}"
+
+          echo "=== diff --stat: ${{ env.BASE_BRANCH }}..${{ env.REFERENCE_BRANCH }} ==="
+          git --no-pager diff --stat "${{ env.BASE_BRANCH }}..origin/${{ env.REFERENCE_BRANCH }}" || true
+
+          echo
+          echo "=== full patch saved to $GITHUB_WORKSPACE/winlator-pan.patch ==="
+          git --no-pager diff "${{ env.BASE_BRANCH }}..origin/${{ env.REFERENCE_BRANCH }}" \
+            > "$GITHUB_WORKSPACE/winlator-pan.patch"
+          wc -l "$GITHUB_WORKSPACE/winlator-pan.patch"
+          ls -lh "$GITHUB_WORKSPACE/winlator-pan.patch"
+
+      - name: Create winlator-2 (main + AHB files from winlator-pan)
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+
+          # --- start from main ---
+          git checkout -B "${{ env.OUTPUT_BRANCH }}" "${{ env.BASE_BRANCH }}"
+
+          # --- KEEP list: files/paths that AHB + Android support needs ---
+          # Edit this list to change what comes over from winlator-pan.
+          # Directory entries bring the whole subtree.
+          KEEP_PATHS=(
+            # Android native buffer + Vulkan runtime glue
+            "include/vulkan/vk_android_native_buffer.h"
+            "src/vulkan/runtime/vk_android.c"
+            "src/vulkan/runtime/vk_android.h"
+            "src/vulkan/runtime/meson.build"
+            "src/vulkan/meson.build"
+
+            # Android HAL stubs (libhardware, libnativewindow, liblog, libsync)
+            "src/android_stub"
+
+            # PanVK Android glue
+            "src/panfrost/vulkan/panvk_android.c"
+            "src/panfrost/vulkan/panvk_android.h"
+            "src/panfrost/vulkan/panvk_android_hal_bridge.c"
+            "src/panfrost/vulkan/meson.build"
+            "src/panfrost/vulkan/panvk_instance.c"
+            "src/panfrost/vulkan/panvk_physical_device.c"
+            "src/panfrost/vulkan/panvk_wsi.c"
+
+            # PanVK JM (kbase) submission path
+            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c"
+            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c"
+
+            # u_gralloc helper (fd probing for AHB)
+            "src/util/u_gralloc"
+            "src/util/meson.build"
+
+            # top-level build config (for with_platform_android + panvk-use-kbase)
+            "meson.build"
+            "meson.options"
+          )
+
+          echo "=== KEEP list ==="
+          for p in "${KEEP_PATHS[@]}"; do
+            echo "  $p"
+          done
+          echo
+
+          # --- overlay each path from winlator-pan ---
+          for p in "${KEEP_PATHS[@]}"; do
+            if git cat-file -e "origin/${{ env.REFERENCE_BRANCH }}:$p" 2>/dev/null; then
+              echo "keeping: $p"
+              git checkout "origin/${{ env.REFERENCE_BRANCH }}" -- "$p"
+            else
+              echo "skip (not present in reference): $p"
+            fi
+          done
+
+          # --- diff summary: what winlator-2 actually changes vs main ---
+          echo
+          echo "=== diff --stat: ${{ env.BASE_BRANCH }}..${{ env.OUTPUT_BRANCH }} (staged) ==="
+          git --no-pager diff --cached --stat "${{ env.BASE_BRANCH }}" || true
+
+          echo
+          echo "=== full file list changed vs main ==="
+          git --no-pager diff --cached --name-status "${{ env.BASE_BRANCH }}" || true
+
+          # --- commit ---
+          if git diff --cached --quiet; then
+            echo "⚠️  winlator-2 has no changes vs main — KEEP list matched nothing"
+          else
+            git -c user.email="github-actions@users.noreply.github.com" \
+                -c user.name="github-actions" \
+                commit -m "ci: winlator-2 = main + AHB/android support files from ${{ env.REFERENCE_BRANCH }}"
+          fi
+
+      - name: Push winlator-2 to origin
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          git push origin "${{ env.OUTPUT_BRANCH }}" --force
+          echo "✔ pushed ${{ env.OUTPUT_BRANCH }}"
+
+      - name: Save diff patch as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: winlator-pan.diff
+          path: winlator-pan.patch
+          if-no-files-found: warn
+
+      - name: Report checked-out commit and patch mode
+        working-directory: mesa
+        run: |
+          echo "APPLY_PATCHES=${APPLY_PATCHES}"
+          echo "building from branch: ${{ env.OUTPUT_BRANCH }}"
+          git --no-pager log -1 --oneline
+          sha256sum src/panfrost/vulkan/meson.build
+          grep -n "shared_library" src/panfrost/vulkan/meson.build || true
+
+      # =====================================================================
+      # HOST-TOOLS CACHE
+      # =====================================================================
+      - name: Checkout cache repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref_name }}
+          path: ci-repo
+          fetch-depth: 1
+          token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Try restore host-tools from cache repo
+        id: cache
+        run: |
+          set -euo pipefail
+          FILE="$GITHUB_WORKSPACE/ci-repo/${{ env.CACHE_FILE }}"
+          if [ -f "$FILE" ]; then
+            echo "✔ cache found: $FILE"
+            tar -xzf "$FILE" -C "$GITHUB_WORKSPACE"
+            chmod -R +x "$GITHUB_WORKSPACE/host-bin" 2>/dev/null || true
+            ls -la "$GITHUB_WORKSPACE/host-bin" || true
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "✗ no cache — will build host tools from source"
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Export HOST_DEPS + PATH (cache hit)
+        if: steps.cache.outputs.hit == 'true'
+        run: |
+          echo "HOST_DEPS=$GITHUB_WORKSPACE/spirv-host/prefix" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
+
+      - name: Build SPIRV-Tools (host)
+        if: steps.cache.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          SDK_TAG=vulkan-sdk-1.4.309.0
+          WORK="$GITHUB_WORKSPACE/spirv-host"
+          HOST_DEPS="$WORK/prefix"
+          mkdir -p "$WORK"
+          git clone --depth 1 --branch "$SDK_TAG" \
+            https://github.com/KhronosGroup/SPIRV-Tools.git "$WORK/SPIRV-Tools"
+          git clone --depth 1 --branch "$SDK_TAG" \
+            https://github.com/KhronosGroup/SPIRV-Headers.git \
+            "$WORK/SPIRV-Tools/external/spirv-headers"
+          cmake -S "$WORK/SPIRV-Tools" -B "$WORK/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOST_DEPS" \
+            -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON
+          cmake --build "$WORK/build" --parallel 2
+          cmake --install "$WORK/build"
+          echo "HOST_DEPS=$HOST_DEPS" >> "$GITHUB_ENV"
+
+      - name: Configure host tools
+        if: steps.cache.outputs.hit != 'true'
+        working-directory: mesa
+        env:
+          CC: clang-19
+          CXX: clang++-19
+          LLVM_CONFIG: /usr/lib/llvm-19/bin/llvm-config
+          PKG_CONFIG_PATH: ${{ env.HOST_DEPS }}/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig
+          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
+        run: |
+          meson setup build-host \
+            --buildtype=release -Dbuild-tests=false \
+            -Dplatforms=[] -Dgallium-drivers=[] -Dvulkan-drivers=[] \
+            -Dtools=panfrost -Dprecomp-compiler=enabled \
+            -Dinstall-precomp-compiler=true -Dllvm=enabled \
+            -Dmesa-clc=enabled -Dinstall-mesa-clc=true
+
+      - name: Build host tools
+        if: steps.cache.outputs.hit != 'true'
+        working-directory: mesa
+        env:
+          CC: clang-19
+          CXX: clang++-19
+          LLVM_CONFIG: /usr/lib/llvm-19/bin/llvm-config
+          PKG_CONFIG_PATH: ${{ env.HOST_DEPS }}/lib/pkgconfig:/usr/lib/llvm-19/lib/pkgconfig
+          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
+        run: |
+          ninja -C build-host \
+            src/compiler/clc/mesa_clc \
+            src/compiler/spirv/vtn_bindgen2 \
+            src/panfrost/clc/panfrost_compile
+
+      - name: Stage host tools
+        if: steps.cache.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/host-bin"
+          for name in mesa_clc vtn_bindgen2 panfrost_compile; do
+            bin=$(find "$GITHUB_WORKSPACE/mesa/build-host" -type f -executable -name "$name" | head -n1)
+            [ -n "$bin" ] || { echo "❌ $name not found"; exit 1; }
+            dashed=$(echo "$name" | tr '_' '-')
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$name"
+            cp "$bin" "$GITHUB_WORKSPACE/host-bin/$dashed"
+          done
+          chmod -R +x "$GITHUB_WORKSPACE/host-bin"
+          echo "$GITHUB_WORKSPACE/host-bin" >> "$GITHUB_PATH"
+          echo "HOST_DEPS=$GITHUB_WORKSPACE/spirv-host/prefix" >> "$GITHUB_ENV"
+
+      - name: Upload host-tools to cache repo
+        if: steps.cache.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p ci-repo/ci-cache
+          tar -czf "ci-repo/${{ env.CACHE_FILE }}" spirv-host/prefix host-bin
+          ls -lh "ci-repo/${{ env.CACHE_FILE }}"
+          cd ci-repo
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name  "github-actions"
+          git add "${{ env.CACHE_FILE }}"
+          if git diff --cached --quiet; then
+            echo "no cache change"; exit 0
+          fi
+          git commit -m "ci: cache host-tools ($(date -u +%Y%m%d-%H%M%S))"
+          git push origin "HEAD:${{ github.ref_name }}" && echo "✔ pushed" || echo "⚠️ push failed"
+
+      # =====================================================================
+      # EXTRA SOURCE PATCHES — gated on apply_patches
+      # (leave this unchecked to build the raw winlator-2 branch)
+      # =====================================================================
+
+      - name: PATCH 1 — Revert vk_android_native_buffer.h
+        if: env.APPLY_PATCHES == 'true'
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          F="include/vulkan/vk_android_native_buffer.h"
+          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
+          python3 - "$F" <<'PY'
+          import sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          lines = src.splitlines(keepends=True)
+          patched = 0
+          out = []
+          for line in lines:
+              s = line.lstrip()
+              if (patched == 0 and s.startswith("#if")
+                      and "defined(__ANDROID__)" in line
+                      and "defined(ANDROID)"    in line
+                      and "&& 0"                in line):
+                  indent = line[:len(line) - len(s)]
+                  nl = "\n" if line.endswith("\n") else ""
+                  out.append(f"{indent}#if defined(__ANDROID__) || defined(ANDROID){nl}")
+                  patched += 1
+              else:
+                  out.append(line)
+          if patched:
+              open(p, "w", encoding="utf-8", newline="").write("".join(out))
+              print(f"✔ reverted {patched} line(s)")
+          else:
+              print("✔ already clean")
+          PY
+
+      - name: PATCH 2 — Force desktop vulkan.sym
+        if: env.APPLY_PATCHES == 'true'
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          F="src/vulkan/meson.build"
+          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
+          if ! grep -q "vulkan-android.sym" "$F"; then
+            echo "✔ already desktop vulkan.sym"; exit 0
+          fi
+          sed -i \
+            -e 's/vulkan-icd-android-symbols\.txt/vulkan-icd-symbols.txt/g' \
+            -e 's/vulkan-android\.sym/vulkan.sym/g' "$F"
+          echo "✔ replaced Android HAL symbol scheme with desktop vulkan.sym"
+
+      - name: PATCH 3 — Honest hw_get_module() stub
+        if: env.APPLY_PATCHES == 'true'
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          F="src/android_stub/hardware_stub.cpp"
+          [ -f "$F" ] || { echo "⚠️  not present"; exit 0; }
+          if grep -q "PATCH: honest stub" "$F"; then exit 0; fi
+          cat > "$F" <<'EOF'
+          /* PATCH: honest stub */
+          extern "C" {
+          struct hw_module_t;
+          int hw_get_module(const char *id, const struct hw_module_t **module)
+          {
+             (void)id;
+             *module = 0;
+             return -1;
+          }
+          }
+          EOF
+          echo "✔ rewrote $F"
+
+      - name: PATCH 4 — fd probe in vk_common_GetAndroidHardwareBufferPropertiesANDROID
+        if: env.APPLY_PATCHES == 'true'
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          F="src/vulkan/runtime/vk_android.c"
+          [ -f "$F" ] || { echo "⚠️  not found"; exit 0; }
+          if grep -q "PANVK_PATCHED_VK_ANDROID_FD_PROBE" "$F"; then exit 0; fi
+          python3 - "$F" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          pat = re.compile(
+              r'pProperties->allocationSize\s*=\s*lseek\(\s*handle->data\[0\]\s*,\s*0\s*,\s*SEEK_END\s*\);'
+          )
+          if not pat.search(src):
+              print("⚠️  lseek(data[0]) not found"); sys.exit(0)
+          src = pat.sub(
+              "/* PANVK_PATCHED_VK_ANDROID_FD_PROBE */\n"
+              "   int dma_buf_fd = handle->data[0];\n"
+              "   off_t dma_buf_size = lseek(dma_buf_fd, 0, SEEK_END);\n"
+              "   if (dma_buf_size <= 0) {\n"
+              "      for (int _i = 1; _i < handle->numFds; _i++) {\n"
+              "         off_t _sz = lseek(handle->data[_i], 0, SEEK_END);\n"
+              "         if (_sz > 0) { dma_buf_fd = handle->data[_i];\n"
+              "                        dma_buf_size = _sz; break; }\n"
+              "      }\n"
+              "   }\n"
+              "   pProperties->allocationSize = dma_buf_size;",
+              src, count=1,
+          )
+          src = src.replace(
+              "VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, handle->data[0],",
+              "VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dma_buf_fd,",
+              1,
+          )
+          open(p, "w", encoding="utf-8").write(src)
+          print("✔ patched vk_android.c fd probe")
+          PY
+
+      - name: PATCH 5 — u_gralloc_panvk_test.h fd probing
+        if: env.APPLY_PATCHES == 'true'
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          HDR="src/util/u_gralloc/u_gralloc_panvk_test.h"
+          [ -f "$HDR" ] || { echo "⚠️  not found"; exit 0; }
+          if grep -q "PANVK_PATCHED_FD_PROBE" "$HDR"; then exit 0; fi
+          cat > "$HDR" <<'HDR_EOF'
+          /* SPDX-License-Identifier: MIT */
+          #ifndef U_GRALLOC_PANVK_TEST_H
+          #define U_GRALLOC_PANVK_TEST_H
+          #include <cutils/native_handle.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include "util/log.h"
+          static inline int
+          u_gralloc_panvk_test_fd(const native_handle_t *handle, const char *where)
+          {
+             if (!handle || handle->numFds < 1) return -1;
+             int   best_fd   = -1;
+             off_t best_size = 0;
+             for (int i = 0; i < handle->numFds; i++) {
+                int   fd   = handle->data[i];
+                off_t size = lseek(fd, 0, SEEK_END);
+                if (size <= 0) continue;
+                if (size > best_size) { best_size = size; best_fd = fd; }
+             }
+             if (best_fd < 0) {
+                mesa_loge("AHBFD %s: no valid dma-buf in %d entries",
+                          where, handle->numFds);
+                return handle->data[0];
+             }
+             mesa_logi("AHBFD %s: selected fd=%d size=%lld",
+                       where, best_fd, (long long)best_size);
+             return best_fd;
+          }
+          #endif
+          HDR_EOF
+          echo "✔ rewrote $HDR"
+
+      - name: PATCH 6 — Guard panvk_android_hal_bridge out of Android builds
+        if: env.APPLY_PATCHES == 'true'
+        working-directory: mesa
+        run: |
+          set -euo pipefail
+          FILE="src/panfrost/vulkan/meson.build"
+          [ -f "$FILE" ] || { echo "⚠️  $FILE not found"; exit 0; }
+          python3 - "$FILE" <<'PY'
+          import sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          if "if not with_platform_android" in src and "panvk_android_hal_bridge" in src:
+              print("✔ already guarded"); sys.exit(0)
+          old = "panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')"
+          if old not in src:
+              print("⚠️  pattern not found, skipping"); sys.exit(0)
+          src = src.replace(
+              old,
+              "panvk_android_hal_bridge = []\n"
+              "if not with_platform_android\n"
+              "  panvk_android_hal_bridge = files('panvk_android_hal_bridge.c')\n"
+              "endif",
+              1,
+          )
+          open(p, "w", encoding="utf-8").write(src)
+          print("✔ guarded panvk_android_hal_bridge")
+          PY
+          echo "==== after ===="
+          grep -n -A4 'panvk_android_hal_bridge' "$FILE" | head -20
+
+      - name: PATCH SUMMARY
+        working-directory: mesa
+        run: |
+          echo "APPLY_PATCHES=${APPLY_PATCHES}"
+          echo "=== git diff --stat vs HEAD (winlator-2) ==="
+          git --no-pager diff --stat || true
+
+      - name: Override Vulkan API version (optional)
+        if: github.event.inputs.api_override != ''
+        working-directory: mesa
+        run: |
+          VER="${{ github.event.inputs.api_override }}"
+          DEVFILE="src/panfrost/vulkan/panvk_physical_device.c"
+          [ -f "$DEVFILE" ] || { echo "❌ $DEVFILE not found"; exit 1; }
+          sed -i "0,/VK_API_VERSION_[0-9_]*/s//VK_API_VERSION_${VER//\./_}/" "$DEVFILE" || true
+
+      # =====================================================================
+      # BUILD
+      # =====================================================================
+      - name: Create Meson cross file
+        run: |
+          set -euo pipefail
+          NDK_BIN="$PANVK_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          EMPTY_PKGCONFIG="$(mktemp -d)"
+          echo "PANVK_EMPTY_PKGCONFIG=$EMPTY_PKGCONFIG" >> "$GITHUB_ENV"
+          cat > "$GITHUB_WORKSPACE/android-aarch64.ini" <<EOF
+          [binaries]
+          c = '${NDK_BIN}/aarch64-linux-android${ANDROID_API}-clang'
+          cpp = '${NDK_BIN}/aarch64-linux-android${ANDROID_API}-clang++'
+          ar = '${NDK_BIN}/llvm-ar'
+          strip = '${NDK_BIN}/llvm-strip'
+          pkg-config = '/usr/bin/pkgconf'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8-a'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          pkg_config_libdir = ['${EMPTY_PKGCONFIG}']
+
+          [built-in options]
+          c_args = ['-fno-unwind-tables', '-fno-asynchronous-unwind-tables']
+          cpp_args = ['-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables']
+          cpp_link_args = ['-static-libstdc++']
+          pkg_config_path = []
+          EOF
+          cat "$GITHUB_WORKSPACE/android-aarch64.ini"
+
+      - name: Configure PanVK (Android)
+        working-directory: mesa
+        run: |
+          rm -rf build-android
+          PKG_CONFIG_PATH= meson setup build-android \
+            --cross-file "$GITHUB_WORKSPACE/android-aarch64.ini" \
+            --buildtype=release -Dbuild-tests=false \
+            -Dplatforms=android -Dplatform-sdk-version="$ANDROID_API" \
+            -Dandroid-stub=true -Dandroid-libbacktrace=disabled \
+            -Dandroid-libperfetto=disabled \
+            -Dvulkan-drivers=panfrost -Dgallium-drivers= \
+            -Dpanfrost-kmds=kbase,panthor -Dpanvk-use-kbase=true \
+            -Dpanfrost-rust=false -Dllvm=disabled \
+            -Dmesa-clc=system -Dprecomp-compiler=system \
+            -Dspirv-tools=disabled \
+            -Dglx=disabled -Dgbm=disabled -Dopengl=false \
+            -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
+            -Dshader-cache=disabled -Dxmlconfig=disabled -Dexpat=disabled \
+            -Dlibunwind=disabled -Dvalgrind=disabled \
+            -Dzlib=disabled -Dzstd=disabled \
+            -Dvideo-codecs= -Dperfetto=false -Dstrip=true -Dcpp_rtti=false \
+            --force-fallback-for=libdrm -Dallow-fallback-for=libdrm \
+            -Dlibdrm:default_library=static
+
+      - name: Build PanVK driver
+        working-directory: mesa
+        env:
+          PATH: ${{ github.workspace }}/host-bin:/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          LD_LIBRARY_PATH: ${{ env.HOST_DEPS }}/lib
+        run: |
+          set -euo pipefail
+          meson compile -C build-android -j 2 vulkan_panfrost
+
+          echo
+          echo "==== locating .so ===="
+          SO=$(find build-android -name 'libvulkan_panfrost.so' -print -quit)
+          if [ -z "$SO" ]; then
+            echo "❌ libvulkan_panfrost.so not found"
+            find build-android -name '*.so*' -print | sort
+            exit 1
+          fi
+          REAL=$(readlink -f "$SO")
+          echo "✔ $SO -> $REAL"
+          ls -la "$REAL"
+          echo "PANVK_SO=$REAL" >> "$GITHUB_ENV"
+
+      - name: Verify driver
+        run: |
+          set -euo pipefail
+          SO="$PANVK_SO"
+          [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
+          echo "==== DT_NEEDED ===="
+          readelf -d "$SO" | grep NEEDED || true
+          echo
+          echo "==== vk_icdGetInstanceProcAddr exported? ===="
+          nm -D "$SO" 2>/dev/null | grep -i 'vk_icdGetInstanceProcAddr' || echo "❌ not exported"
+          echo
+          echo "==== AHBFD strings ===="
+          strings "$SO" | grep -i AHBFD || echo "(none)"
+          echo
+          echo "==== PANVKDBG strings ===="
+          strings "$SO" | grep -c PANVKDBG || true
+
+      - name: Package AdrenoTools driver ZIP
+        run: |
+          set -euo pipefail
+          SO="$PANVK_SO"
+          [ -f "$SO" ] || { echo "❌ $SO not found"; exit 1; }
+          if [ ! -f mesa/meta.json ]; then
+            echo "❌ meta.json missing at mesa/meta.json"; exit 1
+          fi
+          if [ "${APPLY_PATCHES}" = "true" ]; then
+            SUFFIX="patched"
+          else
+            SUFFIX="winlator2"
+          fi
+          OUT_NAME="panvcake_${SUFFIX}_26.3.0.R2.zip"
+          STAGE="adreno-driver"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          ${PANVK_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
+            --strip-unneeded -o "$STAGE/libvulkan_panfrost.so" "$SO"
+          cp mesa/meta.json "$STAGE/meta.json"
+          ls -la "$STAGE"
+          cd "$STAGE"
+          zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so
+          cd ..
+          unzip -l "${OUT_NAME}"
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-build-logs-${{ env.APPLY_PATCHES }}
+          path: |
+            mesa/build-android/meson-logs/
+            mesa/build-host/meson-logs/
+          if-no-files-found: ignore
+
+      - name: Upload driver ZIP as artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: panVK-G57-driver-zip-${{ env.APPLY_PATCHES }}
+          path: panvcake_*.zip
+          if-no-files-found: error
+
+      - name: Upload release assets
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          body: |
+            # PanVK `panvcake` driver for AdrenoTools
+
+            Built from branch **`winlator-2`** = `main` + Android AHB support
+            files cherry-picked from `winlator-pan`.
+
+            ## Build mode
+
+            - `apply_patches` = **${{ env.APPLY_PATCHES }}**
+            - Source branch: `${{ env.OUTPUT_BRANCH }}` (pushed to origin)
+            - Vanilla build: `panvcake_winlator2_*.zip`
+            - Extra-patched build: `panvcake_patched_*.zip`
+
+            ## Install (AdrenoTools)
+
+            1. Download `panvcake_*.zip`.
+            2. Import driver → select the ZIP as-is.
+            3. Apply and launch.
+
+            - API level: ${{ env.ANDROID_API }}
+            - Workflow run: ${{ github.run_number }}
+          files: |
+            panvcake_*.zip
+          overwrite_files: true
+          generate_release_notes: true
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
