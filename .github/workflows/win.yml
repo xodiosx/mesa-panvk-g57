@@ -150,9 +150,9 @@ jobs:
             "src/panfrost/vulkan/panvk_physical_device.c"
             "src/panfrost/vulkan/panvk_wsi.c"
 
-            # PanVK JM (kbase) submission path
-            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c"
-            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c"
+            # PanVK JM (kbase) submission path — whole directory so headers
+            # like panvk_vX_gpu_queue_kbase.h come along too
+            "src/panfrost/vulkan/jm"
 
             # u_gralloc helper (fd probing for AHB)
             "src/util/u_gralloc"
