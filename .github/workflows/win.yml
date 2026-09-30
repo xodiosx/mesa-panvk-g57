@@ -62,17 +62,7 @@ jobs:
           test -x "/opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang"
 
       # =====================================================================
-      # PREPARATION
-      #
-      #   base      = this repo @ main
-      #   reference = this repo @ winlator-pan
-      #
-      # 1. Print diff main..winlator-pan (informational, saved as artifact).
-      # 2. Create branch winlator-2 starting from main.
-      # 3. Overlay only the AHB / Android-support paths from winlator-pan.
-      # 4. Commit winlator-2 and push it.
-      #
-      # Result: winlator-2 = main + Android AHB support files, nothing else.
+      # PREPARATION — base = main, reference = winlator-pan, output = winlator-2
       # =====================================================================
 
       - name: Checkout base branch (main) into mesa/
@@ -105,8 +95,6 @@ jobs:
         working-directory: mesa
         run: |
           set -euo pipefail
-
-          # Fetch the winlator-pan branch into this repo so we can diff / checkout by ref
           git fetch origin "${{ env.REFERENCE_BRANCH }}:refs/remotes/origin/${{ env.REFERENCE_BRANCH }}"
 
           echo "=== diff --stat: ${{ env.BASE_BRANCH }}..${{ env.REFERENCE_BRANCH }} ==="
@@ -119,57 +107,46 @@ jobs:
           wc -l "$GITHUB_WORKSPACE/winlator-pan.patch"
           ls -lh "$GITHUB_WORKSPACE/winlator-pan.patch"
 
-      - name: Create winlator-2 (main + AHB files from winlator-pan)
+      - name: Create winlator-2 (main + AHB from winlator-pan, some files restored to main)
         working-directory: mesa
         run: |
           set -euo pipefail
 
-          # --- start from main ---
           git checkout -B "${{ env.OUTPUT_BRANCH }}" "${{ env.BASE_BRANCH }}"
 
-          # --- KEEP list: files/paths that AHB + Android support needs ---
-          # Edit this list to change what comes over from winlator-pan.
-          # Directory entries bring the whole subtree.
+          # --- KEEP: overlay these whole subtrees from winlator-pan ---
           KEEP_PATHS=(
-            # Android native buffer + Vulkan runtime glue
             "include/vulkan/vk_android_native_buffer.h"
-            "src/vulkan/runtime/vk_android.c"
-            "src/vulkan/runtime/vk_android.h"
-            "src/vulkan/runtime/meson.build"
-            "src/vulkan/meson.build"
-
-            # Android HAL stubs (libhardware, libnativewindow, liblog, libsync)
             "src/android_stub"
-
-            # PanVK Android glue
-            "src/panfrost/vulkan/panvk_android.c"
-            "src/panfrost/vulkan/panvk_android.h"
-            "src/panfrost/vulkan/panvk_android_hal_bridge.c"
-            "src/panfrost/vulkan/meson.build"
-            "src/panfrost/vulkan/panvk_instance.c"
-            "src/panfrost/vulkan/panvk_physical_device.c"
-            "src/panfrost/vulkan/panvk_wsi.c"
-
-            # PanVK JM (kbase) submission path — whole directory so headers
-            # like panvk_vX_gpu_queue_kbase.h come along too
-            "src/panfrost/vulkan/jm"
-
-            # u_gralloc helper (fd probing for AHB)
+            "src/panfrost"
+            "src/vulkan/runtime"
+            "src/vulkan/wsi"
+            "src/vulkan/meson.build"
+            "src/gallium/drivers/panfrost"
+            "src/gallium/drivers/zink"
             "src/util/u_gralloc"
             "src/util/meson.build"
-
-            # top-level build config (for with_platform_android + panvk-use-kbase)
             "meson.build"
             "meson.options"
           )
 
-          echo "=== KEEP list ==="
-          for p in "${KEEP_PATHS[@]}"; do
-            echo "  $p"
-          done
+          # --- RESTORE FROM MAIN: after overlaying, put these back to main ---
+          # Files the user wants as the main branch's version.
+          RESTORE_FROM_MAIN=(
+            "src/panfrost/vulkan/panvk_physical_device.c"
+            "src/panfrost/vulkan/panvk_physical_device.h"
+            # Uncomment if AHB turns out not to need the fork's pan_props change:
+            # "src/panfrost/lib/pan_props.c"
+            # "src/panfrost/lib/pan_props.h"
+          )
+
+          echo "=== KEEP list (from ${{ env.REFERENCE_BRANCH }}) ==="
+          for p in "${KEEP_PATHS[@]}"; do echo "  $p"; done
+          echo
+          echo "=== RESTORE list (from ${{ env.BASE_BRANCH }}) ==="
+          for p in "${RESTORE_FROM_MAIN[@]}"; do echo "  $p"; done
           echo
 
-          # --- overlay each path from winlator-pan ---
           for p in "${KEEP_PATHS[@]}"; do
             if git cat-file -e "origin/${{ env.REFERENCE_BRANCH }}:$p" 2>/dev/null; then
               echo "keeping: $p"
@@ -179,7 +156,15 @@ jobs:
             fi
           done
 
-          # --- diff summary: what winlator-2 actually changes vs main ---
+          for p in "${RESTORE_FROM_MAIN[@]}"; do
+            if git cat-file -e "${{ env.BASE_BRANCH }}:$p" 2>/dev/null; then
+              echo "restoring from main: $p"
+              git checkout "${{ env.BASE_BRANCH }}" -- "$p"
+            else
+              echo "skip (not present in main): $p"
+            fi
+          done
+
           echo
           echo "=== diff --stat: ${{ env.BASE_BRANCH }}..${{ env.OUTPUT_BRANCH }} (staged) ==="
           git --no-pager diff --cached --stat "${{ env.BASE_BRANCH }}" || true
@@ -188,7 +173,6 @@ jobs:
           echo "=== full file list changed vs main ==="
           git --no-pager diff --cached --name-status "${{ env.BASE_BRANCH }}" || true
 
-          # --- commit ---
           if git diff --cached --quiet; then
             echo "⚠️  winlator-2 has no changes vs main — KEEP list matched nothing"
           else
@@ -343,7 +327,6 @@ jobs:
 
       # =====================================================================
       # EXTRA SOURCE PATCHES — gated on apply_patches
-      # (leave this unchecked to build the raw winlator-2 branch)
       # =====================================================================
 
       - name: PATCH 1 — Revert vk_android_native_buffer.h
@@ -695,12 +678,12 @@ jobs:
             # PanVK `panvcake` driver for AdrenoTools
 
             Built from branch **`winlator-2`** = `main` + Android AHB support
-            files cherry-picked from `winlator-pan`.
+            files from `winlator-pan`, with select files restored to main.
 
             ## Build mode
 
             - `apply_patches` = **${{ env.APPLY_PATCHES }}**
-            - Source branch: `${{ env.OUTPUT_BRANCH }}` (pushed to origin)
+            - Source branch: `${{ env.OUTPUT_BRANCH }}`
             - Vanilla build: `panvcake_winlator2_*.zip`
             - Extra-patched build: `panvcake_patched_*.zip`
 
