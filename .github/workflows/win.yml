@@ -107,14 +107,16 @@ jobs:
           wc -l "$GITHUB_WORKSPACE/winlator-pan.patch"
           ls -lh "$GITHUB_WORKSPACE/winlator-pan.patch"
 
-      - name: Create winlator-2 (main + AHB from winlator-pan, some files restored to main)
+      - name: Create winlator-2 (main + AHB from winlator-pan + fixes)
         working-directory: mesa
         run: |
           set -euo pipefail
 
           git checkout -B "${{ env.OUTPUT_BRANCH }}" "${{ env.BASE_BRANCH }}"
 
-          # --- KEEP: overlay these whole subtrees from winlator-pan ---
+          # ---------------------------------------------------------------
+          # KEEP: overlay these whole subtrees from winlator-pan
+          # ---------------------------------------------------------------
           KEEP_PATHS=(
             "include/vulkan/vk_android_native_buffer.h"
             "src/android_stub"
@@ -130,14 +132,12 @@ jobs:
             "meson.options"
           )
 
-          # --- RESTORE FROM MAIN: after overlaying, put these back to main ---
-          # Files the user wants as the main branch's version.
+          # ---------------------------------------------------------------
+          # RESTORE FROM MAIN: after overlay, put these back to main
+          # ---------------------------------------------------------------
           RESTORE_FROM_MAIN=(
             "src/panfrost/vulkan/panvk_physical_device.c"
             "src/panfrost/vulkan/panvk_physical_device.h"
-            # Uncomment if AHB turns out not to need the fork's pan_props change:
-            # "src/panfrost/lib/pan_props.c"
-            # "src/panfrost/lib/pan_props.h"
           )
 
           echo "=== KEEP list (from ${{ env.REFERENCE_BRANCH }}) ==="
@@ -165,6 +165,116 @@ jobs:
             fi
           done
 
+          # ---------------------------------------------------------------
+          # FIXUP 1: main's panvk_physical_device.h is missing the two
+          # inline helpers that winlator-pan's other files call:
+          #   panvk_host_import_enabled
+          #   panvk_host_import_memory_types
+          # Add them so panvk_vX_physical_device.c and panvk_device_memory.c
+          # (both from winlator-pan) compile.
+          # ---------------------------------------------------------------
+          echo
+          echo "=== FIXUP 1: add host_import helpers to main panvk_physical_device.h ==="
+          HDR="src/panfrost/vulkan/panvk_physical_device.h"
+          [ -f "$HDR" ] || { echo "❌ $HDR not found"; exit 1; }
+
+          python3 - "$HDR" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+
+          if "panvk_host_import_enabled" in src:
+              print("✔ helpers already present — skipping")
+              sys.exit(0)
+
+          # Ensure the required includes are present. Idempotent.
+          if '#include <stdlib.h>' not in src:
+              src = src.replace("#include <stdint.h>",
+                                "#include <stdint.h>\n#include <stdlib.h>",
+                                1)
+          if '#include <string.h>' not in src:
+              src = src.replace("#include <stdlib.h>",
+                                "#include <stdlib.h>\n#include <string.h>",
+                                1)
+          if '#include "pan_props.h"' not in src:
+              # Anchor on the existing lib/kmod include which both branches have
+              src = src.replace('#include "lib/kmod/pan_kmod.h"',
+                                '#include "lib/kmod/pan_kmod.h"\n#include "pan_props.h"',
+                                1)
+
+          helpers = (
+              "/* JM USER_BUFFER imports provide host-addressable memory for WoW64.\n"
+              " * Keep an explicit opt-out for regression comparisons. */\n"
+              "static inline bool\n"
+              "panvk_host_import_enabled(const struct panvk_physical_device *device)\n"
+              "{\n"
+              "   const char *value = getenv(\"PANVK_TEST_HOST_IMPORT\");\n"
+              "   return device->kbase_node_path[0] &&\n"
+              "          pan_arch(device->kmod.dev->props.gpu_id) < 10 &&\n"
+              "          (!value || strcmp(value, \"0\") != 0);\n"
+              "}\n"
+              "\n"
+              "static inline uint32_t\n"
+              "panvk_host_import_memory_types(const struct panvk_physical_device *device)\n"
+              "{\n"
+              "   uint32_t bits = 0;\n"
+              "   for (uint32_t i = 0; i < device->memory.type_count; i++) {\n"
+              "      if (device->memory.types[i].propertyFlags &\n"
+              "          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)\n"
+              "         bits |= 1u << i;\n"
+              "   }\n"
+              "   return bits;\n"
+              "}\n"
+              "\n"
+          )
+
+          anchor = "void panvk_physical_device_finish(struct panvk_physical_device *device);"
+          if anchor not in src:
+              print("ERROR: anchor prototype not found", file=sys.stderr)
+              sys.exit(1)
+          src = src.replace(anchor, helpers + anchor, 1)
+
+          open(p, "w", encoding="utf-8").write(src)
+          print("✔ inserted panvk_host_import_enabled / panvk_host_import_memory_types")
+          PY
+
+          echo "==== confirm helpers present ===="
+          grep -n "panvk_host_import_enabled\|panvk_host_import_memory_types\|pan_props.h" "$HDR" || true
+
+          # ---------------------------------------------------------------
+          # FIXUP 2: main's panvk_physical_device.c calls the 1-arg form of
+          # pan_query_core_count, but the tree uses winlator-pan's pan_props.h
+          # which declares the 2-arg form.
+          # ---------------------------------------------------------------
+          echo
+          echo "=== FIXUP 2: 2-arg pan_query_core_count in main panvk_physical_device.c ==="
+          CDOT="src/panfrost/vulkan/panvk_physical_device.c"
+          [ -f "$CDOT" ] || { echo "❌ $CDOT not found"; exit 1; }
+
+          python3 - "$CDOT" <<'PY'
+          import sys
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+
+          needle = "pan_query_core_count(&device->kmod.dev->props)"
+          repl   = "pan_query_core_count(&device->kmod.dev->props, NULL)"
+
+          n = src.count(needle)
+          if n == 0:
+              print("✔ no 1-arg calls remain (already patched or different form)")
+              sys.exit(0)
+
+          src = src.replace(needle, repl)
+          open(p, "w", encoding="utf-8").write(src)
+          print(f"✔ patched {n} call site(s)")
+          PY
+
+          echo "==== confirm 2-arg calls ===="
+          grep -n "pan_query_core_count" "$CDOT" || true
+
+          # ---------------------------------------------------------------
+          # Show what the merge actually produced vs main
+          # ---------------------------------------------------------------
           echo
           echo "=== diff --stat: ${{ env.BASE_BRANCH }}..${{ env.OUTPUT_BRANCH }} (staged) ==="
           git --no-pager diff --cached --stat "${{ env.BASE_BRANCH }}" || true
@@ -178,7 +288,7 @@ jobs:
           else
             git -c user.email="github-actions@users.noreply.github.com" \
                 -c user.name="github-actions" \
-                commit -m "ci: winlator-2 = main + AHB/android support files from ${{ env.REFERENCE_BRANCH }}"
+                commit -m "ci: winlator-2 = main + AHB support from ${{ env.REFERENCE_BRANCH }} (main panvk_physical_device.c/.h + compat fixes)"
           fi
 
       - name: Push winlator-2 to origin
@@ -508,8 +618,6 @@ jobs:
           open(p, "w", encoding="utf-8").write(src)
           print("✔ guarded panvk_android_hal_bridge")
           PY
-          echo "==== after ===="
-          grep -n -A4 'panvk_android_hal_bridge' "$FILE" | head -20
 
       - name: PATCH SUMMARY
         working-directory: mesa
@@ -678,7 +786,9 @@ jobs:
             # PanVK `panvcake` driver for AdrenoTools
 
             Built from branch **`winlator-2`** = `main` + Android AHB support
-            files from `winlator-pan`, with select files restored to main.
+            from `winlator-pan`, with `panvk_physical_device.c`/`.h` from
+            `main` (plus compatibility fixes for `panvk_host_import_*` and
+            the 2-arg `pan_query_core_count`).
 
             ## Build mode
 
