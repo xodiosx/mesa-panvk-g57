@@ -113,6 +113,7 @@ jobs:
           KEEP_PATHS=(
             # --- Android HAL stubs ---
             "src/android_stub"
+            "include/android_stub/"
 
             # --- u_gralloc fd-probe helper (used by panvk_android.c) ---
             "src/util/u_gralloc"
