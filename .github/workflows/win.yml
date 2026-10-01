@@ -94,75 +94,119 @@ jobs:
             > "$GITHUB_WORKSPACE/winlator-pan.patch"
           wc -l "$GITHUB_WORKSPACE/winlator-pan.patch"
 
-      - name: Create winlator-2 (main + AHB from winlator-pan + fixes)
+      - name: Create winlator-2 (minimal diff vs main)
         working-directory: mesa
         run: |
           set -euo pipefail
 
           git checkout -B "${{ env.OUTPUT_BRANCH }}" "${{ env.BASE_BRANCH }}"
 
+          # -----------------------------------------------------------------
+          # KEEP: minimal set of files from winlator-pan required for
+          # Android AHB + kbase JM support. Everything NOT listed here stays
+          # exactly as main has it.
+          #
+          # Files that are unchanged between the two branches are NOT listed.
+          # Trace-only files (extra PANVKDBG fprintf) are NOT listed unless
+          # their code changes are functional.
+          # -----------------------------------------------------------------
           KEEP_PATHS=(
-            "include/vulkan/vk_android_native_buffer.h"
+            # --- Android HAL stubs ---
             "src/android_stub"
-            "src/vulkan/wsi"
-            "src/panfrost/vulkan/panvk_android_hal_bridge.c"
-            "src/panfrost/vulkan/panvk_wsi.c"
-            "src/panfrost/vulkan/panvk_wsi.h"
-            "src/vulkan/wsi/wsi_common.c"
-            "src/vulkan/wsi/wsi_common.h"
-            "src/vulkan/wsi/wsi_common_x11.c"
-            "src/vulkan/wsi/wsi_common_x11.h"
+
+            # --- u_gralloc fd-probe helper (used by panvk_android.c) ---
             "src/util/u_gralloc"
             "src/util/meson.build"
-            "meson.build"
-            "meson.options"
-          )
 
-          RESTORE_FROM_MAIN=(
-            "src/panfrost/vulkan/panvk_physical_device.c"
-            "src/panfrost/vulkan/panvk_physical_device.h"
-            "src/panfrost/lib/kmod/kbase_kmod.c"
-            "src/panfrost/lib/kmod/panfrost_kmod.c"
-            "src/gallium/drivers/panfrost/pan_device.c"
-            "src/gallium/drivers/panfrost/pan_screen.c"
-            "src/gallium/drivers/zink/zink_screen.c"
+            # --- PanVK Android entry points ---
+            "src/panfrost/vulkan/panvk_android.c"
+            "src/panfrost/vulkan/panvk_android.h"
+            "src/panfrost/vulkan/panvk_android_hal_bridge.c"
+            "src/panfrost/vulkan/panvk_wsi.c"
             "src/panfrost/vulkan/meson.build"
-            "src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c"
-            "src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c"
-            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c"
-            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c"
-            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h"
-            "src/vulkan/runtime/vk_device.c"
-            "src/vulkan/runtime/vk_meta_copy_fill_update.c"
-            "src/panfrost/perf/pan_perf.c"
+
+            # --- PanVK core files with functional AHB/kbase changes ---
             "src/panfrost/vulkan/panvk_device_memory.c"
             "src/panfrost/vulkan/panvk_image.c"
             "src/panfrost/vulkan/panvk_instance.c"
-            "src/panfrost/vulkan/panvk_physical_device.c"
-            "src/panfrost/vulkan/panvk_physical_device.h"
-            "src/panfrost/vulkan/panvk_vX_cmd_draw.c"
-            "src/panfrost/vulkan/panvk_vX_cmd_meta.c"
             "src/panfrost/vulkan/panvk_vX_device.c"
             "src/panfrost/vulkan/panvk_vX_physical_device.c"
+
+            # --- JM (kbase) submission path ---
+            "src/panfrost/vulkan/panvk_vX_cmd_buffer.c"
+            "src/panfrost/vulkan/panvk_vX_cmd_draw.c"
+            "src/panfrost/vulkan/panvk_vX_cmd_meta.c"
+            #"src/panfrost/vulkan/jm"
+
+            # --- Panfrost lib: kbase driver ---
+            #"src/panfrost/lib/kmod/kbase_kmod.c"
+
+            # --- 2-arg pan_query_core_count signature chain ---
+            # (all 5 callers + declaration + implementation must move together)
+            "src/panfrost/lib/pan_props.c"
+            "src/panfrost/lib/pan_props.h"
+            "src/panfrost/lib/kmod/panfrost_kmod.c"
+            "src/panfrost/perf/pan_perf.c"
+            "src/gallium/drivers/panfrost/pan_device.c"
+            "src/gallium/drivers/panfrost/pan_screen.c"
+
+            # --- Vulkan WSI (AHB swapchain, X11 DRI3 fixes) ---
+            "src/vulkan/wsi"
+
+            # --- Zink: name override + format-truncation fix ---
+            #"src/gallium/drivers/zink/zink_screen.c"
           )
+
+          # RESTORE_FROM_MAIN intentionally empty: we do not KEEP any
+          # directory that would require pulling individual files back
+          # to main. main's versions of panvk_physical_device.c/.h stay
+          # in place automatically.
+          RESTORE_FROM_MAIN=(
+
+          "src/panfrost/lib/kmod/kbase_kmod.c"
+          )
+
+          echo "=== KEEP list (from ${{ env.REFERENCE_BRANCH }}) ==="
+          for p in "${KEEP_PATHS[@]}"; do echo "  $p"; done
+          echo
+          echo "=== RESTORE list (from ${{ env.BASE_BRANCH }}) ==="
+          for p in "${RESTORE_FROM_MAIN[@]}"; do echo "  $p"; done
+          echo
 
           for p in "${KEEP_PATHS[@]}"; do
             if git cat-file -e "origin/${{ env.REFERENCE_BRANCH }}:$p" 2>/dev/null; then
+              echo "keeping: $p"
               git checkout "origin/${{ env.REFERENCE_BRANCH }}" -- "$p"
+            else
+              echo "skip (not present in reference): $p"
             fi
           done
           for p in "${RESTORE_FROM_MAIN[@]}"; do
-            git checkout "${{ env.BASE_BRANCH }}" -- "$p"
+            if git cat-file -e "${{ env.BASE_BRANCH }}:$p" 2>/dev/null; then
+              echo "restoring from main: $p"
+              git checkout "${{ env.BASE_BRANCH }}" -- "$p"
+            else
+              echo "skip (not present in main): $p"
+            fi
           done
 
+          # -----------------------------------------------------------------
+          # FIXUP 1: main's panvk_physical_device.h lacks the two helpers
+          # that winlator-pan's panvk_vX_physical_device.c and
+          # panvk_device_memory.c call.
+          # -----------------------------------------------------------------
+          echo
           echo "=== FIXUP 1: add host_import helpers to main panvk_physical_device.h ==="
           HDR="src/panfrost/vulkan/panvk_physical_device.h"
+          [ -f "$HDR" ] || { echo "❌ $HDR not found"; exit 1; }
+
           python3 - "$HDR" <<'PY'
           import sys
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
           if "panvk_host_import_enabled" in src:
-              print("✔ already present"); sys.exit(0)
+              print("✔ helpers already present — skipping")
+              sys.exit(0)
           if '#include <stdlib.h>' not in src:
               src = src.replace("#include <stdint.h>",
                                 "#include <stdint.h>\n#include <stdlib.h>", 1)
@@ -173,6 +217,8 @@ jobs:
               src = src.replace('#include "lib/kmod/pan_kmod.h"',
                                 '#include "lib/kmod/pan_kmod.h"\n#include "pan_props.h"', 1)
           helpers = (
+              "/* JM USER_BUFFER imports provide host-addressable memory for WoW64.\n"
+              " * Keep an explicit opt-out for regression comparisons. */\n"
               "static inline bool\n"
               "panvk_host_import_enabled(const struct panvk_physical_device *device)\n"
               "{\n"
@@ -199,8 +245,15 @@ jobs:
           print("✔ inserted helpers")
           PY
 
+          # -----------------------------------------------------------------
+          # FIXUP 2: main's panvk_physical_device.c calls the 1-arg form of
+          # pan_query_core_count, but pan_props.h now declares the 2-arg form.
+          # -----------------------------------------------------------------
+          echo
           echo "=== FIXUP 2: 2-arg pan_query_core_count in main panvk_physical_device.c ==="
           CDOT="src/panfrost/vulkan/panvk_physical_device.c"
+          [ -f "$CDOT" ] || { echo "❌ $CDOT not found"; exit 1; }
+
           python3 - "$CDOT" <<'PY'
           import sys
           p = sys.argv[1]
@@ -212,22 +265,23 @@ jobs:
           print(f"✔ patched {n} call site(s)")
           PY
 
-          # -------------------------------------------------------------
-          # FIXUP 3 (Zink-only): gallium/drivers/zink was overlaid from
-          # winlator-pan. Its meson.build must not clash with the fact
-          # that our build has -Dgallium-drivers=zink or =. It self-
-          # gates; nothing to do here. But the top-level meson.build
-          # that came from winlator-pan may set certain defaults we do
-          # not want; leave as-is and let -D flags override.
-          # -------------------------------------------------------------
+          # -----------------------------------------------------------------
+          # Show the diff vs main
+          # -----------------------------------------------------------------
+          echo
+          echo "=== diff --stat: ${{ env.BASE_BRANCH }}..${{ env.OUTPUT_BRANCH }} (staged) ==="
+          git --no-pager diff --cached --stat "${{ env.BASE_BRANCH }}" || true
 
-          git add -A
+          echo
+          echo "=== full file list changed vs main ==="
+          git --no-pager diff --cached --name-status "${{ env.BASE_BRANCH }}" || true
+
           if git diff --cached --quiet; then
-            echo "⚠️  no changes"
+            echo "⚠️  winlator-2 has no changes vs main — KEEP list matched nothing"
           else
             git -c user.email="github-actions@users.noreply.github.com" \
                 -c user.name="github-actions" \
-                commit -m "ci: winlator-2 merge ($(date -u +%Y%m%d-%H%M%S))"
+                commit -m "ci: winlator-2 = main + minimal AHB/kbase set from ${{ env.REFERENCE_BRANCH }}"
           fi
 
       - name: Push winlator-2 to origin
@@ -554,18 +608,6 @@ jobs:
           EOF
           cat "$GITHUB_WORKSPACE/android-aarch64.ini"
 
-      # ---------------------------------------------------------------
-      # When BUILD_ZINK=true we flip three things compared to the plain
-      # PanVK-only build:
-      #
-      #   -Dgallium-drivers=zink         (compile Zink)
-      #   -Dopengl=true -Dgles2=enabled  (build the GL APIs)
-      #   -Degl=enabled                  (build libEGL / libEGL_mesa)
-      #   + -Dshared-glapi=enabled
-      #
-      # Everything else stays as-is: same cross file, same -Dplatforms,
-      # same kbase/panthor, same zlib/zstd off.
-      # ---------------------------------------------------------------
       - name: Configure PanVK + optional Zink (Android)
         working-directory: mesa
         run: |
@@ -622,8 +664,6 @@ jobs:
           if [ "${BUILD_ZINK}" = "true" ]; then
             echo ">>> adding Zink + GL targets"
             TARGETS="$TARGETS gallium_dri"
-            # libEGL / libGLESv2 / libglapi live under specific target names;
-            # try each and ignore misses so older trees still build.
             EXTRA_EGL="libEGL libEGL_mesa libGLESv2 shared-glapi glapi"
           fi
 
@@ -687,7 +727,7 @@ jobs:
           fi
 
       # =====================================================================
-      # PACKAGE — AdrenoTools ZIP (Vulkan driver only)
+      # PACKAGE
       # =====================================================================
       - name: Package AdrenoTools driver ZIP
         run: |
@@ -708,14 +748,7 @@ jobs:
           ( cd "$STAGE" && zip -9 "../${OUT_NAME}" meta.json libvulkan_panfrost.so )
           unzip -l "${OUT_NAME}"
 
-      # =====================================================================
-      # PACKAGE — Mesa GL stack (Zink, EGL, GLES, glapi, gallium)
-      #
-      # This is what Winlator/Wine loads for OpenGL apps to reach Zink.
-      # It ships as a plain .tar.gz — the user extracts it into the same
-      # location as Winlator's existing Mesa GL libs.
-      # =====================================================================
-      - name: Package Mesa GL stack (Zink) — only when BUILD_ZINK=true
+      - name: Package Mesa GL stack (Zink)
         if: env.BUILD_ZINK == 'true'
         run: |
           set -euo pipefail
@@ -724,7 +757,6 @@ jobs:
           STAGE="$GITHUB_WORKSPACE/gl-stack"
           rm -rf "$STAGE"; mkdir -p "$STAGE/lib" "$STAGE/share/vulkan/icd.d"
 
-          # Copy whatever Mesa GL libs the build produced.
           FOUND=0
           for name in libgallium_dri.so \
                       libEGL.so libEGL.so.1 libEGL_mesa.so \
@@ -746,7 +778,6 @@ jobs:
             exit 1
           fi
 
-          # Symlinks that Android loaders may look for.
           ( cd "$STAGE/lib"
             [ -f libEGL.so.1 ] && ln -sf libEGL.so.1 libEGL.so || true
             [ -f libGLESv2.so.2 ] && ln -sf libGLESv2.so.2 libGLESv2.so || true
@@ -755,7 +786,6 @@ jobs:
             true
           )
 
-          # ICD manifest for the bundled Vulkan driver.
           cp "$PANVK_SO" "$STAGE/lib/libvulkan_panfrost.so" 2>/dev/null || true
           cat > "$STAGE/share/vulkan/icd.d/panfrost_icd.aarch64.json" <<EOF
           {
@@ -773,9 +803,6 @@ jobs:
           tar -czf "$OUT" -C "$STAGE" .
           ls -lh "$OUT"
           echo "GLSTACK_OUT=$OUT" >> "$GITHUB_ENV"
-
-          echo
-          echo "==== gl-stack/lib contents ===="
           ls -la "$STAGE/lib/"
 
       # =====================================================================
@@ -816,6 +843,9 @@ jobs:
           body: |
             # PanVK `panvcake` driver for AdrenoTools
 
+            Built from branch **`winlator-2`** = `main` + minimal AHB/kbase
+            file set from `winlator-pan`.
+
             ## Build mode
 
             - `apply_patches`  = **${{ env.APPLY_PATCHES }}**
@@ -824,45 +854,15 @@ jobs:
 
             ## What's in the release
 
-            **Always**: `panvcake_*.zip` — the AdrenoTools ZIP with the Vulkan
-            driver only. Import via AdrenoTools, select it for your container.
+            **Always**: `panvcake_*.zip` — AdrenoTools ZIP with the Vulkan ICD.
 
-            **When `build_zink=true`**: additionally a
-            `panvk-zink-glstack-aarch64-*.tar.gz` containing:
+            **When `build_zink=true`**: `panvk-zink-glstack-aarch64-*.tar.gz`
+            containing the Mesa GL stack (`libgallium_dri.so`, `libEGL*.so`,
+            `libGLESv2.so`, `libglapi.so`) plus a copy of the ICD. Extract
+            into Winlator's Mesa GL library folder.
 
-            - `libvulkan_panfrost.so` — the same Vulkan ICD
-            - `libgallium_dri.so` — the Gallium loader with Zink compiled in
-            - `libEGL.so` / `libEGL_mesa.so` — Mesa EGL
-            - `libGLESv2.so` / `libGLESv1_CM.so` — Mesa GLES
-            - `libglapi.so` — GL dispatch
-            - `share/vulkan/icd.d/panfrost_icd.aarch64.json` — ICD manifest
+            ### Running OpenGL (Zink)
 
-            ### How Zink works in Winlator
-
-            Zink is a Gallium driver: it translates OpenGL/GLES into Vulkan.
-            It is **not** part of `libvulkan_panfrost.so`. The AdrenoTools ZIP
-            only supplies the Vulkan ICD. To use Zink, the environment needs
-            the Mesa GL stack above:
-
-            ```
-            Wine opengl32.dll
-              → libGLESv2.so / libEGL.so
-                 → libgallium_dri.so (Zink inside)
-                    → libvulkan_panfrost.so  ← AdrenoTools ZIP
-            ```
-
-            ### Installing the GL stack
-
-            Extract the `panvk-zink-glstack-aarch64-*.tar.gz` into the
-            directory that Winlator uses for its Mesa GL libs (typically the
-            same folder as its existing `libgallium_dri.so`). Keep the
-            AdrenoTools ZIP installed separately — do not merge them.
-
-            ### Running
-
-            Vulkan apps: AdrenoTools handles it, no extra env needed.
-
-            OpenGL apps (Zink):
             ```
             MESA_LOADER_DRIVER_OVERRIDE=zink
             GALLIUM_DRIVER=zink
