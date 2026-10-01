@@ -1,4 +1,4 @@
-name: release PanVK + Zink for Termux (aarch64, native)
+name: release PanVKc + Zink for Termux (aarch64, native)
 
 on:
   push:
