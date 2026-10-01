@@ -127,7 +127,7 @@ jobs:
             "src/gallium/drivers/panfrost/pan_screen.c"
             "src/gallium/drivers/zink/zink_screen.c"
             "src/panfrost/vulkan/meson.build"
-            src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c"
+            "src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c"
             "src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c"
             "src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c"
             "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c"
@@ -141,7 +141,7 @@ jobs:
             "src/panfrost/vulkan/panvk_physical_device.c"
             "src/panfrost/vulkan/panvk_physical_device.h"
             "src/panfrost/vulkan/panvk_vX_cmd_draw.c"
-            "src/panfrost/vulkan/panvk_vX_cmd_meta.c*
+            "src/panfrost/vulkan/panvk_vX_cmd_meta.c"
             "src/panfrost/vulkan/panvk_vX_device.c"
             "src/panfrost/vulkan/panvk_vX_physical_device.c"
           )
