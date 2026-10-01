@@ -1,4 +1,4 @@
-name: release PanVKc + Zink for Termux (aarch64, native)
+name: release PanVKC + Zink for Termux native 
 
 on:
   push:
@@ -332,6 +332,7 @@ jobs:
             --exclude='.git/' \
             --exclude='.github/' \
             --exclude='docs/panvk_g57/' \
+            --exclude='meta.json' \
             --exclude='*.md' \
             --exclude='*.markdown' \
             --exclude='*.zip' \
@@ -381,21 +382,46 @@ jobs:
 
           if git diff --cached --quiet; then
             echo ">>> No source changes to commit."
-          else
-            echo "--- staged changes summary ---"
-            git diff --cached --stat | tail -40
-            echo "--- end summary ---"
-
-            BRANCH="${{ github.ref_name }}"
-            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-              BRANCH="main"
-            fi
-            echo ">>> force-pushing to branch: ${BRANCH}"
-
-            git commit -m "CI: sync patched Mesa tree from xodiosx/mesa-panvk-mali-g57@main ($(date -u +%Y%m%d-%H%M%S))"
-            git push --force origin "HEAD:refs/heads/${BRANCH}"
-            echo ">>> push succeeded"
+            exit 0
           fi
+
+          echo "--- staged changes summary ---"
+          git diff --cached --stat | tail -40
+          echo "--- end summary ---"
+
+          BRANCH="${{ github.ref_name }}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            BRANCH="main"
+          fi
+          echo ">>> target branch: ${BRANCH}"
+
+          git commit -m "CI: sync patched Mesa tree from xodiosx/mesa-panvk-mali-g57@main ($(date -u +%Y%m%d-%H%M%S))"
+
+          # Re-fetch immediately before pushing to refresh our view of
+          # the remote ref. Then push with a retry loop that also
+          # re-fetches on every failure. This handles races where
+          # something else (another workflow, a manual push, a bot)
+          # moves the branch between our checkout and our push.
+          git fetch origin "$BRANCH" || true
+
+          PUSH_OK=0
+          for attempt in 1 2 3 4 5; do
+            echo "=== push attempt ${attempt} ==="
+            if git push --force origin "HEAD:refs/heads/${BRANCH}"; then
+              PUSH_OK=1
+              break
+            fi
+            echo "push attempt ${attempt} failed; re-fetching and retrying..."
+            git fetch origin "$BRANCH" || true
+            sleep 5
+          done
+
+          if [[ "${PUSH_OK}" != "1" ]]; then
+            echo "ERROR: push failed after 5 attempts"
+            exit 1
+          fi
+
+          echo ">>> push succeeded"
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
@@ -775,8 +801,8 @@ jobs:
             # expect: driverName = Mesa PanVCake Mali-G57 Vulkan HAL
 
             glxinfo | grep -i "OpenGL renderer"
-            # Zink now reports whatever stock Mesa generates for its
-            # driver string — we no longer override it.
+            # Zink reports whatever stock Mesa generates for its driver
+            # string — no override is applied.
             ```
           files: |
             artifacts/*.tar.gz
