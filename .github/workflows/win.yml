@@ -105,15 +105,10 @@ jobs:
           # KEEP: minimal set of files from winlator-pan required for
           # Android AHB + kbase JM support. Everything NOT listed here stays
           # exactly as main has it.
-          #
-          # Files that are unchanged between the two branches are NOT listed.
-          # Trace-only files (extra PANVKDBG fprintf) are NOT listed unless
-          # their code changes are functional.
           # -----------------------------------------------------------------
           KEEP_PATHS=(
             # --- Android HAL stubs ---
             "src/android_stub"
-            "include/android_stub/"
 
             # --- u_gralloc fd-probe helper (used by panvk_android.c) ---
             "src/util/u_gralloc"
@@ -133,17 +128,17 @@ jobs:
             "src/panfrost/vulkan/panvk_vX_device.c"
             "src/panfrost/vulkan/panvk_vX_physical_device.c"
 
-            # --- JM (kbase) submission path ---
-            "src/panfrost/vulkan/panvk_vX_cmd_buffer.c"
+            # --- JM (kbase) submission path (whole directory) ---
+            "src/panfrost/vulkan/jm"
+
+            # --- top-level PanVK files with functional changes ---
             "src/panfrost/vulkan/panvk_vX_cmd_draw.c"
             "src/panfrost/vulkan/panvk_vX_cmd_meta.c"
-            #"src/panfrost/vulkan/jm"
 
             # --- Panfrost lib: kbase driver ---
-            #"src/panfrost/lib/kmod/kbase_kmod.c"
+            "src/panfrost/lib/kmod/kbase_kmod.c"
 
             # --- 2-arg pan_query_core_count signature chain ---
-            # (all 5 callers + declaration + implementation must move together)
             "src/panfrost/lib/pan_props.c"
             "src/panfrost/lib/pan_props.h"
             "src/panfrost/lib/kmod/panfrost_kmod.c"
@@ -155,16 +150,13 @@ jobs:
             "src/vulkan/wsi"
 
             # --- Zink: name override + format-truncation fix ---
-            #"src/gallium/drivers/zink/zink_screen.c"
+            "src/gallium/drivers/zink/zink_screen.c"
           )
 
-          # RESTORE_FROM_MAIN intentionally empty: we do not KEEP any
-          # directory that would require pulling individual files back
-          # to main. main's versions of panvk_physical_device.c/.h stay
-          # in place automatically.
-          RESTORE_FROM_MAIN=(
-          "src/panfrost/lib/kmod/kbase_kmod.c"
-          )
+          # Empty: nothing in KEEP is a directory we need to peel files back
+          # to main from. main's panvk_physical_device.c/.h stay in place
+          # automatically because their parent is not KEEP'd.
+          RESTORE_FROM_MAIN=()
 
           echo "=== KEEP list (from ${{ env.REFERENCE_BRANCH }}) ==="
           for p in "${KEEP_PATHS[@]}"; do echo "  $p"; done
@@ -310,37 +302,6 @@ jobs:
           fetch-depth: 1
           token: ${{ secrets.GH_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Revert vk_android_native_buffer.h (always)
-        working-directory: mesa
-        run: |
-         set -euo pipefail
-         F="include/vulkan/vk_android_native_buffer.h"
-         [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
-         python3 - "$F" <<'PY'
-         import sys
-         p = sys.argv[1]; src = open(p, encoding="utf-8").read()
-         lines = src.splitlines(keepends=True); patched = 0; out = []
-         for line in lines:
-             s = line.lstrip()
-             if (patched == 0 and s.startswith("#if")
-                and "defined(__ANDROID__)" in line
-                and "defined(ANDROID)"    in line
-                and "&& 0"                in line):
-                 indent = line[:len(line) - len(s)]
-                 nl = "\n" if line.endswith("\n") else ""
-                 out.append(f"{indent}#if defined(__ANDROID__) || defined(ANDROID){nl}")
-                 patched += 1
-              else:
-                 out.append(line)
-              if patched:
-             open(p, "w", encoding="utf-8", newline="").write("".join(out))
-         print(f"✔ reverted {patched} line(s)")
-         PY
-         echo "==== confirm no && 0 remains ===="
-         grep -n '&& 0' "$F" || echo "  (clean)"
-      
-      
-      
       - name: Try restore host-tools from cache repo
         id: cache
         run: |
@@ -446,15 +407,23 @@ jobs:
           git push origin "HEAD:${{ github.ref_name }}" || echo "⚠️ push failed"
 
       # =====================================================================
-      # EXTRA SOURCE PATCHES — gated on apply_patches
+      # MANDATORY FIXUP — always runs, not gated
+      #
+      # The repo's checked-in include/vulkan/vk_android_native_buffer.h has a
+      # `&& 0` that forces the fallback `typedef void *buffer_handle_t;`.
+      # android_stub/cutils/native_handle.h (reached via
+      # android_stub/vndk/hardware_buffer.h) defines the real
+      # `typedef const native_handle_t *buffer_handle_t;`.
+      # Both in the same TU → "typedef redefinition" error.
+      #
+      # Revert the `&& 0` so the real Android header is used.
       # =====================================================================
-
-      - name: PATCH 1 — Revert vk_android_native_buffer.h
-        if: env.APPLY_PATCHES == 'true'
+      - name: Revert vk_android_native_buffer.h stale &&0 guard (always)
         working-directory: mesa
         run: |
           set -euo pipefail
           F="include/vulkan/vk_android_native_buffer.h"
+          [ -f "$F" ] || { echo "❌ $F not found"; exit 1; }
           python3 - "$F" <<'PY'
           import sys
           p = sys.argv[1]; src = open(p, encoding="utf-8").read()
@@ -473,8 +442,16 @@ jobs:
                   out.append(line)
           if patched:
               open(p, "w", encoding="utf-8", newline="").write("".join(out))
-          print(f"✔ reverted {patched} line(s)")
+              print(f"✔ reverted {patched} line(s)")
+          else:
+              print("✔ already clean")
           PY
+          echo "==== confirm no && 0 remains ===="
+          grep -n '&& 0' "$F" || echo "  (clean)"
+
+      # =====================================================================
+      # EXTRA SOURCE PATCHES — gated on apply_patches
+      # =====================================================================
 
       - name: PATCH 2 — Force desktop vulkan.sym
         if: env.APPLY_PATCHES == 'true'
