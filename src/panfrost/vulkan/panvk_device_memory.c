@@ -5,12 +5,15 @@
 
 #include "genxml/decode.h"
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "vulkan/util/vk_util.h"
 
 #include "panvk_android.h"
 #include "panvk_device.h"
 #include "panvk_device_memory.h"
+#include "panvk_image.h"
 
 #if defined(HAVE_PAN_KMOD_KBASE)
 #include "lib/kmod/kbase_kmod.h"
@@ -22,6 +25,10 @@
 #include "util/u_atomic.h"
 #include "vk_debug_utils.h"
 #include "vk_log.h"
+
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#endif
 
 static void
 panvk_memory_emit_report(struct panvk_device *device,
@@ -63,6 +70,208 @@ panvk_memory_emit_report(struct panvk_device *device,
                                 mem->bo->size, VK_OBJECT_TYPE_DEVICE_MEMORY,
                                 (uintptr_t)(mem), heap_index);
 }
+
+#ifdef __ANDROID__
+/* AHB-backed WSI image memory (PANVK_AHB_WSI=1): allocate an Android
+ * Hardware Buffer for the swapchain image extent/format, import its dma-buf
+ * fd through the kbase UMM path, and hand back a BO that exports. Falls
+ * back to NULL (normal allocation) on anything unexpected: unsupported
+ * format, padded stride, size mismatch, missing symbols.
+ *
+ * Only RGBA8-family formats map 1:1 (sRGB variants share the memory layout).
+ * BGR swapchains fall back to the SHM path.
+ */
+#define PANVK_AHB_FORMAT_R8G8B8A8_UNORM 1
+#define PANVK_AHB_USAGE_GPU_SAMPLED_IMAGE (1UL << 8)
+#define PANVK_AHB_USAGE_GPU_FRAMEBUFFER (1UL << 9)
+
+struct panvk_ahb_desc {
+   uint32_t width, height, layers, format;
+   uint64_t usage;
+   uint32_t stride;
+};
+
+typedef struct {
+   int version, numFds, numInts;
+   int data[0];
+} panvk_ahb_handle_t;
+
+struct panvk_ahb_fns {
+   int (*allocate)(const void *, void **);
+   void (*describe)(const void *, void *);
+   const void *(*getNativeHandle)(const void *);
+   void (*release)(const void *);
+   bool ok;
+};
+
+static struct panvk_ahb_fns
+panvk_ahb_resolve(void)
+{
+   static struct panvk_ahb_fns fns = { 0 };
+   static void *libandroid = NULL;
+   static bool done = false;
+   if (done)
+      return fns;
+   done = true;
+   /* libandroid is not linked; load it explicitly (present on Android). */
+   libandroid = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+   if (!libandroid) {
+      (void)0;
+   }
+   if (libandroid) {
+      fns.allocate = dlsym(libandroid, "AHardwareBuffer_allocate");
+      fns.describe = dlsym(libandroid, "AHardwareBuffer_describe");
+      fns.getNativeHandle = dlsym(libandroid, "AHardwareBuffer_getNativeHandle");
+      fns.release = dlsym(libandroid, "AHardwareBuffer_release");
+   }
+   if (!fns.getNativeHandle) {
+      /* getNativeHandle lives in libnativewindow on-device, not in
+       * Termux's libandroid. */
+      void *nw = dlopen("/system/lib64/libnativewindow.so",
+                        RTLD_NOW | RTLD_LOCAL);
+      if (nw)
+         fns.getNativeHandle = dlsym(nw, "AHardwareBuffer_getNativeHandle");
+   }
+   if (!fns.allocate)
+      fns.allocate = dlsym(RTLD_DEFAULT, "AHardwareBuffer_allocate");
+   if (!fns.describe)
+      fns.describe = dlsym(RTLD_DEFAULT, "AHardwareBuffer_describe");
+   if (!fns.release)
+      fns.release = dlsym(RTLD_DEFAULT, "AHardwareBuffer_release");
+   if (!fns.getNativeHandle)
+      fns.getNativeHandle = dlsym(RTLD_DEFAULT, "AHardwareBuffer_getNativeHandle");
+   if (!fns.getNativeHandle) {
+      void *nw = dlopen("/system/lib64/libnativewindow.so",
+                        RTLD_NOW | RTLD_LOCAL);
+      if (nw)
+         fns.getNativeHandle = dlsym(nw, "AHardwareBuffer_getNativeHandle");
+   }
+   fns.ok = fns.allocate && fns.describe && fns.getNativeHandle && fns.release;
+   return fns;
+}
+
+/* Try to back a dedicated WSI image with an imported AHB dma-buf.
+ * Returns VK_SUCCESS with out params filled, or an error to fall back.
+ */
+static VkResult
+panvk_ahb_import_image(struct panvk_device *device, VkImage image,
+                       VkDeviceSize alloc_size, struct pan_kmod_bo **out_bo,
+                       void **out_ahb)
+{
+   VK_FROM_HANDLE(panvk_image, pimage, image);
+   uint32_t w = pimage->vk.extent.width;
+   uint32_t h = pimage->vk.extent.height;
+   (void)0;
+   if (pimage->vk.extent.depth != 1 || pimage->vk.mip_levels != 1 ||
+       pimage->vk.array_layers != 1 || w == 0 || h == 0)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   uint32_t ahb_fmt = 0;
+   /* R8G8B8A8 sRGB shares the memory layout (transfer is bytewise). BGR
+    * swapchains reuse the RGBA buffer: scanout presents raw bytes, so
+    * channel order is preserved end-to-end (no sampling reinterpretation
+    * on the present path). */
+   switch (pimage->vk.format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      ahb_fmt = PANVK_AHB_FORMAT_R8G8B8A8_UNORM;
+      break;
+   default:
+      (void)0;
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   struct panvk_ahb_fns fns = panvk_ahb_resolve();
+   if (!fns.ok) {
+      (void)0;
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   struct {
+      uint32_t width, height, layers, format;
+      uint64_t usage;
+      uint32_t stride, rfu0;
+      uint64_t rfu1;
+   } desc;
+   memset(&desc, 0, sizeof(desc));
+   desc.width = w;
+   desc.height = h;
+   desc.layers = 1;
+   desc.format = ahb_fmt;
+   desc.usage = PANVK_AHB_USAGE_GPU_FRAMEBUFFER | PANVK_AHB_USAGE_GPU_SAMPLED_IMAGE;
+
+   void *ahb = NULL;
+   if (fns.allocate(&desc, &ahb) || !ahb) {
+      (void)0;
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   struct {
+      uint32_t width, height, layers, format;
+      uint64_t usage;
+      uint32_t stride, rfu0;
+      uint64_t rfu1;
+   } out;
+   memset(&out, 0, sizeof(out));
+   fns.describe(ahb, &out);
+   if (out.stride != w) {
+      (void)0;
+      fns.release(ahb);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   const panvk_ahb_handle_t *nh = fns.getNativeHandle(ahb);
+   int dmabuf = -1;
+   if (nh) {
+      for (int i = 0; i < nh->numFds; i++) {
+         char path[64], target[128];
+         snprintf(path, sizeof(path), "/proc/self/fd/%d", nh->data[i]);
+         ssize_t len = readlink(path, target, sizeof(target) - 1);
+         if (len > 0) {
+            target[len] = 0;
+            if (strstr(target, "dmabuf")) {
+               dmabuf = nh->data[i];
+               break;
+            }
+         }
+      }
+   }
+   if (dmabuf < 0) {
+      (void)0;
+      fns.release(ahb);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   struct pan_kmod_bo *bo =
+      pan_kmod_bo_import(device->kmod.dev, dmabuf);
+   if (!bo) {
+      (void)0;
+      fns.release(ahb);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   if (pan_kmod_bo_size(bo) < alloc_size) {
+      (void)0;
+      pan_kmod_bo_put(bo);
+      fns.release(ahb);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   *out_bo = bo;
+   *out_ahb = ahb;
+   return VK_SUCCESS;
+}
+#else
+static VkResult
+panvk_ahb_import_image(struct panvk_device *dev, VkImage image,
+                       VkDeviceSize alloc_size, struct pan_kmod_bo **out_bo,
+                       void **out_ahb)
+{
+   return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+#endif
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_AllocateMemory(VkDevice _device,
@@ -169,6 +378,24 @@ panvk_AllocateMemory(VkDevice _device,
          bo_flags |= PAN_KMOD_BO_FLAG_WB_MMAP;
 
       bo_flags = panvk_device_adjust_bo_flags(device, bo_flags);
+#if defined(HAVE_PAN_KMOD_KBASE)
+      /* Exportable allocations (DMA_BUF/OPAQUE_FD) cannot use native kbase
+       * MEM_ALLOC BOs: those have no dma-buf and can never be exported.
+       * Allocate from the system dma-heap and import via UMM instead, so
+       * vkGetMemoryFdKHR works. Fail honestly when no dma-heap exists. */
+      if (can_be_exported && physical_device->kbase_node_path[0] &&
+          (export_info->handleTypes &
+           (VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT))) {
+         /* No dma-heap and no gralloc AHardwareBuffer -> ENOSYS inside. */
+         mem->bo = kbase_kmod_bo_alloc_exportable(
+            device->kmod.dev, pAllocateInfo->allocationSize, bo_flags);
+         if (!mem->bo) {
+            result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+            goto err_destroy_mem;
+         }
+      } else
+#endif
       mem->bo = pan_kmod_bo_alloc(device->kmod.dev,
                                   can_be_exported ? NULL : device->kmod.vm,
                                   pAllocateInfo->allocationSize, bo_flags);
@@ -177,6 +404,7 @@ panvk_AllocateMemory(VkDevice _device,
          goto err_destroy_mem;
       }
    }
+
 
    /* Always GPU-map at creation time. */
    struct pan_kmod_vm_op op = {
@@ -301,6 +529,9 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
    if (mem == NULL)
       return;
 
+   /* Async mode: the memory may still be in flight. */
+   panvk_kbase_async_drain_if_busy(device);
+
    struct panvk_physical_device *physical_device =
       to_panvk_physical_device(device->vk.physical);
 
@@ -349,8 +580,140 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
    panvk_memory_emit_report(device, mem, /* alloc_info */ NULL, VK_SUCCESS);
 
    pan_kmod_bo_put(mem->bo);
+#ifdef __ANDROID__
+   if (mem->ahb) {
+      static void (*release_fn)(const void *) = NULL;
+      static bool release_done = false;
+      if (!release_done) {
+         release_done = true;
+         release_fn = dlsym(RTLD_DEFAULT, "AHardwareBuffer_release");
+      }
+      if (release_fn)
+         release_fn(mem->ahb);
+      mem->ahb = NULL;
+   }
+#endif
    vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
 }
+
+/* WSI dma-buf blit-buffer hook (PANVK_AHB_WSI=1): back the present
+ * buffer with an imported AHB dma-buf. row_pitch_bytes is WSI's tight row
+ * length; the AHB stride must match it exactly (guaranteed for 4Bpp when
+ * optimalBufferCopyRowPitchAlignment is 256, verified below).
+ */
+VkResult
+panvk_create_dma_buf_buffer_mem(VkDevice _device, uint32_t w, uint32_t h,
+                                VkFormat format, VkDeviceSize size,
+                                uint32_t row_pitch_bytes,
+                                uint32_t memory_type_index,
+                                VkDeviceMemory *out_mem)
+{
+   VK_FROM_HANDLE(panvk_device, device, _device);
+   struct panvk_physical_device *physical_device =
+      to_panvk_physical_device(device->vk.physical);
+
+   if (!physical_device->kbase_node_path[0] || !getenv("PANVK_AHB_WSI"))
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   /* 4 bytes/pixel only (row math below assumes it). */
+   switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      break;
+   default:
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   if (w == 0 || h == 0)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   struct panvk_ahb_fns fns = panvk_ahb_resolve();
+   if (!fns.ok)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   struct {
+      uint32_t width, height, layers, format;
+      uint64_t usage;
+      uint32_t stride, rfu0;
+      uint64_t rfu1;
+   } desc;
+   memset(&desc, 0, sizeof(desc));
+   desc.width = w;
+   desc.height = h;
+   desc.layers = 1;
+   desc.format = PANVK_AHB_FORMAT_R8G8B8A8_UNORM;
+   desc.usage = PANVK_AHB_USAGE_GPU_FRAMEBUFFER | PANVK_AHB_USAGE_GPU_SAMPLED_IMAGE;
+
+   void *ahb = NULL;
+   if (fns.allocate(&desc, &ahb) || !ahb)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   struct {
+      uint32_t width, height, layers, format;
+      uint64_t usage;
+      uint32_t stride, rfu0;
+      uint64_t rfu1;
+   } out;
+   memset(&out, 0, sizeof(out));
+   fns.describe(ahb, &out);
+   if ((uint64_t)out.stride * 4 != (uint64_t)row_pitch_bytes) {
+      (void)0;
+      fns.release(ahb);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   if ((uint64_t)out.stride * 4 * h < (uint64_t)size) {
+      fns.release(ahb);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   const panvk_ahb_handle_t *nh = fns.getNativeHandle(ahb);
+   int dmabuf = -1;
+   if (nh) {
+      for (int i = 0; i < nh->numFds; i++) {
+         char path[64], target[128];
+         snprintf(path, sizeof(path), "/proc/self/fd/%d", nh->data[i]);
+         ssize_t len = readlink(path, target, sizeof(target) - 1);
+         if (len > 0) {
+            target[len] = 0;
+            if (strstr(target, "dmabuf")) {
+               dmabuf = nh->data[i];
+               break;
+            }
+         }
+      }
+   }
+   if (dmabuf < 0) {
+      fns.release(ahb);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   VkImportMemoryFdInfoKHR fd_info = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+      .fd = dmabuf,
+   };
+   VkMemoryAllocateInfo sub_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &fd_info,
+      .allocationSize = size,
+      .memoryTypeIndex = memory_type_index,
+   };
+   VkDeviceMemory mem_handle = VK_NULL_HANDLE;
+   VkResult result =
+      panvk_AllocateMemory(_device, &sub_info, NULL, &mem_handle);
+   if (result != VK_SUCCESS) {
+      fns.release(ahb);
+      return result;
+   }
+
+   VK_FROM_HANDLE(panvk_device_memory, mem, mem_handle);
+   mem->ahb = ahb;
+   (void)0;
+   *out_mem = mem_handle;
+   return VK_SUCCESS;
+}
+
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo,

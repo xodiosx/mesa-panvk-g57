@@ -10,6 +10,7 @@
  */
 
 #include <sys/sysmacros.h>
+#include <stdlib.h>
 
 #include "git_sha1.h"
 
@@ -41,6 +42,10 @@ panvk_per_arch(get_physical_device_extensions)(
 {
    bool has_gralloc = vk_android_get_ugralloc() != NULL;
 
+   /* Opt-in fd interop (dma-buf export via dma-heap + UMM import). Off by
+    * default to preserve the Wine win32 ext-mismatch workaround below. */
+   bool fd_interop = getenv("PANVK_FD_INTEROP") != NULL;
+
    *ext = (struct vk_device_extension_table){
       .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
@@ -62,13 +67,14 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_driver_properties = true,
       .KHR_dynamic_rendering = true,
       .KHR_dynamic_rendering_local_read = true,
-      /* ADHOC-DBG: hide external memory group to avoid Wine win32 ext mismatch */
-      .KHR_external_fence = false,
-      .KHR_external_fence_fd = false,
-      .KHR_external_memory = false,
-      .KHR_external_memory_fd = false,
-      .KHR_external_semaphore = false,
-      .KHR_external_semaphore_fd = false,
+      /* ADHOC-DBG: hide external memory group to avoid Wine win32 ext mismatch
+       * (overridden by PANVK_FD_INTEROP=1 now that dma-buf export works). */
+      .KHR_external_fence = fd_interop,
+      .KHR_external_fence_fd = fd_interop,
+      .KHR_external_memory = fd_interop,
+      .KHR_external_memory_fd = fd_interop,
+      .KHR_external_semaphore = fd_interop,
+      .KHR_external_semaphore_fd = fd_interop,
       .KHR_format_feature_flags2 = true,
       .KHR_get_memory_requirements2 = true,
       .KHR_global_priority = true,
@@ -163,7 +169,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_acquire_unmodified = false,
-      .EXT_external_memory_dma_buf = false,
+      .EXT_external_memory_dma_buf = fd_interop,
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -172,7 +178,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_host_query_reset = true,
       .EXT_image_2d_view_of_3d = true,
       /* EXT_image_drm_format_modifier depends on KHR_sampler_ycbcr_conversion */
-      .EXT_image_drm_format_modifier = false,
+      .EXT_image_drm_format_modifier = fd_interop,
       .EXT_image_robustness = true,
       .EXT_image_sliced_view_of_3d = true,
       .EXT_image_view_min_lod = true,
@@ -1037,7 +1043,11 @@ panvk_per_arch(get_physical_device_properties)(
       .strictLines = true,
       .standardSampleLocations = true,
       .optimalBufferCopyOffsetAlignment = 64,
-      .optimalBufferCopyRowPitchAlignment = 64,
+      /* AHB dma-buf stride granularity is 64px; align buffer copies
+       * the same way when the AHB WSI path is on so gralloc strides always
+       * match WSI row pitches for 4Bpp formats. */
+      .optimalBufferCopyRowPitchAlignment =
+         getenv("PANVK_AHB_WSI") ? 256 : 64,
 
       /* If we can't detect the cacheline size, assume 64 bytes cachelines. */
       .nonCoherentAtomSize = util_has_cache_ops() ? util_cache_granularity() : 64,
@@ -1087,7 +1097,7 @@ panvk_per_arch(get_physical_device_properties)(
       .independentResolveNone = true,
       .independentResolve = true,
       /* VK_KHR_driver_properties */
-      .driverID = ((VkDriverId)0x0000CAFE),
+      .driverID = VK_DRIVER_ID_MESA_PANVK,
       .conformanceVersion = get_conformance_version(),
       .denormBehaviorIndependence =
          PAN_ARCH >= 9 ? VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE

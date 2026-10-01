@@ -35,6 +35,7 @@
  */
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <linux/dma-heap.h>
 #include <stdlib.h>
@@ -174,6 +175,28 @@ kbase_kmod_supports_dmabuf(const struct pan_kmod_dev *dev)
       container_of(dev, const struct kbase_kmod_dev, base);
 
    return kbase_dev->dma_heap_fd >= 0;
+}
+
+int
+kbase_kmod_fence_validate(struct pan_kmod_dev *dev, int fd)
+{
+   /* nr 25 _IOW(0x80, 25, s32): 0 valid, -EINVAL invalid. Verified present
+    * on JM 11.38 (post-handshake probe). */
+   int arg = fd;
+   int ret = ioctl(dev->fd, _IOW(KBASE_IOCTL_TYPE, 25, int), &arg);
+   return ret ? -errno : 0;
+}
+
+int
+kbase_kmod_stream_create(struct pan_kmod_dev *dev, const char *name)
+{
+   /* nr 24 _IOW(0x80, 24, char[32]): returns a timeline fd. Verified
+    * working on JM 11.38. */
+   char sname[32] = { 0 };
+   if (name)
+      strncpy(sname, name, sizeof(sname) - 1);
+   int ret = ioctl(dev->fd, _IOW(KBASE_IOCTL_TYPE, 24, char[32]), sname);
+   return ret < 0 ? -errno : ret;
 }
 
 /* -------------------------------------------------------------------------
@@ -1689,16 +1712,35 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
    if (kmod_flags & PAN_KMOD_BO_FLAG_WB_MMAP)
       import_flags |= BASE_MEM_CACHED_CPU;
 
-   int import_fd = kbase_bo->dmabuf_fd;
-   union kbase_ioctl_mem_import req = {
-      .in = {
-         .flags = import_flags,
-         .phandle = (uintptr_t)&import_fd,
-         .type = BASE_MEM_IMPORT_TYPE_UMM,
-      },
+   /* Some exporters (e.g. Android gralloc CPU-uncached heaps) reject the
+    * full coherency/shared set; retry with the minimal GPU-only set which
+    * suffices for GPU rendering + display.
+    */
+   const uint64_t flag_tries[] = {
+      import_flags,
+      BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR,
    };
 
-   if (ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req)) {
+   int import_fd = kbase_bo->dmabuf_fd;
+   union kbase_ioctl_mem_import req;
+   unsigned t;
+   for (t = 0; t < 2; t++) {
+      req = (union kbase_ioctl_mem_import) {
+         .in = {
+            .flags = flag_tries[t],
+            .phandle = (uintptr_t)&import_fd,
+            .type = BASE_MEM_IMPORT_TYPE_UMM,
+         },
+      };
+
+      if (!ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req))
+         break;
+
+      mesa_logd("kbase: KBASE_IOCTL_MEM_IMPORT failed with flags=0x%" PRIx64
+                ": %s", flag_tries[t], strerror(errno));
+   }
+
+   if (t == 2) {
       mesa_loge("kbase: KBASE_IOCTL_MEM_IMPORT failed: %s", strerror(errno));
       goto err_close_dmabuf;
    }
@@ -2012,6 +2054,131 @@ static struct pan_kmod_bo *
 kbase_kmod_bo_import_fd(struct pan_kmod_dev *dev, int fd, uint64_t size)
 {
    return kbase_kmod_import_dmabuf(dev, NULL, fd, size, 0, true);
+}
+
+/* Allocate shareable memory for VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+ * (and OPAQUE_FD, which a dma-buf fd also satisfies): allocate a real dma-buf
+ * and import into kbase via UMM, retaining the fd so bo_export_fd() (dup)
+ * works. Native kbase MEM_ALLOC BOs have no dma-buf and can never be exported,
+ * hence this separate path.
+ *
+ * Two dma-buf sources, in order: the system dma-heap (needs write permission,
+ * absent on unrooted MediaTek), then an AHardwareBuffer BLOB via gralloc
+ * (the sanctioned allocator, always permitted). */
+struct pan_kmod_bo *
+kbase_kmod_bo_alloc_exportable(struct pan_kmod_dev *dev, uint64_t size,
+                               uint32_t kmod_flags)
+{
+   struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, struct kbase_kmod_dev, base);
+
+   /* Resolved once, no hard link dependency on libnativewindow. */
+   static int (*p_ahb_alloc)(const void *, void **) = NULL;
+   static const void *(*p_ahb_getNH)(const void *) = NULL;
+   static void (*p_ahb_rel)(const void *) = NULL;
+   static bool ahb_resolved = false;
+   if (!ahb_resolved) {
+      ahb_resolved = true;
+      void *h = dlopen("/system/lib64/libnativewindow.so",
+                       RTLD_NOW | RTLD_LOCAL);
+      if (!h)
+         h = dlopen("libnativewindow.so", RTLD_NOW | RTLD_LOCAL);
+      if (h) {
+         p_ahb_alloc = dlsym(h, "AHardwareBuffer_allocate");
+         p_ahb_getNH = dlsym(h, "AHardwareBuffer_getNativeHandle");
+         p_ahb_rel = dlsym(h, "AHardwareBuffer_release");
+         if (!p_ahb_alloc || !p_ahb_getNH || !p_ahb_rel)
+            p_ahb_alloc = NULL;
+      }
+      if (!p_ahb_alloc) {
+         p_ahb_alloc = dlsym(RTLD_DEFAULT, "AHardwareBuffer_allocate");
+         p_ahb_getNH = dlsym(RTLD_DEFAULT, "AHardwareBuffer_getNativeHandle");
+         p_ahb_rel = dlsym(RTLD_DEFAULT, "AHardwareBuffer_release");
+      }
+   }
+
+   const uint64_t aligned_size = ALIGN_POT(size, 4096);
+   int src_fd = -1;
+   void *ahb = NULL;
+
+   if (kbase_dev->dma_heap_fd >= 0) {
+      struct dma_heap_allocation_data alloc = {
+         .len = aligned_size,
+         .fd_flags = O_RDWR | O_CLOEXEC,
+      };
+
+      if (!ioctl(kbase_dev->dma_heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc))
+         src_fd = alloc.fd;
+      else
+         mesa_logd("kbase: DMA_HEAP_IOCTL_ALLOC(%" PRIu64 ") failed: %s",
+                   aligned_size, strerror(errno));
+   }
+
+   /* Fall back to gralloc AHardwareBuffers. Combos vary by vendor gralloc;
+       * walk the list until one allocates. */
+   if (src_fd < 0 && p_ahb_alloc) {
+      /* AHardwareBuffer_Desc layout: must match android/hardware_buffer.h
+       * (width/height/layers/format/usage/stride/reserved). */
+      struct ahb_desc {
+         uint32_t width, height, layers, format;
+         uint64_t usage;
+         uint32_t stride, reserved[2];
+      };
+      uint32_t dim = 1;
+      while ((uint64_t)dim * dim * 4 < aligned_size)
+         dim *= 2;
+      const struct ahb_desc descs[] = {
+         { (uint32_t)aligned_size, 1, 1, 0x21, 0x200 | 0x800 | 0x100000, 0, {0, 0} },
+         { (uint32_t)aligned_size, 1, 1, 0x21, 0x200, 0, {0, 0} },
+         { dim, dim, 1, 1, 0x100 | 0x200, 0, {0, 0} }, /* RGBA SAMPLED|FRAMEBUFFER */
+      };
+      for (unsigned d = 0; d < 3 && !ahb; d++) {
+         if (p_ahb_alloc(&descs[d], &ahb))
+            ahb = NULL;
+      }
+      if (ahb) {
+         const struct { int version, numFds, numInts; int data[0]; } *nh =
+            p_ahb_getNH(ahb);
+         if (nh) {
+            for (int i = 0; i < nh->numFds && src_fd < 0; i++) {
+               char p[64], t[128];
+               snprintf(p, sizeof(p), "/proc/self/fd/%d", nh->data[i]);
+               ssize_t l = readlink(p, t, sizeof(t) - 1);
+               if (l > 0) {
+                  t[l] = 0;
+                  if (strstr(t, "dmabuf") || strstr(t, "dma"))
+                     src_fd = nh->data[i];
+               }
+            }
+            /* BLOB handles carry exactly one fd: take it if unnamed. */
+            if (src_fd < 0 && nh->numFds == 1)
+               src_fd = nh->data[0];
+         }
+         if (src_fd < 0) {
+            p_ahb_rel(ahb);
+            ahb = NULL;
+         }
+      }
+   }
+
+   if (src_fd < 0) {
+      errno = ENOSYS;
+      return NULL;
+   }
+
+   /* import_dmabuf dups the fd, so both sources can be released here. */
+   struct pan_kmod_bo *bo =
+      kbase_kmod_import_dmabuf(dev, NULL, src_fd, aligned_size,
+                               kmod_flags, false);
+   close(src_fd);
+   if (ahb)
+      p_ahb_rel(ahb);
+   if (!bo) {
+      mesa_loge("kbase: UMM import of exportable dma-buf failed");
+      return NULL;
+   }
+
+   return bo;
 }
 
 static int

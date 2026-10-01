@@ -482,6 +482,8 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    device->vk.get_timestamp = panvk_device_get_timestamp;
    device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
 
+   panvk_kbase_async_init(device);
+
    device->kmod.allocator = (struct pan_kmod_allocator){
       .zalloc = panvk_kmod_zalloc,
       .free = panvk_kmod_free,
@@ -614,8 +616,16 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 #endif
 
 #if PAN_ARCH <= 9
+   /* Tiler heap size in MB (default 128). Larger heaps give heavy geometry
+    * more headroom and enlarge each heap-split overlap half. */
+   uint64_t tiler_heap_mb = 128;
+   {
+      const char *e = getenv("PANVK_TILER_HEAP_MB");
+      if (e && atoi(e) >= 16 && atoi(e) <= 2048)
+         tiler_heap_mb = (uint64_t)atoi(e);
+   }
    result = panvk_priv_bo_create(
-      device, 128 * 1024 * 1024,
+      device, tiler_heap_mb * 1024 * 1024,
       PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap);
    if (result != VK_SUCCESS)
@@ -792,6 +802,8 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
 {
    if (!device)
       return;
+
+   panvk_kbase_async_fini(device);
 
    panvk_per_arch(utrace_context_fini)(device);
 

@@ -288,10 +288,22 @@ panvk_per_arch(cmd_alloc_tls_desc)(struct panvk_cmd_buffer *cmdbuf, bool gfx)
    return VK_SUCCESS;
 }
 
+/* Heap-split overlap (PANVK_OVERLAP=1): consecutive batches use disjoint
+ * tiler heap halves so vertex work overlaps the previous fragment pass. */
+static bool
+panvk_overlap_enabled(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("PANVK_OVERLAP");
+      on = (e && e[0] != '0') ? 1 : 0;
+   }
+   return on != 0;
+}
+
 VkResult
 panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
-                                          uint32_t layer_idx)
-{
+                                          uint32_t layer_idx){
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(cmdbuf->vk.base.device->physical);
@@ -320,6 +332,18 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
       cfg.base = dev->tiler_heap->addr.dev;
       cfg.bottom = dev->tiler_heap->addr.dev;
       cfg.top = cfg.base + cfg.size;
+      if (panvk_overlap_enabled()) {
+         /* Split the heap in halves so consecutive batches use disjoint
+          * regions; a later vertex job then only waits for the fragment job
+          * that owns its half. */
+         static unsigned next_half;
+         batch->heap_half = __atomic_fetch_add(&next_half, 1, __ATOMIC_RELAXED) & 1;
+         const uint64_t half = (uint64_t)cfg.size / 2;
+         cfg.size = half;
+         cfg.base += batch->heap_half * half;
+         cfg.bottom = cfg.base;
+         cfg.top = cfg.base + half;
+      }
    }
 
    pan_pack(&batch->tiler.ctx_templ, TILER_CONTEXT, cfg) {
@@ -403,6 +427,15 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
    struct panvk_cmd_buffer *cmdbuf =
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
 
+   /* Async mode: the command buffer's pools may still be executing. Wait
+    * for its last submission before recycling anything (usually already
+    * complete, making this a no-op). */
+   if (cmdbuf->async_seqno) {
+      struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+      panvk_kbase_async_wait_seqno(dev, cmdbuf->async_seqno, UINT64_MAX);
+      cmdbuf->async_seqno = 0;
+   }
+
    vk_command_buffer_reset(&cmdbuf->vk);
 
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
@@ -427,6 +460,13 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
    struct panvk_cmd_buffer *cmdbuf =
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+
+   /* Async mode: wait for any in-flight work referencing this command
+    * buffer before tearing down its pools. */
+   if (cmdbuf->async_seqno) {
+      panvk_kbase_async_wait_seqno(dev, cmdbuf->async_seqno, UINT64_MAX);
+      cmdbuf->async_seqno = 0;
+   }
 
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
       list_del(&batch->node);
