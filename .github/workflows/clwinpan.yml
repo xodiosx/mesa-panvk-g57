@@ -1,4 +1,4 @@
-name: sync winlator-pan (overlay reference, optional restore from main)
+name: sync winlator-pan (overlay reference, option restore from main)
 
 on:
   workflow_dispatch:
