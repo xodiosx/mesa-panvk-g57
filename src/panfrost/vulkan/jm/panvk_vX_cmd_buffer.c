@@ -34,6 +34,14 @@
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 
+#if defined(HAVE_PAN_KMOD_KBASE) && defined(PANVK_USE_KBASE)
+/* panvk_per_arch(kbase_jm_drain) is declared in panvk_vX_gpu_queue_kbase.h.
+ * Resetting or destroying a command buffer recycles the pools and the job
+ * chains the GPU may still be reading, so the JM jobs in flight must drain
+ * first. */
+#include "panvk_vX_gpu_queue_kbase.h"
+#endif
+
 static VkResult
 panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
 {
@@ -75,9 +83,11 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
    assert(batch);
 
-   if (unlikely(getenv("PANVK_VERBOSE"))) {
-      (void)0;
-   }
+   fprintf(stderr, "PANVKDBG close_batch: fb=%llx vtc=%llx frag=%llx jobs=%u\n",
+           (unsigned long long)batch->fb.desc.gpu,
+           (unsigned long long)batch->vtc_jc.first_job,
+           (unsigned long long)batch->frag_jc.first_job,
+           (unsigned)util_dynarray_num_elements(&batch->jobs, void));
    if (!batch->fb.desc.gpu && !batch->vtc_jc.first_job) {
       if (util_dynarray_num_elements(&batch->event_ops,
                                      struct panvk_cmd_event_op) == 0) {
@@ -206,23 +216,50 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
                                    pan_size(ZS_CRC_EXTENSION)
                               : fbd.cpu + pan_size(FRAMEBUFFER),
          };
-         tagged_fbd_ptr |= GENX(pan_emit_fb_desc)(&fbd_info, &fb_descs);
+tagged_fbd_ptr |= GENX(pan_emit_fb_desc)(&fbd_info, &fb_descs);
 
-         if (unlikely(getenv("PANVK_VERBOSE"))) {
-              const uint32_t *w = (const uint32_t *)fbd.cpu;
-              (void)0;
-              (void)0;
-              (void)0;
-              (void)0;
-              (void)0;
+          {
+const uint32_t *w = (const uint32_t *)fbd.cpu;
+              fprintf(stderr,
+                      "PANVKDBG fbd l=%u w0=%08x w1=%08x w2=%08x w3=%08x "
+                      "w4=%08x w5=%08x w6=%08x w7=%08x\n",
+                      layer_id, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+              fprintf(stderr,
+                      "PANVKDBG fbd w8=%08x w9=%08x w10=%08x w11=%08x "
+                      "w12=%08x w13=%08x w14=%08x w15=%08x\n",
+                      w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+              fprintf(stderr,
+                      "PANVKDBG fs modes=%u,%u,%u dcd=%llx\n",
+                      fs.modes[0], fs.modes[1], fs.modes[2],
+                      (unsigned long long)fs.dcd_pointer);
+              fprintf(stderr,
+                      "PANVKDBG fb: w=%u h=%u tile=%u samps=%u rts=%u\n",
+                      render->fb.layout.width_px, render->fb.layout.height_px,
+                      render->fb.layout.tile_size_px,
+                      render->fb.layout.sample_count, render->fb.layout.rt_count);
+              fprintf(stderr,
+                      "PANVKDBG tls: gpu=%llx cpu=%p\n",
+                      (unsigned long long)batch->tls.gpu, batch->tls.cpu);
               const uint32_t *rtw = (const uint32_t *)fb_descs.rts;
-              (void)0;
-              (void)0;
+              fprintf(stderr,
+                      "PANVKDBG rt0 w0=%08x w1=%08x w2=%08x w3=%08x "
+                      "w4=%08x w5=%08x w6=%08x w7=%08x\n",
+                      rtw[0], rtw[1], rtw[2], rtw[3], rtw[4], rtw[5],
+                      rtw[6], rtw[7]);
+              fprintf(stderr,
+                      "PANVKDBG rt0 w8=%08x w9=%08x w10=%08x w11=%08x "
+                      "w12=%08x w13=%08x w14=%08x w15=%08x\n",
+                      rtw[8], rtw[9], rtw[10], rtw[11], rtw[12], rtw[13],
+                      rtw[14], rtw[15]);
               const struct pan_fb_load *ld = fbd_info.load;
              for (unsigned rt = 0; rt < render->fb.layout.rt_count; rt++) {
-                (void)0;
+                fprintf(stderr,
+                        "PANVKDBG load rt%u always=%d ib=%d bd=%d clr=%08x%08x\n",
+                        rt, ld->rts[rt].always, ld->rts[rt].in_bounds_load,
+                        ld->rts[rt].border_load,
+                        ld->rts[rt].clear.color.ui[0], ld->rts[rt].clear.color.ui[1]);
              }
-         }
+          }
 
           result = panvk_cmd_prepare_fragment_job(cmdbuf, tagged_fbd_ptr);
          if (result != VK_SUCCESS)
@@ -288,22 +325,10 @@ panvk_per_arch(cmd_alloc_tls_desc)(struct panvk_cmd_buffer *cmdbuf, bool gfx)
    return VK_SUCCESS;
 }
 
-/* Heap-split overlap (PANVK_OVERLAP=1): consecutive batches use disjoint
- * tiler heap halves so vertex work overlaps the previous fragment pass. */
-static bool
-panvk_overlap_enabled(void)
-{
-   static int on = -1;
-   if (on < 0) {
-      const char *e = getenv("PANVK_OVERLAP");
-      on = (e && e[0] != '0') ? 1 : 0;
-   }
-   return on != 0;
-}
-
 VkResult
 panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
-                                          uint32_t layer_idx){
+                                          uint32_t layer_idx)
+{
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(cmdbuf->vk.base.device->physical);
@@ -332,18 +357,6 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
       cfg.base = dev->tiler_heap->addr.dev;
       cfg.bottom = dev->tiler_heap->addr.dev;
       cfg.top = cfg.base + cfg.size;
-      if (panvk_overlap_enabled()) {
-         /* Split the heap in halves so consecutive batches use disjoint
-          * regions; a later vertex job then only waits for the fragment job
-          * that owns its half. */
-         static unsigned next_half;
-         batch->heap_half = __atomic_fetch_add(&next_half, 1, __ATOMIC_RELAXED) & 1;
-         const uint64_t half = (uint64_t)cfg.size / 2;
-         cfg.size = half;
-         cfg.base += batch->heap_half * half;
-         cfg.bottom = cfg.base;
-         cfg.top = cfg.base + half;
-      }
    }
 
    pan_pack(&batch->tiler.ctx_templ, TILER_CONTEXT, cfg) {
@@ -427,14 +440,9 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
    struct panvk_cmd_buffer *cmdbuf =
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
 
-   /* Async mode: the command buffer's pools may still be executing. Wait
-    * for its last submission before recycling anything (usually already
-    * complete, making this a no-op). */
-   if (cmdbuf->async_seqno) {
-      struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-      panvk_kbase_async_wait_seqno(dev, cmdbuf->async_seqno, UINT64_MAX);
-      cmdbuf->async_seqno = 0;
-   }
+#if defined(HAVE_PAN_KMOD_KBASE) && defined(PANVK_USE_KBASE)
+   panvk_per_arch(kbase_jm_drain)(to_panvk_device(cmdbuf->vk.base.device));
+#endif
 
    vk_command_buffer_reset(&cmdbuf->vk);
 
@@ -461,12 +469,9 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
 
-   /* Async mode: wait for any in-flight work referencing this command
-    * buffer before tearing down its pools. */
-   if (cmdbuf->async_seqno) {
-      panvk_kbase_async_wait_seqno(dev, cmdbuf->async_seqno, UINT64_MAX);
-      cmdbuf->async_seqno = 0;
-   }
+#if defined(HAVE_PAN_KMOD_KBASE) && defined(PANVK_USE_KBASE)
+   panvk_per_arch(kbase_jm_drain)(dev);
+#endif
 
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
       list_del(&batch->node);

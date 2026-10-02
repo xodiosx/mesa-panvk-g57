@@ -10,7 +10,6 @@
  */
 
 #include <sys/sysmacros.h>
-#include <stdlib.h>
 
 #include "git_sha1.h"
 
@@ -42,10 +41,6 @@ panvk_per_arch(get_physical_device_extensions)(
 {
    bool has_gralloc = vk_android_get_ugralloc() != NULL;
 
-   /* Opt-in fd interop (dma-buf export via dma-heap + UMM import). Off by
-    * default to preserve the Wine win32 ext-mismatch workaround below. */
-   bool fd_interop = getenv("PANVK_FD_INTEROP") != NULL;
-
    *ext = (struct vk_device_extension_table){
       .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
@@ -67,14 +62,15 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_driver_properties = true,
       .KHR_dynamic_rendering = true,
       .KHR_dynamic_rendering_local_read = true,
-      /* ADHOC-DBG: hide external memory group to avoid Wine win32 ext mismatch
-       * (overridden by PANVK_FD_INTEROP=1 now that dma-buf export works). */
-      .KHR_external_fence = fd_interop,
-      .KHR_external_fence_fd = fd_interop,
-      .KHR_external_memory = fd_interop,
-      .KHR_external_memory_fd = fd_interop,
-      .KHR_external_semaphore = fd_interop,
-      .KHR_external_semaphore_fd = fd_interop,
+      /* ADHOC-DBG: hide external memory group to avoid Wine win32 ext mismatch */
+      .KHR_external_fence = false,
+      .KHR_external_fence_fd = false,
+      .KHR_external_memory = panvk_host_import_enabled(device),
+      .EXT_external_memory_host = panvk_host_import_enabled(device),
+      .KHR_external_memory_fd = false,
+      /* kbase now implements binary SYNC_FD import and export. */
+      .KHR_external_semaphore = true,
+      .KHR_external_semaphore_fd = true,
       .KHR_format_feature_flags2 = true,
       .KHR_get_memory_requirements2 = true,
       .KHR_global_priority = true,
@@ -100,7 +96,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_pipeline_library = true,
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
-      .KHR_robustness2 = PAN_ARCH >= 9,
+      .KHR_robustness2 = PAN_ARCH >= 10,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
@@ -169,7 +165,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_acquire_unmodified = false,
-      .EXT_external_memory_dma_buf = fd_interop,
+      .EXT_external_memory_dma_buf = false,
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -178,7 +174,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_host_query_reset = true,
       .EXT_image_2d_view_of_3d = true,
       /* EXT_image_drm_format_modifier depends on KHR_sampler_ycbcr_conversion */
-      .EXT_image_drm_format_modifier = fd_interop,
+      .EXT_image_drm_format_modifier = false,
       .EXT_image_robustness = true,
       .EXT_image_sliced_view_of_3d = true,
       .EXT_image_view_min_lod = true,
@@ -209,7 +205,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_queue_family_foreign = true,
       .EXT_rasterization_order_attachment_access = PAN_ARCH >= 10,
       .EXT_rgba10x6_formats = PAN_ARCH >= 11,
-      .EXT_robustness2 = PAN_ARCH >= 9,
+      .EXT_robustness2 = PAN_ARCH >= 10,
       .EXT_sampler_filter_minmax = PAN_ARCH >= 10,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
@@ -643,7 +639,7 @@ panvk_per_arch(get_physical_device_features)(
       /* VK_KHR_robustness2 */
       .robustBufferAccess2 = PAN_ARCH >= 11,
       .robustImageAccess2 = false,
-      .nullDescriptor = PAN_ARCH >= 9,
+      .nullDescriptor = PAN_ARCH >= 10,
 
       /* VK_EXT_shader_tile_image */
       .shaderTileImageColorReadAccess = PAN_ARCH >= 9,
@@ -781,14 +777,7 @@ panvk_per_arch(get_physical_device_features)(
 #endif
 
       /* VK_EXT_multisampled_render_to_single_sampled */
-#if PAN_ARCH >= 10
       .multisampledRenderToSingleSampled = true,
-#else
-      /* Valhall JM resolve-on-store for MSRS outputs black; force clients
-       * onto the explicit-resolve path until the tilebuffer MSAA handling
-       * is fixed. */
-      .multisampledRenderToSingleSampled = false,
-#endif
 
 #ifdef PANVK_USE_WSI_PLATFORM
       /* VK_EXT_present_timing */
@@ -1043,11 +1032,7 @@ panvk_per_arch(get_physical_device_properties)(
       .strictLines = true,
       .standardSampleLocations = true,
       .optimalBufferCopyOffsetAlignment = 64,
-      /* AHB dma-buf stride granularity is 64px; align buffer copies
-       * the same way when the AHB WSI path is on so gralloc strides always
-       * match WSI row pitches for 4Bpp formats. */
-      .optimalBufferCopyRowPitchAlignment =
-         getenv("PANVK_AHB_WSI") ? 256 : 64,
+      .optimalBufferCopyRowPitchAlignment = 64,
 
       /* If we can't detect the cacheline size, assume 64 bytes cachelines. */
       .nonCoherentAtomSize = util_has_cache_ops() ? util_cache_granularity() : 64,
@@ -1314,6 +1299,9 @@ panvk_per_arch(get_physical_device_properties)(
       /* VK_EXT_nested_command_buffer */
       .maxCommandBufferNestingLevel = 5,
 
+      /* USER_BUFFER imports require page-aligned host allocations. */
+      .minImportedHostPointerAlignment = 4096,
+
       /* VK_EXT_map_memory_placed */
       .minPlacedMemoryMapAlignment = os_page_size,
 
@@ -1381,7 +1369,7 @@ panvk_per_arch(get_physical_device_properties)(
    STATIC_ASSERT(sizeof(instance->driver_build_sha) >= VK_UUID_SIZE);
    memcpy(properties->driverUUID, instance->driver_build_sha, VK_UUID_SIZE);
 
-   snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "panvcake");
+   snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "panvk");
    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
 
@@ -1453,7 +1441,7 @@ panvk_per_arch(get_physical_device_properties)(
    if (PANVK_DEBUG(STARTUP)) {
       mesa_logi("%s (%s) %s", properties->driverName, properties->deviceName,
                 properties->driverInfo);
-      mesa_logi("panvcake: gpu_id=0x%" PRIx64 " variant=0x%x "
+      mesa_logi("panvk: gpu_id=0x%" PRIx64 " variant=0x%x "
                 "texture_features0=0x%08x afbc=%u afrc=%u",
                 device->kmod.dev->props.gpu_id,
                 device->kmod.dev->props.gpu_variant,

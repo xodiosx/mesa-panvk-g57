@@ -80,7 +80,7 @@ panvk_debug_init(void)
       char debug_string[256];
       dump_debug_control_string(debug_string, sizeof(debug_string),
                                 panvk_debug_options, panvk_debug);
-      mesa_logi("panvcake_debug: %s", debug_string);
+      mesa_logi("panvk_debug: %s", debug_string);
    }
 }
 
@@ -263,7 +263,7 @@ panvk_init_dri_options(struct panvk_instance *instance)
 {
    panvk_parse_dri_options(&instance->drirc,
                            &(driConfigFileParseParams) {
-                              .driverName = "panvcake",
+                              .driverName = "panvk",
                               .applicationName = instance->vk.app_info.app_name,
                               .applicationVersion = instance->vk.app_info.app_version,
                               .engineName = instance->vk.app_info.engine_name,

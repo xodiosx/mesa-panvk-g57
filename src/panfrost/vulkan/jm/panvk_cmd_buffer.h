@@ -60,10 +60,6 @@ struct panvk_batch {
    struct pan_tls_info tlsinfo;
    unsigned wls_total_size;
    bool issued;
-   /* Heap-split overlap: which tiler heap half this batch uses (assigned at
-    * record time, alternating). Lets a later batch's vertex job depend only
-    * on the fragment job that used the same half. */
-   unsigned heap_half;
 };
 
 enum panvk_cmd_event_op_type {
@@ -86,10 +82,6 @@ struct panvk_cmd_buffer {
    struct list_head batches;
    struct list_head push_sets;
    struct panvk_batch *cur_batch;
-
-   /* Sequence number of the last async submission using this command
-    * buffer (0 = none). Reset/destroy wait for it. */
-   uint64_t async_seqno;
 
    struct {
       struct panvk_cmd_graphics_state gfx;

@@ -362,7 +362,15 @@ wsi_x11_connection_create(struct wsi_device *wsi_dev,
 
    wsi_conn->has_mit_shm = false;
 #if defined(HAVE_X11_DRM) && defined(HAVE_SYS_SHM_H)
-   (void)0;
+   fprintf(stderr,
+
+           "PANVKDBG XSHM_GATE dri3=%d present=%d wants_shm=%d\\n",
+
+           wsi_conn->has_dri3,
+
+           wsi_conn->has_present,
+
+           wants_shm);
 
    if (wsi_conn->has_dri3 && wsi_conn->has_present && wants_shm) {
       wsi_conn->has_mit_shm = x11_xcb_display_supports_xshm(conn, NULL);
@@ -1780,23 +1788,21 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
    if (image->shm_fence)
       xshmfence_reset(image->shm_fence);
 
+   if (!chain->base.image_info.explicit_sync) {
+      ++chain->sent_image_count;
+      assert(chain->sent_image_count <= chain->base.image_count);
+   }
+
    ++chain->send_sbc;
    uint32_t serial = (uint32_t)chain->send_sbc;
 
-   if (!chain->base.wsi->sw) {
-      if (!chain->base.image_info.explicit_sync) {
-         ++chain->sent_image_count;
-         assert(chain->sent_image_count <= chain->base.image_count);
-      }
-
-      assert(image->present_queued_count < ARRAY_SIZE(image->pending_completions));
-      image->pending_completions[image->present_queued_count++] =
-         (struct x11_image_pending_completion) {
-            .signal_present_id = image->present_id,
-            .serial = serial,
-            .timing_serial = image->timing_request.serial,
-         };
-   }
+   assert(image->present_queued_count < ARRAY_SIZE(image->pending_completions));
+   image->pending_completions[image->present_queued_count++] =
+      (struct x11_image_pending_completion) {
+         .signal_present_id = image->present_id,
+         .serial = serial,
+         .timing_serial = image->timing_request.serial,
+      };
 
    xcb_void_cookie_t cookie;
 #ifdef HAVE_DRI3_EXPLICIT_SYNC
@@ -1842,10 +1848,6 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
    }
    xcb_discard_reply(chain->conn, cookie.sequence);
    xcb_flush(chain->conn);
-
-   if (chain->base.wsi->sw)
-      wsi_queue_push(&chain->acquire_queue, image_index);
-
    return x11_swapchain_result(chain, VK_SUCCESS);
 }
 #endif
@@ -2166,8 +2168,10 @@ x11_acquire_next_image(struct wsi_swapchain *wsi_chain,
    struct x11_swapchain *chain = (struct x11_swapchain *)wsi_chain;
    uint64_t timeout = info->timeout;
 
-   if (unlikely(getenv("PANVK_VERBOSE")))
-      (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_ACQUIRE_ENTER chain=%p timeout=%" PRIu64
+           " images=%u\\n",
+           (void *)chain, timeout, chain->base.image_count);
 
    /* If the swapchain is in an error state, don't go any further. */
    VkResult result = x11_swapchain_read_status_atomic(chain);
@@ -2228,8 +2232,11 @@ x11_queue_present(struct wsi_swapchain *wsi_chain,
    struct x11_swapchain *chain = (struct x11_swapchain *)wsi_chain;
    xcb_xfixes_region_t update_area = 0;
 
-   if (unlikely(getenv("PANVK_VERBOSE")))
-      (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_QUEUE_ENTER chain=%p image=%u "
+           "present_id=%" PRIu64 " sw=%d blit=%d\\n",
+           (void *)chain, image_index, present_id,
+           chain->base.wsi->sw, chain->base.blit.type);
 
    /* If the swapchain is in an error state, don't go any further. */
    VkResult status = x11_swapchain_read_status_atomic(chain);
@@ -2289,19 +2296,6 @@ static unsigned x11_driver_owned_images(const struct x11_swapchain *chain)
  * For IMMEDIATE and MAILBOX, the application thread pumped the event queue, which caused a lot of pain
  * when trying to deal with present wait.
  */
-static bool
-x11_event_thread_poll(void)
-{
-   /* Termux:X11 never emits Present CompleteNotify for our DRI3 pixmaps, so
-    * a blocking xcb_wait_for_special_event() can sleep forever: no socket
-    * traffic ever wakes it, and unregistering at destroy does not interrupt
-    * the poll on some xcb builds. Polling keeps teardown terminating. */
-   static int cached = -1;
-   if (cached < 0)
-      cached = getenv("PANVK_X11_EVENT_POLL") != NULL;
-   return cached != 0;
-}
-
 static int
 x11_manage_event_queue(void *state)
 {
@@ -2342,23 +2336,8 @@ x11_manage_event_queue(void *state)
          /* Only yield lock when blocking on X11 event. */
          mesa_logd("WSI x11: event thread blocking on xcb_wait_for_special_event");
          mtx_unlock(&chain->thread_state_lock);
-         xcb_generic_event_t *event = NULL;
-         if (x11_event_thread_poll()) {
-            for (;;) {
-               event = xcb_poll_for_special_event(chain->conn,
-                                                  chain->special_event);
-               if (event)
-                  break;
-               mtx_lock(&chain->thread_state_lock);
-               VkResult poll_status = chain->status;
-               mtx_unlock(&chain->thread_state_lock);
-               if (poll_status < 0)
-                  break;
-               usleep(1000);
-            }
-         } else {
-            event = xcb_wait_for_special_event(chain->conn, chain->special_event);
-         }
+         xcb_generic_event_t *event =
+               xcb_wait_for_special_event(chain->conn, chain->special_event);
          mtx_lock(&chain->thread_state_lock);
          mesa_logd("WSI x11: event thread woke from special_event wait (event=%p)",
                    (void *)event);
@@ -2589,7 +2568,7 @@ x11_manage_present_queue(void *state)
 
       /* In IMMEDIATE and MAILBOX modes, there is a risk that we have exhausted the presentation queue,
        * since IDLE could return multiple times before observing a COMPLETE. */
-      while (chain->status >= 0 && !chain->base.wsi->sw &&
+      while (chain->status >= 0 &&
              chain->images[image_index].present_queued_count ==
              ARRAY_SIZE(chain->images[image_index].pending_completions)) {
          u_cnd_monotonic_wait(&chain->thread_state_cond, &chain->thread_state_lock);
@@ -2609,9 +2588,8 @@ x11_manage_present_queue(void *state)
          break;
       }
 
-      if ((present_mode == VK_PRESENT_MODE_FIFO_KHR ||
-           present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
-          !chain->base.wsi->sw) {
+      if (present_mode == VK_PRESENT_MODE_FIFO_KHR ||
+          present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
          MESA_TRACE_SCOPE("wait present");
 
          while (chain->status >= 0 && chain->images[image_index].present_queued_count != 0) {
@@ -3191,7 +3169,15 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    VkResult result;
    VkPresentModeKHR present_mode = wsi_swapchain_get_present_mode(wsi_device, pCreateInfo);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_CREATE_ENTER sw=%d format=%d "
+           "extent=%ux%u minImages=%u mode=%d\\n",
+           wsi_device->sw,
+           pCreateInfo->imageFormat,
+           pCreateInfo->imageExtent.width,
+           pCreateInfo->imageExtent.height,
+           pCreateInfo->minImageCount,
+           present_mode);
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
 
@@ -3297,7 +3283,10 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_cpu_image_params cpu_image_params;
    uint64_t *modifiers[2] = {NULL, NULL};
    if (wsi_device->sw) {
-            (void)0;
+            fprintf(stderr,
+              "PANVKDBG X11_MITSHM has_mit_shm=%d alloc_shm_choice=%p\\n",
+              wsi_conn->has_mit_shm,
+              wsi_conn->has_mit_shm ? (void *)&alloc_shm : NULL);
 
 cpu_image_params = (struct wsi_cpu_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_CPU,
@@ -3335,12 +3324,21 @@ cpu_image_params = (struct wsi_cpu_image_params) {
 #endif
    }
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_BEFORE_INIT sw=%d image_type=%d "
+           "image_params=%p\\n",
+           wsi_device->sw,
+           image_params ? image_params->image_type : -1,
+           (void *)image_params);
 
    result = wsi_swapchain_init(wsi_device, &chain->base, device, pCreateInfo,
                                image_params, pAllocator);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG PRESENT X11_AFTER_INIT result=%d blit=%d image_count=%u\\n",
+           result,
+           result == VK_SUCCESS ? chain->base.blit.type : -1,
+           result == VK_SUCCESS ? chain->base.image_count : 0);
 
    for (int i = 0; i < ARRAY_SIZE(modifiers); i++)
       vk_free(pAllocator, modifiers[i]);

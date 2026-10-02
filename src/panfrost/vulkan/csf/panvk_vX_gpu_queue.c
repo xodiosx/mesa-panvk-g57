@@ -1432,7 +1432,7 @@ init_utrace(struct panvk_gpu_queue *queue)
    if (!sync_type || !vk_sync_type_is_drm_syncobj(sync_type) ||
        !(sync_type->features & VK_SYNC_FEATURE_TIMELINE)) {
       return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
-                       "panvcake CSF: timeline DRM syncobj required for queue "
+                       "panvk CSF: timeline DRM syncobj required for queue "
                        "creation");
    }
 

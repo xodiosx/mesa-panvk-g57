@@ -238,12 +238,12 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
 
    if (!vk_queue || !vk_queue->base.device) {
-      mesa_loge("panvcake: NULL queue or device in gpu_queue_submit");
+      mesa_loge("panvk: NULL queue or device in gpu_queue_submit");
       return VK_ERROR_DEVICE_LOST;
    }
 
    if (!dev || !dev->kmod.dev) {
-      mesa_loge("panvcake: submit on invalid device/queue");
+      mesa_loge("panvk: submit on invalid device/queue");
       return VK_ERROR_DEVICE_LOST;
    }
 
@@ -256,7 +256,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    if (is_kbase && !getenv("PANVK_FORCE_ALT_SUBMIT"))
       return panvk_per_arch(kbase_jm_submit)(vk_queue, queue, dev, submit);
 
-   mesa_logd("panvcake: gpu_queue_submit start, cmd_count=%u", submit->command_buffer_count);
+   mesa_logd("panvk: gpu_queue_submit start, cmd_count=%u", submit->command_buffer_count);
 
    unsigned nr_semaphores = submit->wait_count + 1;
    uint32_t semaphores[nr_semaphores];
@@ -275,7 +275,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
          container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
 
       list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
-         mesa_logd("panvcake: batch submit, vtc_jc=%s frag_jc=%s",
+         mesa_logd("panvk: batch submit, vtc_jc=%s frag_jc=%s",
                    batch->vtc_jc.first_job ? "yes" : "no",
                    batch->frag_jc.first_job ? "yes" : "no");
          /* FIXME: should be done at the batch level */
@@ -386,7 +386,7 @@ struct panvk_gpu_queue *queue = vk_zalloc(&device->vk.alloc, sizeof(*queue), 8,
                                  &queue->sync);
       if (ret) {
          queue->sync = 0;
-         mesa_logd("panvcake: drmSyncobjCreate failed (%d); continuing without "
+         mesa_logd("panvk: drmSyncobjCreate failed (%d); continuing without "
                    "per-queue DRM syncobj", ret);
       }
 #ifdef HAVE_PAN_KMOD_KBASE
@@ -406,9 +406,6 @@ void panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
 {
    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
-
-   /* Async mode: no queue may die with work in flight. */
-   panvk_kbase_async_drain(dev);
 
    vk_queue_finish(&queue->vk);
    if (queue->sync && dev->drm_fd >= 0)
@@ -436,11 +433,6 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
       u_printf_with_ctx(stdout, &dev->printf.ctx);
       return VK_ERROR_DEVICE_LOST;
    }
-
-   /* Async mode: wait for all in-flight work on this queue's device. */
-   VkResult wres = panvk_kbase_async_drain(dev);
-   if (wres != VK_SUCCESS)
-      return wres;
 
    return VK_SUCCESS;
 }

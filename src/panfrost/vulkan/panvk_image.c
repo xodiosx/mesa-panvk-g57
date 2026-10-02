@@ -22,8 +22,6 @@
 #include "panvk_instance.h"
 #include "panvk_physical_device.h"
 
-#include "vk_common_entrypoints.h"
-
 #include "drm-uapi/drm_fourcc.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
@@ -392,22 +390,11 @@ panvk_image_get_mod(struct panvk_image *image,
     * The sw_device WSI path must be able to consume the image through the
     * CPU/software presentation path.  Do not let modifier selection choose
     * AFBC while testing that path.
-    *
-    * PANVK_WSI_AFBC=1 (requires PANVK_AHB_WSI=1, i.e. the GPU-blit present
-    * path) lifts the WSI LINEAR force: swapchain images may select AFBC
-    * and the present blit decompresses on the way to the linear AHB
-    * buffer. Never enable on the sw_device/CPU present path.
     */
-   if (iusage.wsi || getenv("PANVK_NO_AFBC")) {
-      const char *wsi_afbc = getenv("PANVK_WSI_AFBC");
-      const char *ahb_wsi = getenv("PANVK_AHB_WSI");
-      if (!(iusage.wsi && wsi_afbc && wsi_afbc[0] != '0' && ahb_wsi &&
-            ahb_wsi[0] != '0')) {
-         if (iusage.wsi) {
-            (void)0;
-         }
-         return DRM_FORMAT_MOD_LINEAR;
-      }
+   if (iusage.wsi) {
+      fprintf(stderr,
+              "PANVKDBG WSI image: forcing LINEAR modifier\n");
+      return DRM_FORMAT_MOD_LINEAR;
    }
 
    /* Without external dependencies, pick the best modifier that supports the image. */
@@ -864,9 +851,6 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
 
    if (!image)
       return;
-
-   /* Async mode: the image's memory may still be in flight. */
-   panvk_kbase_async_drain_if_busy(device);
 
    if (image->vk.create_flags &
        VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
@@ -1380,7 +1364,17 @@ panvk_image_bind(struct panvk_device *dev,
 
    assert(mem);
 
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG IMAGE_BIND img=%p mem=%p memdev=%016llx offset=%016llx "
+           "modifier=%016llx planes=%u format=%u usage=%016llx\n",
+           (void *)image,
+           (void *)mem,
+           (unsigned long long)mem->addr.dev,
+           (unsigned long long)offset,
+           (unsigned long long)image->vk.drm_format_mod,
+           image->plane_count,
+           image->vk.format,
+           (unsigned long long)image->vk.usage);
 
    if (is_disjoint(image)) {
       const VkBindImagePlaneMemoryInfo *plane_info =
@@ -1399,7 +1393,13 @@ panvk_image_bind(struct panvk_device *dev,
       for (unsigned plane = 0; plane < image->plane_count; plane++) {
          panvk_image_plane_bind_mem(dev, &image->planes[plane], mem, offset);
 
-         (void)0;
+         fprintf(stderr,
+                 "PANVKDBG IMAGE_PLANE img=%p plane=%u base=%016llx "
+                 "mem_offset=%016llx\n",
+                 (void *)image,
+                 plane,
+                 (unsigned long long)image->planes[plane].plane.base,
+                 (unsigned long long)image->planes[plane].mem_offset);
       }
 
       panvk_image_report_binding(dev, image,
@@ -1431,15 +1431,4 @@ panvk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
    }
 
    return result;
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-panvk_GetImageDrmFormatModifierPropertiesEXT(
-   VkDevice device, VkImage image,
-   VkImageDrmFormatModifierPropertiesEXT *pProperties)
-{
-   /* drm_format_mod is tracked for every image (LINEAR, AFBC, interleaved),
-    * so the common helper is all we need. */
-   return vk_common_GetImageDrmFormatModifierPropertiesEXT(device, image,
-                                                           pProperties);
 }

@@ -11,7 +11,6 @@
 
 #include <stdio.h>
 #include "panvk_wsi.h"
-#include "panvk_device_memory.h"
 #include "panvk_instance.h"
 #include "panvk_physical_device.h"
 
@@ -82,7 +81,9 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
 
             if (dup2(fileno(panvkdbg_file), STDERR_FILENO) >= 0) {
                setvbuf(stderr, NULL, _IOLBF, 0);
-               (void)0;
+               fprintf(stderr,
+                       "PANVKDBG FILE_LOG path=%s pid=%ld\n",
+                       panvkdbg_path, (long)getpid());
                fflush(stderr);
             }
 
@@ -116,21 +117,23 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
 #endif
    VkResult result;
 
-   /* AHB-backed WSI images (PANVK_AHB_WSI=1): swapchain image memory comes
-    * from imported Android Hardware Buffer dma-bufs, so the native DRI3
-    * present path can be used instead of the SHM fallback. Default off. */
-   const bool ahb_wsi =
-      uses_kbase && getenv("PANVK_AHB_WSI") != NULL;
-
-   (void)0;
+   fprintf(stderr,
+           "PANVKDBG WSI: uses_kbase=%d termux_raw=%d raw_dri3=%d "
+           "kbase_dmabuf=%d sw_device=%d raw_fd_modifier=%d\n",
+           uses_kbase,
+           termux_raw_dri3,
+           kbase_raw_dri3,
+           kbase_dmabuf,
+           uses_kbase && !kbase_dmabuf,
+           kbase_dmabuf && kbase_raw_dri3);
 
    result = wsi_device_init(&physical_device->wsi_device,
                             panvk_physical_device_to_handle(physical_device),
                             panvk_wsi_proc_addr, &instance->vk.alloc, -1,
                             &instance->drirc.options,
                             &(struct wsi_device_options){
-                               .sw_device = !ahb_wsi && uses_kbase && !kbase_dmabuf,
-                               .wait_present_before_queue = kbase_dmabuf || ahb_wsi,
+                               .sw_device = uses_kbase && !kbase_dmabuf,
+                               .wait_present_before_queue = kbase_dmabuf,
                                .x11_use_raw_fd_modifier =
                                   kbase_dmabuf && kbase_raw_dri3,
                             });
@@ -144,7 +147,8 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
     */
    if (uses_kbase) {
       physical_device->wsi_device.has_import_memory_host = true;
-      (void)0;
+      fprintf(stderr,
+              "PANVKDBG WSI host-import diagnostic enabled\n");
    }
 
 
@@ -162,11 +166,6 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
     */
    physical_device->wsi_device.supports_modifiers =
       !uses_kbase || (kbase_dmabuf && !kbase_raw_dri3);
-   /* Blit path (PRIME) handles padded gralloc strides via row lengths;
-    * keep native direct path off: AHB stride can exceed image width. */
-   physical_device->wsi_device.supports_scanout = false;
-   physical_device->wsi_device.create_dma_buf_buffer_mem =
-      panvk_create_dma_buf_buffer_mem;
    physical_device->wsi_device.can_present_on_device =
       panvk_can_present_on_device;
 
