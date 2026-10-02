@@ -136,12 +136,12 @@ jobs:
             "src/panfrost/vulkan/panvk_vX_cmd_meta.c"
 
             # --- Panfrost lib: kbase driver ---
-            "src/panfrost/lib/kmod/kbase_kmod.c"
+            #"src/panfrost/lib/kmod/kbase_kmod.c"
 
             # --- 2-arg pan_query_core_count signature chain ---
             "src/panfrost/lib/pan_props.c"
             "src/panfrost/lib/pan_props.h"
-            "src/panfrost/lib/kmod/panfrost_kmod.c"
+            #"src/panfrost/lib/kmod/panfrost_kmod.c"
             "src/panfrost/perf/pan_perf.c"
             "src/gallium/drivers/panfrost/pan_device.c"
             "src/gallium/drivers/panfrost/pan_screen.c"
