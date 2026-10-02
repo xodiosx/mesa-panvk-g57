@@ -150,13 +150,42 @@ jobs:
             "src/vulkan/wsi"
 
             # --- Zink: name override + format-truncation fix ---
-            "src/gallium/drivers/zink/zink_screen.c"
+            #"src/gallium/drivers/zink/zink_screen.c"
+            # --- 24 files under src/panfrost/vulkan that differ vs main ---
+            "src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c"
+            "src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c"
+            "src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c"
+            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c"
+            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c"
+            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h"
+            "src/panfrost/vulkan/meson.build"
+            "src/panfrost/vulkan/panvk_android_hal_bridge.c"
+            #"src/panfrost/vulkan/panvk_cmd_alloc.h"
+            #"src/panfrost/vulkan/panvk_device_memory.c"
+            #"src/panfrost/vulkan/panvk_image.c"
+            #"src/panfrost/vulkan/panvk_instance.c"
+            #"src/panfrost/vulkan/panvk_physical_device.c"
+            #"src/panfrost/vulkan/panvk_physical_device.h"
+            "src/panfrost/vulkan/panvk_query_pool.h"
+            #"src/panfrost/vulkan/panvk_shader.h"
+            "src/panfrost/vulkan/panvk_vX_cmd_draw.c"
+            "src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c"
+            "src/panfrost/vulkan/panvk_vX_cmd_meta.c"
+            "src/panfrost/vulkan/panvk_vX_device.c"
+            "src/panfrost/vulkan/panvk_vX_image_view.c"
+            "src/panfrost/vulkan/panvk_vX_physical_device.c"
+            "src/panfrost/vulkan/panvk_vX_shader.c"
+            "src/panfrost/vulkan/panvk_wsi.c"
           )
 
           # Empty: nothing in KEEP is a directory we need to peel files back
           # to main from. main's panvk_physical_device.c/.h stay in place
           # automatically because their parent is not KEEP'd.
-          RESTORE_FROM_MAIN=()
+          RESTORE_FROM_MAIN=(
+           "src/panfrost/vulkan/panvk_physical_device.c"
+           "src/panfrost/vulkan/panvk_physical_device.h"
+          
+          )
 
           echo "=== KEEP list (from ${{ env.REFERENCE_BRANCH }}) ==="
           for p in "${KEEP_PATHS[@]}"; do echo "  $p"; done
