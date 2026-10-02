@@ -143,21 +143,21 @@ jobs:
             "src/panfrost/lib/pan_props.h"
             #"src/panfrost/lib/kmod/panfrost_kmod.c"
             "src/panfrost/perf/pan_perf.c"
-            "src/gallium/drivers/panfrost/pan_device.c"
-            "src/gallium/drivers/panfrost/pan_screen.c"
+            #"src/gallium/drivers/panfrost/pan_device.c"
+            #"src/gallium/drivers/panfrost/pan_screen.c"
 
             # --- Vulkan WSI (AHB swapchain, X11 DRI3 fixes) ---
             "src/vulkan/wsi"
 
             # --- Zink: name override + format-truncation fix ---
-            #"src/gallium/drivers/zink/zink_screen.c"
+            #
             # --- 24 files under src/panfrost/vulkan that differ vs main ---
             "src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c"
             "src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c"
             "src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c"
             "src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c"
-            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c"
-            "src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h"
+            #"src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.c"
+            #"src/panfrost/vulkan/jm/panvk_vX_gpu_queue_kbase.h"
             "src/panfrost/vulkan/meson.build"
             "src/panfrost/vulkan/panvk_android_hal_bridge.c"
             #"src/panfrost/vulkan/panvk_cmd_alloc.h"
@@ -166,16 +166,16 @@ jobs:
             #"src/panfrost/vulkan/panvk_instance.c"
             #"src/panfrost/vulkan/panvk_physical_device.c"
             #"src/panfrost/vulkan/panvk_physical_device.h"
-            "src/panfrost/vulkan/panvk_query_pool.h"
+            #"src/panfrost/vulkan/panvk_query_pool.h"
             #"src/panfrost/vulkan/panvk_shader.h"
-            "src/panfrost/vulkan/panvk_vX_cmd_draw.c"
-            "src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c"
-            "src/panfrost/vulkan/panvk_vX_cmd_meta.c"
-            "src/panfrost/vulkan/panvk_vX_device.c"
-            "src/panfrost/vulkan/panvk_vX_image_view.c"
-            "src/panfrost/vulkan/panvk_vX_physical_device.c"
-            "src/panfrost/vulkan/panvk_vX_shader.c"
-            "src/panfrost/vulkan/panvk_wsi.c"
+            #"src/panfrost/vulkan/panvk_vX_cmd_draw.c"
+            #"src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c"
+            #"src/panfrost/vulkan/panvk_vX_cmd_meta.c"
+            #"src/panfrost/vulkan/panvk_vX_device.c"
+            #"src/panfrost/vulkan/panvk_vX_image_view.c"
+            #"src/panfrost/vulkan/panvk_vX_physical_device.c"
+            #"src/panfrost/vulkan/panvk_vX_shader.c"
+            #"src/panfrost/vulkan/panvk_wsi.c"
           )
 
           # Empty: nothing in KEEP is a directory we need to peel files back
@@ -184,6 +184,7 @@ jobs:
           RESTORE_FROM_MAIN=(
            "src/panfrost/vulkan/panvk_physical_device.c"
            "src/panfrost/vulkan/panvk_physical_device.h"
+           "src/panfrost/lib/kmod/kbase_kmod.c"
           
           )
 
